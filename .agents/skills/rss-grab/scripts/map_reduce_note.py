@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Map-reduce 笔记生成：调 MiniMax M3 API 处理长播客 transcript（rss 版）。
+"""Map-reduce 笔记生成：调 OpenAI 兼容 LLM API 处理长播客 transcript。
 
 工作流：
   1. 解析 transcript.md -> cues 列表
   2. 按 token 切分（每块 ~30K tokens，留 1M context 余量）
-  3. MAP 阶段: 并发 4 调 M3 API，每块生成段级 JSON
-  4. REDUCE 阶段: 调 M3 API 一次，输出完整笔记 JSON
+  3. MAP 阶段: 并发 4 调 LLM API，每块生成段级 JSON
+  4. REDUCE 阶段: 调 LLM API 一次，输出完整笔记 JSON
   5. final.json 交给 generate_note.py --source summary 拼最终 MD
 
 用法:
@@ -13,8 +13,8 @@
 
 环境变量:
   LLM_API_KEY  - 必填（与 .env.example 一致，由 _shared/env.py 加载）
-  LLM_BASE_URL - 可选，默认 https://api.minimaxi.com/v1
-  LLM_MODEL    - 可选，默认 MiniMax-M3
+  LLM_BASE_URL - 必填（你的 LLM 服务 OpenAI 兼容接口地址）
+  LLM_MODEL    - 必填（你的模型名）
 """
 import json
 import os
@@ -273,11 +273,11 @@ def main():
     load_env(SCRIPT_DIR)
     client = OpenAI(
         api_key=os.environ["LLM_API_KEY"],
-        base_url=os.environ.get("LLM_BASE_URL", "https://api.minimaxi.com/v1"),
+        base_url=os.environ["LLM_BASE_URL"],
         # 20 分钟硬超时：覆盖 reduce 阶段异常慢的情况
         timeout=1200.0,
     )
-    model = os.environ.get("LLM_MODEL", "MiniMax-M3")
+    model = os.environ["LLM_MODEL"]
 
     text = transcript_path.read_text()
     cues = parse_transcript(text)

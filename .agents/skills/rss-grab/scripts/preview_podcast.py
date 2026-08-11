@@ -141,10 +141,10 @@ def _get_client():
     load_env(SCRIPT_DIR)
     client = OpenAI(
         api_key=os.environ["LLM_API_KEY"],
-        base_url=os.environ.get("LLM_BASE_URL", "https://api.minimaxi.com/v1"),
+        base_url=os.environ["LLM_BASE_URL"],
         timeout=600.0,
     )
-    model = os.environ.get("LLM_MODEL", "MiniMax-M3")
+    model = os.environ["LLM_MODEL"]
     return client, model
 
 
@@ -161,10 +161,10 @@ def summarize_items(feed: dict, items: list[dict], checkpoint_path: Path | None 
     load_env(SCRIPT_DIR)
     client = OpenAI(
         api_key=os.environ["LLM_API_KEY"],
-        base_url=os.environ.get("LLM_BASE_URL", "https://api.minimaxi.com/v1"),
+        base_url=os.environ["LLM_BASE_URL"],
         timeout=600.0,
     )
-    model = os.environ.get("LLM_MODEL", "MiniMax-M3")
+    model = os.environ["LLM_MODEL"]
 
     total = len(items)
     summaries: dict[str, str] = {}   # key -> summary（key = guid 或 idx:N）

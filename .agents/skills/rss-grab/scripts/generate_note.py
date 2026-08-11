@@ -21,8 +21,6 @@ from pathlib import Path
 
 from openai import OpenAI
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.minimaxi.com/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "MiniMax-M3")
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
 from env import load_env
@@ -75,7 +73,7 @@ def call_llm_for_note_generation(
     source="transcript"：原始逐字稿（短播客 < 50K 字符）
     source="summary"：map-reduce 结构化摘要（长播客 > 50K 字符，先跑 map_reduce_note.py）
     """
-    client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=LLM_BASE_URL)
+    client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.environ["LLM_BASE_URL"])
 
     if is_fallback:
         system_prompt = (
@@ -145,7 +143,7 @@ def call_llm_for_note_generation(
 """
 
     resp = client.chat.completions.create(
-        model=LLM_MODEL,
+        model=os.environ["LLM_MODEL"],
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

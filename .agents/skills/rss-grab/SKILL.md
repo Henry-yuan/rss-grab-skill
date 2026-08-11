@@ -25,7 +25,7 @@ description: 抓取播客 RSS feed：解析 RSS XML -> 下载音频到 rss/audio
 2. **拉增量**：`python3 scripts/fetch_rss_feed.py --fetch-updates`
    - 遍历 `rss/订阅/subscriptions.json` 所有源
    - 对比状态文件已有 guid，只拉新增期
-   - 新增期跑 AI 摘要（MiniMax M3，单期纯文本，20 并发 + 2s 间隔 + 429 熔断降级 + checkpoint 恢复）
+   - 新增期跑 AI 摘要（OpenAI 兼容 LLM，单期纯文本，20 并发 + 2s 间隔 + 429 熔断降级 + checkpoint 恢复）
    - 每期完成增量写状态文件"待确认"区
    - 可配定时任务（launchd/cron）每天自动跑 `--fetch-updates`，命令幂等、重复执行安全；日志 `rss/订阅/.logs/`
    - 示例（launchd plist 的 ProgramArguments，每天 22:30）：

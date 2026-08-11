@@ -18,8 +18,6 @@ from pathlib import Path
 
 from openai import OpenAI
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.minimaxi.com/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "MiniMax-M3")
 SCRIPT_DIR = Path(__file__).resolve().parent
 TRUNCATE_CHARS = 3000
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
@@ -92,7 +90,7 @@ def call_llm_for_template_choice(
     templates: list[dict],
 ) -> dict:
     """调 LLM 让其选模板。返回 {style_detected, template_used, is_fallback, adaptation_notes}。"""
-    client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=LLM_BASE_URL)
+    client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.environ["LLM_BASE_URL"])
 
     template_list_str = "\n".join(
         f"- {t['path']}: style={t.get('style', '?')}, description={t.get('description', '?')}"
@@ -121,7 +119,7 @@ def call_llm_for_template_choice(
 }}"""
 
     resp = client.chat.completions.create(
-        model=LLM_MODEL,
+        model=os.environ["LLM_MODEL"],
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

@@ -25,3 +25,10 @@ def load_env(script_dir: Path) -> None:
             "  2. 编辑 .env 填入你的 LLM 服务 API key（OpenAI 兼容接口）\n"
             "  或设置环境变量：export LLM_API_KEY=your-key"
         )
+    if "LLM_BASE_URL" not in os.environ:
+        sys.exit(
+            "ERROR: LLM_BASE_URL 未配置。请：\n"
+            "  1. cp .env.example .env\n"
+            "  2. 编辑 .env 设置 LLM_BASE_URL（你的 LLM 服务 OpenAI 兼容接口地址）\n"
+            "  或设置环境变量：export LLM_BASE_URL=https://your-llm-service/v1"
+        )
