@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装测试依赖
+        # 单测不依赖 mlx-whisper（仅 Apple Silicon，Linux runner 装不上）；
+        # 只需 openai + pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install "openai>=1.0" pytest
+
+      - name: 跑单测
+        run: python -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/tests/ -v
