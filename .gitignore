@@ -1,0 +1,28 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 环境变量（真实 API key，绝不提交）
+.env
+.agents/skills/rss-grab/scripts/.env
+.agents/skills/_shared/.env
+
+# map-reduce 中间产物
+output/
+
+# 测试临时输出
+test_output/
+
+# 本地数据（开源版不包含任何抓取产物）
+rss/
+tools/
+
+# 审查/交接报告（维护者内部文档）
+AUDIT_REPORT*.md
+LICENSES_REPORT*.md
+HANDOFF.md
+
+# macOS
+.DS_Store

@@ -1,0 +1,14 @@
+rss-grab
+Copyright (c) 2026 Henry Yuan
+
+This product includes software developed by third parties:
+
+- openai-python (MIT License) — https://github.com/openai/openai-python
+- mlx-whisper (MIT License) — https://github.com/ml-explore/mlx-examples
+- yt-dlp (Unlicense) — https://github.com/yt-dlp/yt-dlp
+- FFmpeg (LGPL 2.1+) — https://ffmpeg.org/
+- curl (MIT License) — https://curl.se/
+
+Whisper model weights (whisper-large-v3-turbo) by OpenAI are NOT
+included in this repository. Users must download from the official
+Hugging Face repository (mlx-community).
