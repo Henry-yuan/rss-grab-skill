@@ -1,14 +1,73 @@
 rss-grab
 Copyright (c) 2026 Henry Yuan
 
-This product includes software developed by third parties:
+This product includes software developed by third parties, licensed under the
+following licenses (full texts below):
 
-- openai-python (MIT License) — https://github.com/openai/openai-python
+- openai-python (Apache License 2.0) — https://github.com/openai/openai-python
 - mlx-whisper (MIT License) — https://github.com/ml-explore/mlx-examples
 - yt-dlp (Unlicense) — https://github.com/yt-dlp/yt-dlp
-- FFmpeg (LGPL 2.1+) — https://ffmpeg.org/
-- curl (MIT License) — https://curl.se/
+- FFmpeg (LGPL 2.1+) — https://ffmpeg.org/ (used as external subprocess, no linking)
+- curl (MIT-style) — https://curl.se/
 
 Whisper model weights (whisper-large-v3-turbo) by OpenAI are NOT
 included in this repository. Users must download from the official
 Hugging Face repository (mlx-community).
+
+---
+
+Third-party license texts:
+
+=== openai-python (Apache License 2.0) ===
+https://github.com/openai/openai-python
+Apache License, Version 2.0, January 2004
+http://www.apache.org/licenses/
+Full text: https://www.apache.org/licenses/LICENSE-2.0.txt
+(本 NOTICE 为便捷引用。完整文本见上述官方 URL。)
+
+=== mlx-whisper (MIT License) ===
+https://github.com/ml-explore/mlx-examples
+MIT License
+
+Copyright (c) 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+=== yt-dlp (Unlicense) ===
+https://github.com/yt-dlp/yt-dlp
+This is free and unencumbered software released into the public domain.
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute
+this software, either in source code form or as a compiled binary, for any
+purpose, commercial or non-commercial, and by any means.
+For more information, see https://unlicense.org/
+
+=== FFmpeg (LGPL 2.1+) ===
+https://ffmpeg.org/
+rss-grab invokes FFmpeg's ffprobe as an external subprocess (no linking,
+no modification, no redistribution of FFmpeg). LGPL linking obligations are
+not triggered. FFmpeg is subject to LGPL v2.1+; see https://ffmpeg.org/legal.html
+
+=== curl (MIT-style / ISC-like) ===
+https://curl.se/
+COPYRIGHT AND PERMISSION NOTICE
+Copyright (c) 1996 - 2026, Daniel Stenberg, <daniel@haxx.se>, and many
+contributors, see the THANKS file.
+Permission to use, copy, modify, and distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright
+notice and this permission notice appear in all copies.

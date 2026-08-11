@@ -197,7 +197,7 @@ python3 -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/
 
 rss-grab 站在巨人的肩膀上，感谢以下开源项目：
 
-- **[openai-python](https://github.com/openai/openai-python)** (MIT) — OpenAI 兼容 API 客户端
+- **[openai-python](https://github.com/openai/openai-python)** (Apache 2.0) — OpenAI 兼容 API 客户端
 - **[mlx-whisper](https://github.com/ml-explore/mlx-examples)** (MIT) — Apple Silicon 上的 Whisper 推理
 - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** (Unlicense) — 播客音频下载
 - **[FFmpeg](https://ffmpeg.org/)** (LGPL 2.1+) — 音频元数据探测
