@@ -17,7 +17,11 @@ def load_env(script_dir: Path) -> None:
                 continue
             if "=" in line:
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+                v = v.strip()
+                # 剥离成对引号（KEY="v" / KEY='v'），与常见 shell .env 语义一致
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                os.environ.setdefault(k.strip(), v)
     if "LLM_API_KEY" not in os.environ or "your-api" in os.environ.get("LLM_API_KEY", ""):
         sys.exit(
             "ERROR: LLM_API_KEY 未配置。请：\n"
