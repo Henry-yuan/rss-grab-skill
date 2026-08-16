@@ -18,6 +18,7 @@ test_output/
 # 本地数据（开源版不包含任何抓取产物）
 rss/
 tools/
+待抓取URL/
 
 # 审查/交接报告（维护者内部文档）
 AUDIT_REPORT*.md
