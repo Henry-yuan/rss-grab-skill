@@ -18,6 +18,32 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from urllib.parse import urlparse
+
+
+def is_apple_podcasts_url(url: str) -> bool:
+    """URL 的 host 是否精确为 podcasts.apple.com。
+
+    子串包含（"podcasts.apple.com" in url）可被子域伪装
+    （podcasts.apple.com.evil.com）或参数绕过，这里按 host 精确匹配。
+    """
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return False
+    return host == "podcasts.apple.com"
+
+
+def ensure_http_url(url: str, what: str = "URL") -> str:
+    """校验 URL 协议为 http/https，否则抛 ValueError。
+
+    反推出的 feed_url 会写入订阅表被定时任务长期反复拉取，
+    非 http(s) 协议（file:// 等）必须在入口拦住。
+    """
+    scheme = urlparse(url).scheme
+    if scheme not in ("http", "https"):
+        raise ValueError(f"{what} 协议必须是 http/https: {url}")
+    return url
 
 
 def extract_apple_id(apple_url: str) -> str:
@@ -100,14 +126,15 @@ def resolve_apple_url(apple_url: str) -> dict:
       ValueError: apple_url 不是 Apple Podcasts 链接
       RuntimeError: 抓取或解析失败
     """
-    if "podcasts.apple.com" not in apple_url:
+    if not is_apple_podcasts_url(apple_url):
         raise ValueError(
-            f"不是 Apple Podcasts 链接（需包含 podcasts.apple.com）: {apple_url}"
+            f"不是 Apple Podcasts 链接（需 podcasts.apple.com 域名）: {apple_url}"
         )
 
     apple_id = extract_apple_id(apple_url)
     html_text = _fetch_html(apple_url)
     feed_url = parse_feed_url_from_html(html_text)
+    ensure_http_url(feed_url, "反推出的 feedUrl")
     meta = parse_meta_from_html(html_text)
 
     return {

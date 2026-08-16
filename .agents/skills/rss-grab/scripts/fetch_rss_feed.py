@@ -251,7 +251,7 @@ def cmd_subscribe(apple_url: str, feed_url_override: str = "") -> None:
     meta = {}
 
     # 优先用反推，失败时用 --feed-url 手动指定
-    if "podcasts.apple.com" in apple_url:
+    if resolve_apple_podcast.is_apple_podcasts_url(apple_url):
         try:
             result = resolve_apple_podcast.resolve_apple_url(apple_url)
             feed_url = result["feed_url"]

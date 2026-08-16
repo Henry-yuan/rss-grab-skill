@@ -170,6 +170,36 @@ def test_resolve_apple_url_rejects_non_apple():
     print("✅ test_resolve_apple_url_rejects_non_apple")
 
 
+def test_is_apple_url_exact_host():
+    """域名精确匹配：子域伪装 / 参数绕过 / file 协议全部拒绝。"""
+    # 真链接
+    assert rap.is_apple_podcasts_url("https://podcasts.apple.com/cn/podcast/xxx/id123") is True
+    assert rap.is_apple_podcasts_url("https://podcasts.apple.com/us/podcast/y/id456?i=9") is True
+    # 子域伪装（host 是 evil.com）
+    assert rap.is_apple_podcasts_url("https://podcasts.apple.com.evil.com/id123") is False
+    # 参数 / 路径绕过（host 不是 apple）
+    assert rap.is_apple_podcasts_url("https://evil.com/?podcasts.apple.com") is False
+    assert rap.is_apple_podcasts_url("https://evil.com/podcasts.apple.com") is False
+    # 非 http(s) / 非法
+    assert rap.is_apple_podcasts_url("file:///podcasts.apple.com") is False
+    assert rap.is_apple_podcasts_url("not a url") is False
+    assert rap.is_apple_podcasts_url("") is False
+    print("✅ test_is_apple_url_exact_host")
+
+
+def test_ensure_http_url_protocol_whitelist():
+    """feed_url 协议白名单：仅 http/https，其他协议抛 ValueError。"""
+    assert rap.ensure_http_url("https://feed.example/x") == "https://feed.example/x"
+    assert rap.ensure_http_url("http://feed.example/y") == "http://feed.example/y"
+    for bad in ("file:///etc/passwd", "javascript:alert(1)", "ftp://x/y", "不是url"):
+        try:
+            rap.ensure_http_url(bad)
+            assert False, f"应抛 ValueError: {bad}"
+        except ValueError:
+            pass
+    print("✅ test_ensure_http_url_protocol_whitelist")
+
+
 if __name__ == "__main__":
     tests = [
         test_extract_apple_id_normal,
@@ -183,6 +213,8 @@ if __name__ == "__main__":
         test_parse_meta_from_html_broken_json,
         test_parse_meta_missing_fields,
         test_resolve_apple_url_rejects_non_apple,
+        test_is_apple_url_exact_host,
+        test_ensure_http_url_protocol_whitelist,
     ]
 
     for t in tests:
