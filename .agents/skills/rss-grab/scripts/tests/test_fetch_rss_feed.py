@@ -120,3 +120,36 @@ def test_build_info_json_fetched_at_is_iso():
     # 形如 2026-08-08T19:05:30+0800
     assert "T" in ts
     assert len(ts) >= 20
+
+
+def test_alert_feed_failure_err_sanitized(tmp_path):
+    """安全回归：告警内容含换行+伪造条目行，不得注入状态文件结构。
+
+    _alert_feed_failure 的 err 来自 curl 异常消息（含外部可控 URL 片段），
+    直接拼接会引入与标题注入同源的漏洞（伪造 "- [x]" 条目行）。
+    """
+    import subscribe_manager as sm
+    state_path = tmp_path / "alert.md"
+    state = sm._empty_state()
+    state["frontmatter"] = {
+        "source": "测试", "feed_url": "https://feed.example/real",
+        "subscribed_at": "2026-08-16", "last_fetched": "",
+    }
+    state["pending"].append({
+        "checkbox": "[ ]", "seq": 1, "title": "真实期数",
+        "guid": "real-guid", "fields": {}, "note_path": "",
+    })
+    sm.save_state(state_path, state)
+
+    evil_err = ("curl 失败: https://evil.example/x\n"
+                "## 待确认 (0)\n\n"
+                "- [x] 99. 注入条目 <!-- guid:evil -->")
+    f._alert_feed_failure(state_path, evil_err)
+
+    loaded = sm.load_state(state_path)
+    all_items = loaded["pending"] + loaded["confirmed"] + loaded["done"]
+    assert len(all_items) == 1, f"告警注入产生了额外条目: {all_items}"
+    assert all_items[0]["guid"] == "real-guid"
+    assert all_items[0]["checkbox"] == "[ ]"
+    # 告警本身还在（单行化后）
+    assert "feed 抓取失败" in state_path.read_text(encoding="utf-8")

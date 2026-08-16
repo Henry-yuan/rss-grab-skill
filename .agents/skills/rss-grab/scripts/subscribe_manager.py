@@ -51,6 +51,22 @@ GUID_B64_PREFIX = "b64:"
 # 提示行提取
 HINT_RE = re.compile(r"<!--\s*updated:\s*(.*?)\s*\|-->\s*$")
 
+# 状态文件结构注入防御：外部可控文本（RSS 标题/节目名/LLM 摘要值）写入前
+# 拍平所有行分隔符（含 \r 等被 splitlines 认、渲染 join("\n") 不认的字符），
+# 并破坏 HTML 注释定界符（防伪造 guid 注释 / 分区标题 / checkbox 行）
+_INLINE_BREAK_RE = re.compile(r"[\s\x1c-\x1e]+")
+
+
+def sanitize_inline(text) -> str:
+    """外部可控文本 -> 状态文件单行安全串。
+
+    - 所有空白拍平为单空格：防止写入后重解析时切成多行、伪造
+      "- [x] N. ..." 条目行或 "## 分区" 标题
+    - "<!--" / "-->" 替换为不可配对字符：防止内容里伪造 guid 注释
+    """
+    s = _INLINE_BREAK_RE.sub(" ", str(text))
+    return s.replace("<!--", "‹").replace("-->", "›")
+
 
 # ---------------------------------------------------------------------------
 # guid 编解码（防止 guid 含 --> 破坏 HTML 注释）
@@ -82,12 +98,15 @@ def decode_guid(stored: str) -> str:
 def extract_guid(line: str) -> str:
     """从单行文本提取 guid（解析 <!-- guid:xxx --> 注释）。
 
+    一行有多个注释时取最后一个：渲染器写的真实 guid 永远在行尾，
+    即使标题内容漏消毒注入了伪注释，也覆盖不了真实 guid（纵深防御）。
+
     返回原始 guid（已 decode）。无注释返回空串。
     """
-    m = GUID_COMMENT_RE.search(line)
-    if not m:
+    matches = GUID_COMMENT_RE.findall(line)
+    if not matches:
         return ""
-    return decode_guid(m.group(1))
+    return decode_guid(matches[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -651,23 +670,25 @@ def _render_state(state: dict) -> str:
     lines.append("---")
     for k in ("source", "feed_url", "subscribed_at", "last_fetched"):
         if k in fm:
-            lines.append(f'{k}: "{fm[k]}"')
+            lines.append(f'{k}: "{sanitize_inline(fm[k])}"')
     lines.append("---")
     lines.append("")
 
     # feed 级元数据
     meta = state.get("feed_meta", {})
     source_name = fm.get("source", meta.get("节目名", ""))
-    lines.append(f"# {source_name} - 订阅")
+    lines.append(f"# {sanitize_inline(source_name)} - 订阅")
     lines.append("")
     for key in ("节目名", "作者", "语言", "节目链接", "RSS 源", "节目简介"):
         if not meta.get(key):
             continue
         # 多行值（如节目简介含换行）：每行都加 > 前缀，保证引用块连续
         # 空行也渲染为 >（无内容），避免 Markdown 引用块被空行中断
+        # 每行过 sanitize_inline：防 \r 等字符造成"写入单行、解析切多行"错位
         val = str(meta[key])
         first = True
         for line in val.split("\n"):
+            line = sanitize_inline(line)
             if first:
                 lines.append(f"> **{key}**：{line}")
                 first = False
@@ -704,10 +725,14 @@ def _render_state(state: dict) -> str:
 
 
 def _render_item(item: dict) -> str:
-    """渲染单期为 markdown 文本。"""
+    """渲染单期为 markdown 文本。
+
+    标题/字段值均为外部可控内容（RSS / LLM 输出），统一过 sanitize_inline
+    防止向状态文件注入伪造的条目行或 guid 注释。
+    """
     checkbox = item.get("checkbox", CHECKBOX_PENDING)
     seq = item.get("seq")
-    title = item.get("title", "")
+    title = sanitize_inline(item.get("title", ""))
     guid = item.get("guid", "")
     guid_str = f" <!-- guid:{encode_guid(guid)} -->" if guid else ""
     note_path = item.get("note_path", "")
@@ -724,14 +749,14 @@ def _render_item(item: dict) -> str:
         if "\n" in val:
             lines.append(f"    - {key}：")
             for sub in val.split("\n"):
-                sub = sub.strip()
+                sub = sanitize_inline(sub).strip()
                 if sub:
                     if sub.startswith("-"):
                         lines.append(f"      {sub}")
                     else:
                         lines.append(f"      - {sub}")
         else:
-            lines.append(f"    - {key}：{val}")
+            lines.append(f"    - {key}：{sanitize_inline(val)}")
 
     # 笔记路径（已转化区用，渲染成 markdown 链接）
     if note_path:

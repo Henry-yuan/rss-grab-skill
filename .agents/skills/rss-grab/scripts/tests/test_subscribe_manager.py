@@ -336,6 +336,100 @@ def test_feed_meta_multi_line_roundtrip(tmp_path):
     assert "第三段" in desc
     print("✅ test_feed_meta_multi_line_roundtrip")
 
+
+# ---------------------------------------------------------------------------
+# 安全回归：恶意 RSS 标题/节目名/字段值注入状态文件结构
+# （攻击面：feed 作者可控 title / channel title / LLM 摘要值，渲染时不转义
+#   换行或 <!-- --> 即可伪造 checkbox 行、分区标题、guid 注释）
+# ---------------------------------------------------------------------------
+
+def _mk_state_with_item(source="正常节目", title="正常标题", guid="real-guid",
+                        fields=None):
+    state = sm._empty_state()
+    state["frontmatter"] = {
+        "source": source, "feed_url": "https://feed.example/real",
+        "subscribed_at": "2026-08-16", "last_fetched": "",
+    }
+    state["pending"].append({
+        "checkbox": "[ ]", "seq": 1, "title": title, "guid": guid,
+        "fields": fields or {}, "note_path": "",
+    })
+    return state
+
+
+def test_render_title_injection_sanitized(tmp_path):
+    """标题含换行+伪造 [x] 行：重解析后仍 1 条，checkbox/guid 不被篡改。"""
+    state_path = tmp_path / "inj.md"
+    state = _mk_state_with_item(
+        title="正常标题\n- [x] 99. 恶意注入条目 <!-- guid:attacker-guid -->")
+    sm.save_state(state_path, state)
+    loaded = sm.load_state(state_path)
+    all_items = loaded["pending"] + loaded["confirmed"] + loaded["done"]
+    assert len(all_items) == 1, f"注入产生了额外条目: {all_items}"
+    assert all_items[0]["checkbox"] == "[ ]"
+    assert all_items[0]["guid"] == "real-guid"
+    assert "恶意注入条目" in all_items[0]["title"]  # 内容保留（单行化）
+    print("✅ test_render_title_injection_sanitized")
+
+
+def test_render_source_name_injection_sanitized(tmp_path):
+    """节目名含换行+伪造分区/条目：重解析后仍 1 条真实期数。"""
+    state_path = tmp_path / "inj2.md"
+    state = _mk_state_with_item(
+        source="节目A\n## 已转化 (0)\n\n- [x] 1. 注入条目 <!-- guid:evil -->",
+        title="真实期数")
+    sm.save_state(state_path, state)
+    loaded = sm.load_state(state_path)
+    all_items = loaded["pending"] + loaded["confirmed"] + loaded["done"]
+    assert len(all_items) == 1, f"注入产生了额外条目: {all_items}"
+    assert all_items[0]["guid"] == "real-guid"
+    assert loaded["frontmatter"]["feed_url"] == "https://feed.example/real"
+    print("✅ test_render_source_name_injection_sanitized")
+
+
+def test_frontmatter_injection_cannot_override_feed_url(tmp_path):
+    """source 含换行+伪造 feed_url 行：不得覆盖真实 fetch 目标。"""
+    state_path = tmp_path / "inj3.md"
+    state = _mk_state_with_item(
+        source='x\nfeed_url: "https://evil.example/feed"')
+    sm.save_state(state_path, state)
+    loaded = sm.load_state(state_path)
+    assert loaded["frontmatter"]["feed_url"] == "https://feed.example/real"
+    print("✅ test_frontmatter_injection_cannot_override_feed_url")
+
+
+def test_guid_comment_in_title_cannot_override(tmp_path):
+    """标题内嵌 <!-- guid:fake -->：重解析后 guid 仍为真实值。"""
+    state_path = tmp_path / "inj4.md"
+    state = _mk_state_with_item(title="标题 <!-- guid:fake-guid -->")
+    sm.save_state(state_path, state)
+    loaded = sm.load_state(state_path)
+    assert loaded["pending"][0]["guid"] == "real-guid"
+    print("✅ test_guid_comment_in_title_cannot_override")
+
+
+def test_field_value_carriage_return_sanitized(tmp_path):
+    """字段值含 \\r（splitlines 认、渲染器不认）：不得造成结构错位注入。"""
+    state_path = tmp_path / "inj5.md"
+    state = _mk_state_with_item(
+        fields={"一句话概括": "正常摘要\r- [x] 99. 注入条目 <!-- guid:evil -->"})
+    sm.save_state(state_path, state)
+    loaded = sm.load_state(state_path)
+    all_items = loaded["pending"] + loaded["confirmed"] + loaded["done"]
+    assert len(all_items) == 1, f"注入产生了额外条目: {all_items}"
+    assert all_items[0]["guid"] == "real-guid"
+    assert all_items[0]["checkbox"] == "[ ]"
+    print("✅ test_field_value_carriage_return_sanitized")
+
+
+def test_extract_guid_takes_last():
+    """解析侧兜底：一行多个 guid 注释时取行尾最后一个（渲染器写的真实 guid）。"""
+    line = "- [ ] 1. 标题 <!-- guid:fake --> <!-- guid:real -->"
+    assert sm.extract_guid(line) == "real"
+    # 兼容旧行为：单注释正常提取
+    assert sm.extract_guid("- [ ] 1. 标题 <!-- guid:solo -->") == "solo"
+    print("✅ test_extract_guid_takes_last")
+
 if __name__ == "__main__":
     # 创建临时目录给需要 tmp_path 的测试
     import tempfile
@@ -349,6 +443,11 @@ if __name__ == "__main__":
         ("test_render_multi_line_field", test_render_multi_line_field),
         ("test_mark_unsubscribed_keeps_frontmatter", test_mark_unsubscribed_keeps_frontmatter),
         ("test_feed_meta_multi_line_roundtrip", test_feed_meta_multi_line_roundtrip),
+        ("test_render_title_injection_sanitized", test_render_title_injection_sanitized),
+        ("test_render_source_name_injection_sanitized", test_render_source_name_injection_sanitized),
+        ("test_frontmatter_injection_cannot_override_feed_url", test_frontmatter_injection_cannot_override_feed_url),
+        ("test_guid_comment_in_title_cannot_override", test_guid_comment_in_title_cannot_override),
+        ("test_field_value_carriage_return_sanitized", test_field_value_carriage_return_sanitized),
     ]
     simple_tests = [
         test_guid_encode_decode,
@@ -356,6 +455,7 @@ if __name__ == "__main__":
         test_find_new_items_guid,
         test_find_new_items_no_guid_fallback_link,
         test_collect_known_guids,
+        test_extract_guid_takes_last,
     ]
 
     for t in simple_tests:

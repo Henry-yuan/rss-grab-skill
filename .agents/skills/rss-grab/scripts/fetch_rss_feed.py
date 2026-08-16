@@ -626,6 +626,9 @@ def _alert_feed_failure(state_path: Path, err: str) -> None:
     if not state_path.exists():
         return
     text = state_path.read_text(encoding="utf-8")
+    # err 来自 curl 异常消息（含外部可控 URL 片段）：单行化，
+    # 防止换行注入伪造的分区标题 / checkbox 条目行（同标题注入漏洞）
+    err = " ".join(str(err).split())
     alert = f"> ⚠️ feed 抓取失败（{datetime.now().strftime('%Y-%m-%d')}）：{err}\n"
     if "feed 抓取失败" in text:
         return
