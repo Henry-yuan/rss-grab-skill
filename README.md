@@ -115,12 +115,15 @@ flowchart TB
 ## LLM 配置（OpenAI 兼容）
 
 - 代码通过 OpenAI 兼容接口调用 LLM，**不绑定任何特定服务**——你的 `.env` 配哪家就用哪家
-- **支持任意 OpenAI 兼容服务**（DeepSeek / OpenAI / 本地 Ollama 等），只需在 `.agents/skills/rss-grab/scripts/.env` 配置（模板见根目录 `.env.example`）：
+- **支持任意 OpenAI 兼容服务**（DeepSeek / OpenAI / MiniMax / 本地 Ollama 等），只需在 `.agents/skills/rss-grab/scripts/.env` 配置（模板见根目录 `.env.example`）：
   ```bash
   LLM_API_KEY=your-key                    # 你的服务 API key
   LLM_BASE_URL=https://your-llm-service/v1   # 你的服务 base_url
   LLM_MODEL=your-model                    # 你的模型名
   ```
+- ⚠️ **两个常见踩坑**：
+  1. **生效位置是 `scripts/.env`**（`.agents/skills/rss-grab/scripts/.env`）——放在仓库根目录的 `.env` 不会被读取；
+  2. **`LLM_MODEL` 是必填**（三项都缺一不可），缺失时脚本会报错退出。
 - 未配置 `LLM_BASE_URL` 时脚本会报错提示。
 
 ## 两种使用方式

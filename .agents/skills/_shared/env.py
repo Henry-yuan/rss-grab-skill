@@ -36,3 +36,11 @@ def load_env(script_dir: Path) -> None:
             "  2. 编辑 .env 设置 LLM_BASE_URL（你的 LLM 服务 OpenAI 兼容接口地址）\n"
             "  或设置环境变量：export LLM_BASE_URL=https://your-llm-service/v1"
         )
+    if "LLM_MODEL" not in os.environ:
+        sys.exit(
+            "ERROR: LLM_MODEL 未配置。请：\n"
+            "  1. cp .env.example .env\n"
+            "  2. 编辑 .env 设置 LLM_MODEL（你的模型名，必填——"
+            "此前模板误标为可选，实际所有脚本都必读）\n"
+            "  或设置环境变量：export LLM_MODEL=your-model"
+        )
