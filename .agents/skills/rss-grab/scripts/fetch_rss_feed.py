@@ -120,6 +120,23 @@ def download_audio(audio_url: str, save_path: Path,
         return False, "yt-dlp 超时（30 分钟）"
 
 
+def cleanup_audio_files(audio_paths: list[Path]) -> int:
+    """删除本次下载的音频文件（白名单删除，返回删除数）。
+
+    /tmp/rss-grab-audio 是共享临时目录：只删本次下载清单内的文件，
+    不 iterdir 全删（防误删其他会话 / 手动放入的文件）。
+    """
+    n = 0
+    for p in audio_paths:
+        try:
+            if p.is_file():
+                p.unlink()
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
 def build_info_json(feed: dict, item: dict, guid_hash8: str,
                     audio_path: Path | None) -> dict:
     """组装 info.json 内容。"""
@@ -483,6 +500,7 @@ def cmd_pick_subscribe(state_path: Path, args) -> None:
 
     n_ok = n_skip = n_fail = 0
     new_raw_paths = []
+    downloaded_audio: list[Path] = []  # 本次下载成功清单（--cleanup-audio 白名单）
     for i, item in enumerate(items, 1):
         title = item["title"]
         guid_hash8 = derive_rss_id.derive_id(
@@ -509,6 +527,7 @@ def cmd_pick_subscribe(state_path: Path, args) -> None:
             print(f"  ❌ 下载失败: {err[:200]}")
             n_fail += 1
             continue
+        downloaded_audio.append(audio_path)
 
         info_path = raw_dir / f"{safe}-{guid_hash8}.info.json"
         info = build_info_json(feed, item, guid_hash8, audio_path)
@@ -522,13 +541,9 @@ def cmd_pick_subscribe(state_path: Path, args) -> None:
         print("\n=== ASR 转写 ===")
         _transcribe_items(new_raw_paths)
 
-    # 转写完成后清理 /tmp 音频（可选，--cleanup-audio）
-    if args.cleanup_audio and audio_dir.exists():
-        n_del = 0
-        for f in audio_dir.iterdir():
-            if f.is_file():
-                f.unlink()
-                n_del += 1
+    # 转写完成后清理 /tmp 音频（可选，--cleanup-audio；只删本次下载的）
+    if args.cleanup_audio and downloaded_audio:
+        n_del = cleanup_audio_files(downloaded_audio)
         print(f"🧹 --cleanup-audio：已清理 {n_del} 个 /tmp 音频")
 
 
@@ -765,6 +780,7 @@ def main():
 
     n_ok = n_skip = n_fail = 0
     new_raw_paths = []  # 本次成功下载的 info.json 路径（--transcribe 用）
+    downloaded_audio: list[Path] = []  # 本次下载成功清单（--cleanup-audio 白名单）
     for i, item in enumerate(items, 1):
         title = item["title"]
         guid_hash8 = derive_rss_id.derive_id(
@@ -812,6 +828,7 @@ def main():
         print(f"  ✅ 完成：{raw_path.name}")
         n_ok += 1
         new_raw_paths.append(raw_path)
+        downloaded_audio.append(audio_path)
 
         if i < len(items):
             print(f"  ...sleep {SLEEP_BETWEEN}s (CDN 礼仪)")
@@ -845,13 +862,9 @@ def main():
         if t_ok:
             print(f"💡 阶段 2 完成。阶段 3（笔记生成）后续实现。")
 
-    # 转写完成后清理 /tmp 音频（可选，--cleanup-audio）
-    if args.cleanup_audio and audio_dir.exists():
-        n_del = 0
-        for f in audio_dir.iterdir():
-            if f.is_file():
-                f.unlink()
-                n_del += 1
+    # 转写完成后清理 /tmp 音频（可选，--cleanup-audio；只删本次下载的）
+    if args.cleanup_audio and downloaded_audio:
+        n_del = cleanup_audio_files(downloaded_audio)
         print(f"🧹 --cleanup-audio：已清理 {n_del} 个 /tmp 音频")
 
     # 全部下载失败时返回非零退出码（让 fetch_rss_pending 正确识别失败）

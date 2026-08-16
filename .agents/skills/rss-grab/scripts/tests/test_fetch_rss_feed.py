@@ -153,3 +153,26 @@ def test_alert_feed_failure_err_sanitized(tmp_path):
     assert all_items[0]["checkbox"] == "[ ]"
     # 告警本身还在（单行化后）
     assert "feed 抓取失败" in state_path.read_text(encoding="utf-8")
+
+
+def test_cleanup_audio_only_deletes_given_files(tmp_path):
+    """--cleanup-audio 只删本次下载清单内的文件，不误删 /tmp 共享目录里的其他文件。"""
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    mine1 = audio_dir / "ep1-aaaa1111.m4a"
+    mine2 = audio_dir / "ep2-bbbb2222.mp3"
+    others_session = audio_dir / "其他会话放的-cccc3333.m4a"
+    for p in (mine1, mine2, others_session):
+        p.write_text("x")
+
+    n = f.cleanup_audio_files([mine1, mine2])
+
+    assert n == 2
+    assert not mine1.exists() and not mine2.exists()
+    assert others_session.exists(), "不得误删非本次清单的文件"
+
+
+def test_cleanup_audio_tolerates_missing(tmp_path):
+    """清单里已不存在的文件静默跳过（下载失败路径不进清单，双保险）。"""
+    gone = tmp_path / "audio" / "gone-dddd4444.m4a"
+    assert f.cleanup_audio_files([gone]) == 0
