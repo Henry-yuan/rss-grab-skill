@@ -92,6 +92,26 @@ def test_resume_skips_completed(tmp_path):
     assert p._item_key(items[1], 1) == "guid-b"
 
 
+def test_main_standalone_disabled_with_hint():
+    """回归：main() 不再调用已裁剪的 render_pick_file/pick_file_path（init 起就断裂）。
+
+    独立运行应直接给出指引退出（SystemExit 非零 + 提示走 --fetch-updates），
+    而不是先联网抓取再 AttributeError。
+    """
+    import io
+    import contextlib
+    buf = io.StringIO()
+    code = None
+    try:
+        with contextlib.redirect_stdout(buf):
+            p.main()
+    except SystemExit as e:
+        code = e.code
+    assert code is not None and code != 0, "main() 应 SystemExit 非零"
+    assert "fetch-updates" in buf.getvalue()
+    print("✅ test_main_standalone_disabled_with_hint")
+
+
 if __name__ == "__main__":
     import tempfile
     from pathlib import Path
@@ -104,6 +124,7 @@ if __name__ == "__main__":
         test_replace_descriptions_missing_marks_failure,
         test_item_key_guid,
         test_item_key_idx_fallback,
+        test_main_standalone_disabled_with_hint,
     ]
     for t in tests:
         t()

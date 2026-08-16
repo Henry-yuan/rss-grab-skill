@@ -18,7 +18,6 @@
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -273,30 +272,13 @@ def summarize_items(feed: dict, items: list[dict], checkpoint_path: Path | None 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AI 预读播客简介并生成摘要")
-    parser.add_argument("rss_url", help="RSS feed URL")
-    parser.add_argument("--out", type=Path, help="输出勾选文件路径（默认 rss/选择下载/<节目名>-<时间戳>.md）")
-    parser.add_argument("--checkpoint", type=Path, help="checkpoint 落盘路径（默认 <out>.checkpoint.json）")
-    args = parser.parse_args()
-
-    import fetch_rss_feed as f
-    xml_bytes = f.fetch_xml(args.rss_url)
-    feed = parse_rss.parse_text(xml_bytes)
-    if not parse_rss.is_podcast_audio_feed(feed):
-        print("⚠️  不是播客音频 feed，退出")
-        sys.exit(1)
-
-    out = args.out or f.pick_file_path(feed["title"])
-    checkpoint = args.checkpoint or out.with_name(out.stem + ".checkpoint.json")
-
-    # Step 1: 生成勾选文件（含原始简介）
-    f.render_pick_file(feed["items"], out, feed=feed)
-    print(f"\n=== AI 预读简介（{len(feed['items'])} 期，并发 ≤{MAX_WORKERS}，间隔 {LAUNCH_INTERVAL}s）===")
-    # Step 2: AI 摘要替换 description
-    summarize_items(feed, feed["items"], checkpoint)
-    # Step 3: 重写勾选文件（description 已被 AI 摘要替换）
-    f.render_pick_file(feed["items"], out, feed=feed)
-    print(f"\n✅ 完成：{out}")
+    # 原 main 的独立运行入口调用 fetch_rss_feed.render_pick_file /
+    # pick_file_path——这两个函数属于开源时裁剪掉的"选择下载"模式，仓库里
+    # 不存在，独立运行必然 AttributeError。本脚本是内部模块，摘要由
+    # fetch_rss_feed --fetch-updates 编排调用，不再支持独立运行。
+    print("本脚本为内部模块（AI 摘要由 fetch_rss_feed.py 编排调用），不支持独立运行。")
+    print("拉取增量 + AI 摘要请使用：python3 fetch_rss_feed.py --fetch-updates")
+    sys.exit(2)
 
 
 if __name__ == "__main__":
