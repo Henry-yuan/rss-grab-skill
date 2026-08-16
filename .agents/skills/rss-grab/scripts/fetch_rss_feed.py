@@ -304,7 +304,19 @@ def cmd_subscribe(apple_url: str, feed_url_override: str = "") -> None:
     print(f"   共 {len(feed['items'])} 期（跑 --fetch-updates 拉取内容）")
 
 
-def cmd_fetch_updates() -> None:
+def cap_new_items(new_items: list[dict], max_items: int) -> list[dict]:
+    """--max-updates 截断：max_items>0 时只保留 feed 顺序前 N 期。
+
+    播客 feed 惯例最新在前，前 N 期即最近 N 期。首次订阅大 feed
+    （几百期）时用它避免全量跑 LLM 摘要（token/时间成本高）；
+    被截断的期数不写状态文件，下次不带 --max-updates 再跑仍会处理。
+    """
+    if max_items > 0 and len(new_items) > max_items:
+        return new_items[:max_items]
+    return new_items
+
+
+def cmd_fetch_updates(max_updates: int = 0) -> None:
     """遍历订阅表，每个源拉增量 -> AI 摘要 -> 写状态文件待确认区。
 
     处理两类：
@@ -335,6 +347,10 @@ def cmd_fetch_updates() -> None:
             state = subscribe_manager.load_state(state_file)
             known = subscribe_manager.collect_known_guids(state)
             new_items = subscribe_manager.find_new_items(feed["items"], known)
+            if max_updates > 0 and len(new_items) > max_updates:
+                print(f"  ⚠️ 新增 {len(new_items)} 期，--max-updates {max_updates} 截断为最近 {max_updates} 期"
+                      f"（剩余 {len(new_items) - max_updates} 期下次不带 --max-updates 再跑会处理）")
+                new_items = cap_new_items(new_items, max_updates)
 
             # 待补摘要的已有期：待确认区里缺"一句话概括"的
             missing = [it for it in state["pending"]
@@ -698,6 +714,9 @@ def main():
                     help="--subscribe 的手动 feed URL fallback（反推失败时用）")
     ap.add_argument("--fetch-updates", action="store_true",
                     help="遍历订阅表，拉取所有源的增量 -> AI 摘要 -> 写状态文件待确认区")
+    ap.add_argument("--max-updates", type=int, default=0,
+                    help="--fetch-updates 配套：每个源最多处理 N 期新增（0=全部；"
+                         "首次订阅几百期的大 feed 建议限 5，避免全量跑 LLM 摘要）")
     ap.add_argument("--sync-pick", type=Path,
                     help="读状态文件的 checkbox，按 [x]/[~]/[done] 重新归区 + 更新提示行")
     ap.add_argument("--pick-subscribe", type=Path,
@@ -712,7 +731,7 @@ def main():
     if args.subscribe:
         return cmd_subscribe(args.subscribe, feed_url_override=args.feed_url)
     if args.fetch_updates:
-        return cmd_fetch_updates()
+        return cmd_fetch_updates(max_updates=args.max_updates)
     if args.sync_pick:
         return cmd_sync_pick(args.sync_pick)
     if args.pick_subscribe:

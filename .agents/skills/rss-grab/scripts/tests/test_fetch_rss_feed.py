@@ -176,3 +176,18 @@ def test_cleanup_audio_tolerates_missing(tmp_path):
     """清单里已不存在的文件静默跳过（下载失败路径不进清单，双保险）。"""
     gone = tmp_path / "audio" / "gone-dddd4444.m4a"
     assert f.cleanup_audio_files([gone]) == 0
+
+
+def test_cap_new_items():
+    """--max-updates 截断：0=不限制；N>0 只保留 feed 顺序前 N 期（最新在前）。"""
+    items = [{"guid": f"g{i}", "title": f"t{i}"} for i in range(10)]
+    # 0 = 不限制（默认，增量语义不变）
+    assert f.cap_new_items(items, 0) == items
+    assert f.cap_new_items(items, -1) == items
+    # 截前 N（feed 最新在前 = 最近 N 期）
+    capped = f.cap_new_items(items, 5)
+    assert len(capped) == 5
+    assert capped[0]["guid"] == "g0" and capped[-1]["guid"] == "g4"
+    # 不足 N 不扩
+    assert f.cap_new_items(items[:3], 5) == items[:3]
+    print("✅ test_cap_new_items")
