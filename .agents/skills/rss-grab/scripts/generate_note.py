@@ -163,13 +163,29 @@ def call_llm_for_note_generation(
     return strip_thinking_blocks(content)
 
 
-def inject_note_metadata(note_md: str, style_detected: str, template_used: str) -> str:
-    """在笔记最前面注入 YAML frontmatter。"""
+def inject_note_metadata(
+    note_md: str,
+    style_detected: str,
+    template_used: str,
+    source_url: str | None = None,
+    guid: str | None = None,
+    pubdate: str | None = None,
+    feed_title: str | None = None,
+) -> str:
+    """在笔记最前面注入 YAML frontmatter。
+
+    source_url/guid/pubdate/feed_title 为 V2.8 导入桥字段（下游知识库所需）：
+    None/空时跳过该键，不让 frontmatter 出现空值。
+    """
     plan = {
         "style_detected": style_detected,
         "template_used": template_used,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds"),
     }
+    # V2.8 导入桥：字段缺失/为空时跳过该键
+    for k, v in (("source_url", source_url), ("guid", guid), ("pubdate", pubdate), ("feed_title", feed_title)):
+        if v:
+            plan[k] = v
     fm_lines = ["---"]
     for k, v in plan.items():
         fm_lines.append(f"{k}: {v}")
@@ -317,10 +333,18 @@ def main():
         source=args.source,
     )
 
+    # V2.8 导入桥：知识库导入所需字段（episode 链接原样保留，下游会归一化；guid 缺失回退 --guid）
+    item = info.get("item", {})
+    feed = info.get("feed", {})
+
     note_md = inject_note_metadata(
         note_md=note_md,
         style_detected=plan.get("style_detected", "待确认"),
         template_used=plan.get("template_used", "兜底"),
+        source_url=item.get("link") or None,
+        guid=item.get("guid") or args.guid or None,
+        pubdate=item.get("pub_date") or None,
+        feed_title=feed.get("title") or None,
     )
 
     if plan.get("is_fallback", True):
