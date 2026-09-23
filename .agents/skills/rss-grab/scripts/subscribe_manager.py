@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -313,6 +314,21 @@ def collect_known_guids(state: dict) -> set[str]:
     return guids
 
 
+def _relativize_note_path(state_path: Path, note_path: str) -> str:
+    """笔记路径统一转成相对状态文件所在目录的相对路径再落盘。
+
+    调用方（generate_note --output）传的是绝对路径，直接落盘会让状态文件在
+    项目迁移后全部变成死链（2026-09-19 迁移实测）。相对路径先按 CWD 锚到
+    绝对再转；无法转换（如跨盘）时保留原样。
+    """
+    try:
+        abs_path = Path(note_path).expanduser().resolve()
+        state_dir = Path(state_path).expanduser().resolve().parent
+        return os.path.relpath(abs_path, state_dir)
+    except ValueError:
+        return note_path
+
+
 def mark_done(state_path: Path, guid: str, note_path: str) -> bool:
     """把指定 guid 的期从"确认"移到"已转化"，标 [done] 并附笔记路径。
 
@@ -342,7 +358,7 @@ def mark_done(state_path: Path, guid: str, note_path: str) -> bool:
         state["pending"].remove(target)
 
     target["checkbox"] = CHECKBOX_DONE
-    target["note_path"] = note_path
+    target["note_path"] = _relativize_note_path(state_path, note_path)
     state["done"].append(target)
 
     save_state(state_path, state)

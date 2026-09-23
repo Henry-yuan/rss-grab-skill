@@ -10,6 +10,7 @@
   - add/remove subscription 订阅表读写
 """
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -191,6 +192,32 @@ def test_mark_done_not_found(tmp_path):
     ok = sm.mark_done(state_path, "not-exist", "note.md")
     assert ok is False
     print("✅ test_mark_done_not_found")
+
+
+def test_mark_done_abs_path_relativized(tmp_path):
+    """绝对路径的 note_path 落盘前转成相对状态文件目录的路径（防迁移死链）。"""
+    state_path = tmp_path / "订阅" / "test.md"
+    state_path.parent.mkdir(parents=True)
+    state = sm._empty_state()
+    state["frontmatter"] = {"source": "测试", "feed_url": "https://x", "subscribed_at": "2026-08-11"}
+    state["confirmed"] = [{
+        "checkbox": "[x]",
+        "seq": 1,
+        "title": "第一期",
+        "guid": "g1",
+        "fields": {},
+    }]
+    sm.save_state(state_path, state)
+
+    abs_note = tmp_path / "notes" / "src" / "1-第一期.md"
+    ok = sm.mark_done(state_path, "g1", str(abs_note))
+    assert ok is True
+
+    loaded = sm.load_state(state_path)
+    note_path = loaded["done"][0]["note_path"]
+    assert not os.path.isabs(note_path)
+    assert note_path == os.path.join("..", "notes", "src", "1-第一期.md")
+    print("✅ test_mark_done_abs_path_relativized")
 
 
 def test_update_summary(tmp_path):
