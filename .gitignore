@@ -27,3 +27,6 @@ HANDOFF.md
 
 # macOS
 .DS_Store
+
+# .env 备份文件（含 API 密钥，绝不入库）
+**/scripts/.env.bak-*
