@@ -92,13 +92,14 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到 rss/audi
 转写后，生成结构化中文笔记 + 索引登记：
 
 1. **判断模式**：`python3 scripts/decide_mode.py rss/transcripts/<...>.transcript.md`
-   - < 50K 字符 -> skill 模式；>= 50K 字符 -> map_reduce（rss feed 全部是对话/观点类播客，临界区一律 map-reduce，不做标题关键词判断）
+   - **净字 ≤ 15,000 -> skill 模式；净字 > 15,000 -> map_reduce**。净字 = 剥 `**[mm:ss]**` 时间戳后去所有空白，口径实现在 `_shared/long_doc.py`（与小红书 `build_v3.py` 共用同一份定义）。阈值来源：V1.0 spec AC-A3（2026-10-04 由「原始字符 ≥ 50,000」改来）。
+   - ⚠️ **长文走 map-reduce 还是 v3 四步尚未定案**（spec D6 决策点，正在实测）；当前一律判给 map_reduce 属现状延续。
 2. **选模板**：`python3 ~/.agents/skills/rss-grab/scripts/adapt_template.py <transcript> --templates-dir ~/.agents/skills/rss-grab/templates`
    - 调 `scripts/adapt_template.py`（不硬编码路径），传 rss 的 templates-dir
    - 播客命中「访谈播客」模板
 3. **生成笔记**：
    - skill 模式（短播客）：`python3 scripts/generate_note.py <transcript> <plan.json> --info-json <info.json> --output <note.md>`
-   - map-reduce 模式（长播客 >50K）：`python3 scripts/regenerate_note.py <guid_hash8>`（自动跑 map_reduce_note.py -> final.json -> generate_note --source summary）
+   - map-reduce 模式（长播客，净字 > 15,000）：`python3 scripts/regenerate_note.py <guid_hash8>`（自动跑 map_reduce_note.py -> final.json -> generate_note --source summary）
    - 自动追加 rss/notes/INDEX.md（按 guid_hash8 dedup）
 4. **重生成**：`python3 scripts/regenerate_note.py <guid_hash8> [--mode auto|skill|map_reduce] [--keep-v1]`
 5. **批量抓取**：`python3 scripts/fetch_rss_pending.py [待抓取URL/RSS.md]`
