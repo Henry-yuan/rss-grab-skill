@@ -1,13 +1,13 @@
 ---
 name: rss-grab
-description: 抓取播客 RSS feed：解析 RSS XML -> 下载音频到 rss/audio/ -> 元数据落到 rss/raw/<guid_hash8>.info.json（增量去重，二次运行跳过已有）-> ASR 转写（阶段 2，mlx-whisper）-> 生成结构化中文笔记 + INDEX 索引（阶段 3，短播客 skill 模式 / 长播客 map-reduce 模式）。支持订阅模式（阶段 4）：Apple Podcasts 链接自动反推 feed URL -> 定时拉增量 -> 状态文件勾选 -> 抓取做笔记。当用户提供播客 RSS 链接（https://feed.xyzfm.space/xxx 或 https://xxx.com/feed.xml）或 Apple Podcasts 链接并要求"订阅 / 抓下来 / 下载播客 / 拉取期数 / 转写 / 写笔记"时使用。只支持播客音频类 RSS（RSS 2.0 + itunes + audio enclosure），文章/视频/Atom/JSON Feed 识别后提示不处理。依赖：yt-dlp、curl、Python 3.12+、mlx-whisper（Apple Silicon）、LLM_API_KEY。
+description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到 rss/audio/ → 元数据落到 rss/raw/guid_hash8.info.json（增量去重，二次运行跳过已有）→ ASR 转写（阶段 2，mlx-whisper）→ 生成结构化中文笔记 + INDEX 索引（阶段 3，短播客 skill 模式 / 长播客 map-reduce 模式）。支持订阅模式（阶段 4）：Apple Podcasts 链接自动反推 feed URL → 定时拉增量 → 状态文件勾选 → 抓取做笔记。当用户提供播客 RSS 链接（https://feed.xyzfm.space/xxx 或 https://xxx.com/feed.xml）或 Apple Podcasts 链接并要求"订阅 / 抓下来 / 下载播客 / 拉取期数 / 转写 / 写笔记"时使用。只支持播客音频类 RSS（RSS 2.0 + itunes + audio enclosure），文章/视频/Atom/JSON Feed 识别后提示不处理。依赖：yt-dlp、curl、Python 3.12+、mlx-whisper（Apple Silicon）、LLM_API_KEY。
 ---
 
 # RSS Grab
 
 ## 触发条件
 
-用户在 Codex 对话中发送 RSS 链接（含 `feed.xyzfm.space`、`/rss`、`/feed`、`.xml` 等）或 Apple Podcasts 链接（`podcasts.apple.com`），并要求订阅播客 / 下载播客 / 抓取期数 / 拉取音频。
+用户发送 RSS 链接（含 `feed.xyzfm.space`、`/rss`、`/feed`、`.xml` 等）或 Apple Podcasts 链接（`podcasts.apple.com`），并要求订阅播客 / 下载播客 / 抓取期数 / 拉取音频。
 
 ## 阶段 4 工作流（订阅模式，推荐）
 
