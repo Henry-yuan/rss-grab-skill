@@ -126,7 +126,12 @@ def call_llm_for_template_choice(
         ],
         temperature=0.2,
         # 显式大值，让 LLM 充分发挥
-        max_tokens=32000,
+        extra_body={
+            # M3 官方: max_completion_tokens 上限 524288(512K), 推荐 131072(128K)
+            "max_completion_tokens": 100000,
+            # 思考内容拆分到 reasoning_content 字段, content 不再混 <think> 块
+            "reasoning_split": True,
+        },
     )
     content = resp.choices[0].message.content.strip()
 
