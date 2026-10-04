@@ -18,7 +18,7 @@ import pathlib
 import re
 import unittest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]      # .agents/skills/_shared/tests/ → 仓库根
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]      # .agents/skills/_shared/tests/ → 仓库根
 GUARD_FILE = pathlib.Path(__file__).resolve()
 
 # 禁止出现的源专属特征。
@@ -27,7 +27,9 @@ BANNED = {
     "小红书（中文名）": re.compile(r"小红书"),
     "小红书（拼音）": re.compile(r"xiaohongshu", re.I),
     "小红书（缩写）": re.compile(r"\bxhs\b", re.I),
-    "B 站（中文名）": re.compile(r"B\s*站|B站", re.I),
+    # ⚠️ 左边界不能省：`B\s*站` 会命中「rss-gr**ab 站**在巨人的肩膀上」
+    # （README 致谢段，真实误报）。要求 B 前面不是字母数字下划线。
+    "B 站（中文名）": re.compile(r"(?<![0-9A-Za-z_])B\s*站"),
     "B 站（拼音）": re.compile(r"bilibili", re.I),
     "B 站 skill 名": re.compile(r"bili-grab"),
     "B 站 bvid": re.compile(r"\bBV[0-9A-Za-z]{10}\b"),
