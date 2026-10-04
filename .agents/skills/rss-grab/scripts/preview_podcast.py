@@ -39,7 +39,16 @@ MAX_WORKERS_FALLBACK = 15  # 429 熔断后降级并发（2026-08-11 P3 新增）
 LAUNCH_INTERVAL = 2      # 发射间隔（秒），错开峰值（2026-08-11 从 5 改 2）
 MAX_ATTEMPTS = 3         # 每期最多尝试（1 次 + 2 次重试）
 CHECKPOINT_EVERY = 25    # 每 N 期 check点落盘
-SUMMARY_MAX_TOKENS = 1500
+# 输出预算：**天花板，不是限长工具**（同 map_reduce_note.py，2026-10-04）。
+#
+# ⚠️ 本值原为 1500 且 spec AC-C4 写「值保留、只改参数名」—— 那条指示是在发现
+# thinking token 之前写的，按现在的证据保留 1500 必然失败：现模型是推理模型，
+# thinking 与正文共享预算，1500 里 thinking 独占大部分 → 正文被截断 →
+# 触发现有校验（len<20 或缺「一句话概括」）→ 重试到 MAX_ATTEMPTS 耗尽后报错。
+# 每天 22:30 的订阅拉取会因此失败，故此处一并抬高。
+# 期望正文仅数百 token（播客简介），16,000 已是 20 倍以上余量；
+# 与 map-reduce 的 100,000 不同是因为期望输出量级不同，不是两套魔数。
+SUMMARY_MAX_COMPLETION = int(os.environ.get("LLM_SUMMARY_MAX_COMPLETION", "16000"))
 
 PROMPT = """你是播客简介摘要助手。为下面这一期播客生成结构化中文摘要，**直接输出纯文本**（不要 JSON，不要代码块，不要思考过程）：
 
@@ -93,7 +102,9 @@ def summarize_one(client, model, item: dict, label: str,
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
-                max_tokens=SUMMARY_MAX_TOKENS,
+                # 参数名必须是 max_completion_tokens（AC-C4）：推理模型的 thinking
+                # token 计入此预算，旧的 max_tokens 语义不同。
+                max_completion_tokens=SUMMARY_MAX_COMPLETION,
             )
             content = resp.choices[0].message.content
             summary = strip_thinking_blocks(content)
