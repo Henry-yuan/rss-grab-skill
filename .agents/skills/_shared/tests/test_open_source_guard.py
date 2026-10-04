@@ -32,8 +32,9 @@ BANNED = {
     "B 站 skill 名": re.compile(r"bili-grab"),
     "B 站 bvid": re.compile(r"\bBV[0-9A-Za-z]{10}\b"),
     "小红书分享参数": re.compile(r"xsec_token|xhsshare|xsec_source", re.I),
-    "小红书 note_id": re.compile(r"\bnote_id\b"),
-    "小红书专属字段": re.compile(r"\bnickname\b|\bpublish_time_ms\b"),
+    # ⚠️ `note_id` **不在**黑名单里：它是 AC-C2 定的**三源共用主键名**
+    # （本仓库侧填 guid_hash8），曾被误列为某源专属而误报，见 spec 决策记录。
+    "某源专属的原始字段名": re.compile(r"\bnickname\b|\bpublish_time_ms\b"),
     "小红书图文扩展名": re.compile(r"images\.md"),
     "图文采集（OCR）": re.compile(r"\bOCR\b"),
 }
