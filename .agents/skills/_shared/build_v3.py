@@ -553,3 +553,89 @@ def run_long_path(src_path: Path, source: str, client,
             "n_points": len(pts), "n_chunks": len(chunks)}
 
 
+# ── 编排：产出正文 ─────────────────────────────────────────
+def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos_dir: Path) -> tuple[str, dict, dict]:
+    """跑完四步，返回 **(正文, 校验报告, 统计)**。
+
+    **本函数不写任何文件** —— frontmatter 组装与落盘由调用方做。
+    这样本模块完全不需要知道数据来自哪个源（AC-C2 的「信头归调用方」）。
+
+    流程：
+        净字数 > LONG_DOC_THRESHOLD → ①.5 纠错 → ② 分块扫描 → ③ 合并去重
+                                        → ④ 撰写 → 校验
+        否则                      → ①.5 纠错 → 单次调用 → 校验
+
+    Args:
+        src_path: 源文路径（`<title>-<id>.transcript.md`）
+        info:     元信息 dict；喂给 LLM 的部分按模块级 `PROMPT_INFO_FIELDS` 白名单取
+        client:   OpenAI 兼容客户端
+        work_dir: 中间产物目录（纠错后的 clean.md / points / topics）
+        typos_dir: 纠错报告落盘目录（`*.typos.json`，供溯源）
+
+    Returns:
+        (body, report, stats)。`report` 是 `validate()` 的报告 dict；
+        `stats` 含 route / net_chars / typo_applied / attempts 等。
+
+    Raises:
+        RuntimeError: 校验连续 MAX_RETRY+1 次未过，或分块路径失败。
+    """
+    from clean_source import load_and_clean
+    from validate_v3 import validate
+    stem = src_path.name.replace('.transcript.md', '')
+    stats: dict = {'stem': stem, 'route': '', 'attempts': 0}
+    source, cstat = load_and_clean(src_path)
+    stats['source_chars'] = len(source)
+    stats['clean'] = cstat
+    n_chars = net_len(source)
+    is_long = n_chars > LONG_DOC_THRESHOLD
+    stats['net_chars'] = n_chars
+    stats['route'] = 'chunked' if is_long else 'single'
+    print(f'    净字数 {n_chars} → {('长文分块路径' if is_long else '单次调用路径')}', flush=True)
+    long_info = None
+    try:
+        from correct_typos import run_file
+        if is_long:
+            pass
+        else:
+            wr = work_dir / stem
+            typo_report = run_file(src_path, wr / f'{stem}.clean.md', typos_dir / f'{stem}.typos.json', client=client)
+            n = typo_report['applied_count']
+            if n:
+                print(f'    [短文] 错字纠正 落成 {n} 处 / 成功率 {typo_report['success_rate']:.1%}', flush=True)
+            source = (wr / f'{stem}.clean.md').read_text(encoding='utf-8')
+            stats['typo_applied'] = n
+            stats['typo_success_rate'] = typo_report['success_rate']
+    except Exception as e:
+        print(f'    ⚠️ 短文错字纠正失败，沿用原文：{type(e).__name__}: {str(e)[:110]}', flush=True)
+        stats['typo_error'] = f'{type(e).__name__}: {str(e)[:160]}'
+    if is_long:
+        wr = work_dir / stem
+        try:
+            long_info = run_long_path(src_path, source, client, wr)
+        except Exception as e:
+            print(f'    ✗ 长文路径失败: {type(e).__name__}: {str(e)[:160]}', flush=True)
+            raise RuntimeError(f'长文路径失败: {type(e).__name__}: {e}') from e
+        stats['n_points'] = long_info['n_points']
+        stats['n_chunks'] = long_info['n_chunks']
+        stats['n_topics'] = len(long_info['topics'])
+    last_err = None
+    for attempt in range(1, MAX_RETRY + 2):
+        stats['attempts'] = attempt
+        try:
+            if is_long:
+                raw = call_llm_topics(client, topics_block(long_info['topics']), info, n_topics=len(long_info['topics']))
+                body, llm = parse_output(raw)
+                v = validate(body, long_info['clean_text'], info, llm)
+            else:
+                raw = call_llm(client, source, info)
+                body, llm = parse_output(raw)
+                v = validate(body, source, info, llm)
+            if not v['ok']:
+                last_err = f'校验未过: {v['retries_needed']}'
+                print(f'    ⚠️ 第 {attempt} 次校验未过: {last_err}', flush=True)
+                continue
+            return (body, v['report'], stats)
+        except Exception as e:
+            last_err = f'{type(e).__name__}: {e}'
+            print(f'    ✗ 第 {attempt} 次生成异常: {last_err}', flush=True)
+    raise RuntimeError(f'撰写连续 {MAX_RETRY + 1} 次失败，最后一次: {last_err}')
