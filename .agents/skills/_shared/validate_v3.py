@@ -32,6 +32,42 @@ def normalize(s: str) -> str:
 
 
 # ── C3 章节归一 ──────────────────────────────────────
+def normalize_quotes(body: str) -> tuple[str, int]:
+    """把 `## 关键引用` 章里的引用统一成 `- 引用` 列表项。
+
+    历史上有三种写法并存：`- 引用`（存量主流 288 篇）、`- > 引用`（v3 提示词
+    规定的，实测 43/44 篇）、裸 `> 引用`。格式是机械问题，归代码收口——
+    提示词只负责告知，不承担保证责任（实测提示词也只做到 43/44）。
+
+    只处理 `## 关键引用` 章内部，不动其他章节的引用块。
+
+    Returns: (归一后正文, 改动行数)
+    """
+    m = re.search(r"^##\s*关键引用\s*$", body, re.M)
+    if not m:
+        return body, 0
+    head, sec = body[:m.end()], body[m.end():]
+    nxt = re.search(r"^##\s+", sec, re.M)
+    if nxt:
+        sec, tail = sec[:nxt.start()], sec[nxt.start():]
+    else:
+        tail = ""
+    fixed = 0
+    out = []
+    for ln in sec.split("\n"):
+        # `- > xxx` / `* > xxx` → `- xxx`
+        m2 = re.match(r"^(\s*)[-*]\s*>\s*(.+?)\s*$", ln)
+        # 裸 `> xxx` → `- xxx`
+        if not m2:
+            m2 = re.match(r"^(\s*)>\s*(.+?)\s*$", ln)
+        if m2:
+            out.append(f"{m2.group(1)}- {m2.group(2)}")
+            fixed += 1
+        else:
+            out.append(ln)
+    return head + "\n".join(out) + tail, fixed
+
+
 def normalize_sections(body: str):
     """把章节名收敛到三个硬章节：TL;DR + 要点总结 + 关键引用。多余 H2 降为 H3。
 
@@ -384,6 +420,10 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     # 4.1 未翻译英文（观测，不阻断）
     untr = find_untranslated(body)
     rep["C14_untranslated"] = {"count": len(untr), "samples": untr[:3]}
+
+    # C16 关键引用格式统一（只改格式，不改内容）
+    body, qfix = normalize_quotes(body)
+    rep["C16_quote_format"] = {"fixed": qfix}
 
     # 形态种类（纯观测，不设目标）
     rep["C15_block_kinds"] = {"kinds": sorted(block_kinds(body))}

@@ -228,6 +228,8 @@ USER_TPL = """## 笔记元信息
 }}"""
 
 # ── 长文路径：源太长（净字数 > 15000），一次调用装不下 ──
+# 源文清洗后的字符数下限。低于此值不调 LLM（见 generate_note_body 内的说明）。
+MIN_SOURCE_CHARS = 200
 LONG_DOC_THRESHOLD = 15000
 CHUNK_SIZE = 10000
 CHUNK_OVERLAP = 1
@@ -406,7 +408,7 @@ SYSTEM_PROMPT_TOPICS = """你是一个笔记撰写者。下方是一篇长转写
 - **可以轻微润色让句子读起来顺**，但**不得扭曲原文观点**：
   数字、限定条件、因果方向、对比项都要保持原样
 - 覆盖全文不同部分，数量你判断
-- 格式：`- > 引用`
+- 格式：`- 引用`（普通列表项，句首**不要**加 `>` 引用符）
 
 ## 广告
 
@@ -626,6 +628,21 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
     source, cstat = load_and_clean(src_path)
     stats['source_chars'] = len(source)
     stats['clean'] = cstat
+
+    # ── 源文下限闸门（三源共享）──
+    # 源文几乎没有内容时，纠错、分块、撰写全是白烧 LLM 调用，产出必然是空壳。
+    # 阈值来自实测分布：无内容的源文清洗后 44-73 字符；下一档（确实有内容）
+    # 从 298 字符起。200 落在两者中间，两侧都留了余量。
+    # 全库 320 篇实测只有 4 篇命中。
+    #
+    # 只依赖长度，不依赖 asr_status —— 那是某一源独有的 info 字段，
+    # 换成 transcript_status 后两边都取不到，留着就是只对一部分生效的闸门。
+    if len(source) < MIN_SOURCE_CHARS:
+        stats['status'] = 'empty'
+        print(f"    ⏭️ 源文仅 {len(source)} 字符（< {MIN_SOURCE_CHARS}）→ 跳过正文生成",
+              flush=True)
+        return '', {'C0_empty_source': {'chars': len(source)}}, stats
+
     n_chars = net_len(source)
     is_long = n_chars > LONG_DOC_THRESHOLD
     stats['net_chars'] = n_chars
@@ -678,7 +695,13 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
             # 2026-10-04 漏掉这一步，导致 rss 薄壳写出的 frontmatter
             # `tags` / `summary` 恒为空。放进 stats 一起返回。
             stats['llm'] = llm
-            return (body, v['report'], stats)
+            # ⚠️ 必须返回 v['body']，不能返回原始 body。
+            # validate() 里那一整条归一化链（H3 去编号、重新编号、剥时间戳、
+            # TL;DR 去重、引用格式统一）全都作用在 v['body'] 上；返回原始 body
+            # 等于把归一化结果直接丢弃——H3 编号 `### 1.` 会原样落盘。
+            # 2026-10-04 实测：ok=True 的生产路径上 validate 归一化了 2 个 H3，
+            # 文件里仍留着编号。归一化器是死代码，从未生效过。
+            return (v['body'], v['report'], stats)
         except Exception as e:
             last_err = f'{type(e).__name__}: {e}'
             print(f'    ✗ 第 {attempt} 次生成异常: {last_err}', flush=True)

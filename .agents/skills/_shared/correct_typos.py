@@ -400,6 +400,17 @@ def apply_judgments(text: str, judgments: list[dict]) -> tuple[str, dict]:
             rejected.append({**it, "why": "span_crosses_newline"})
             stat["span_nl"] += 1
             continue
+        # 区间与已接受的那条重叠 → 放弃这一处。
+        # 模型偶尔对**同一处报两遍完全相同的判断**（实测 NotebookLM 636941a1：
+        # `Zedcool→ZCOOL` 与 `Andrew Kaparty→Andrej Karpathy` 各重复一次）。
+        # 倒序叠加时每条都用「按原文算的」a0/a1，而前一条已经把文本改短了，
+        # 第二条的 out[a1:] 就从偏后的位置切 → 多切掉几个字符。
+        # 实测刚好切掉一个换行：行数 2707 -> 2706，assert 失败 → 整篇长文作废。
+        # 单条重复查不出来（单独应用每条都不改行数），只有成对叠加才暴露。
+        if any(a0 < k1 and k0 < a1 for k0, k1, *_ in plan):
+            rejected.append({**it, "why": "overlaps_earlier"})
+            stat["overlap"] += 1
+            continue
         stat["applied"] += 1
         if k != si - 1:
             stat["neighbor_rescued"] += 1

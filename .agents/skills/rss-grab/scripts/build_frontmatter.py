@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 from datetime import datetime
 from pathlib import Path
@@ -219,46 +220,22 @@ def build(info: dict, *, transcript_status: str = "ok",
     }
 
 
-DUMP_SAFE = str.maketrans({":": "：", "#": "＃", '"': "＂", "'": "＇",
-                             "[": "［", "]": "］", "{": "｛", "}": "｝"})
-
-
-def _scalar(v) -> str:
-    """标量 → YAML 字面量。
-
-    ⚠️ **换行必须转义成 \\n**（2026-10-04 修）：值里若含真换行，写出来的
-    YAML 会跨行 —— 一旦值里还含 `---`（实际踩过：某期条目的 description 里就有），
-    读回时会把它误认成 frontmatter 的闭合标记，**正文被整段吞掉**。
-    转义成单行后这个失败模式彻底消失。
-    """
-    s = str(v)
-    if s == "":
-        return '""'
-    if "\n" in s or "\r" in s or s.translate(DUMP_SAFE) != s \
-            or re.search(r"^\s|\s$|:\s", s):
-        esc = (s.replace("\\", "\\\\").replace('"', '\\"')
-                .replace("\r\n", "\\n").replace("\n", "\\n")
-                .replace("\r", "\\n"))
-        return '"' + esc + '"'
-    return s
-def dump(fm: dict) -> str:
-    """frontmatter dict → YAML 文本（含首尾 `---`）。"""
-    out = ["---"]
-    for k, v in fm.items():
-        if isinstance(v, list):
-            if not v:
-                out.append(f"{k}: []")
-            else:
-                out.append(f"{k}:")
-                out += [f"  - {_scalar(x)}" for x in v]
-        elif isinstance(v, bool):
-            out.append(f"{k}: {'true' if v else 'false'}")
-        elif isinstance(v, (int, float)):
-            out.append(f"{k}: {v}")
-        else:
-            out.append(f"{k}: {_scalar(v)}")
-    out.append("---")
-    return "\n".join(out)
+# 字段契约与序列化统一在 `_shared/build_frontmatter.py`（三源共用）。
+# 本模块只负责 rss 侧的「从 info.json 取数」，字段集由 FIELDS 兜底：
+# normalize() 会按 FIELDS 顺序补齐缺失键，多余键丢弃。
+import sys as _sys
+_shared = _sys.modules.get("frontmatter_contract")
+if _shared is None:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "frontmatter_contract",
+        str(pathlib.Path(__file__).resolve().parent.parent.parent / "_shared" / "frontmatter_contract.py"))
+    _shared = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_shared)
+FIELDS = _shared.FIELDS
+dump = _shared.dump
+check = _shared.check
+normalize = _shared.normalize
 
 
 if __name__ == "__main__":
