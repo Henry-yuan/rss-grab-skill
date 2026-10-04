@@ -389,6 +389,17 @@ def apply_judgments(text: str, judgments: list[dict]) -> tuple[str, dict]:
         #                              归一化后才对得上」的情况（低质量文本常见）
         a1 = max(a0 + len(orig_raw),
                  im[min(at + len(on) - 1, len(im) - 1)] + 1)
+        # 替换区间**不得跨行**。
+        # `a0 + len(orig_raw)` 假定 original 在原文里逐字连续出现，可匹配是在
+        # **归一化串**上做的（空白/标点/星号全被剥掉）。模型报的 original 常比原文长
+        # （`**ChatGPT**`、`ChatGPT，`、`ChatGPT。`），a1 于是越过匹配点、吞掉紧随其后
+        # 的换行 → 行数 -1 → assert_structure_preserved 整条作废，该篇长文直接不生成。
+        # 真实踩坑：NotebookLM(636941a1) 2707 -> 2706。
+        # 与本模块「宁可不动」一致：跨行就放弃这一处，不拿结构冒险。
+        if "\n" in text[a0:a1] or "\r" in text[a0:a1]:
+            rejected.append({**it, "why": "span_crosses_newline"})
+            stat["span_nl"] += 1
+            continue
         stat["applied"] += 1
         if k != si - 1:
             stat["neighbor_rescued"] += 1

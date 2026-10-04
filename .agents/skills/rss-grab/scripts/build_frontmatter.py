@@ -219,20 +219,28 @@ def build(info: dict, *, transcript_status: str = "ok",
     }
 
 
-_DUMP_SAFE = str.maketrans({":": "：", "#": "＃", '"': "＂", "'": "＇",
+DUMP_SAFE = str.maketrans({":": "：", "#": "＃", '"': "＂", "'": "＇",
                              "[": "［", "]": "］", "{": "｛", "}": "｝"})
 
 
 def _scalar(v) -> str:
-    """标量转 YAML 字面量：含特殊字符就加引号。"""
+    """标量 → YAML 字面量。
+
+    ⚠️ **换行必须转义成 \\n**（2026-10-04 修）：值里若含真换行，写出来的
+    YAML 会跨行 —— 一旦值里还含 `---`（实际踩过：某期条目的 description 里就有），
+    读回时会把它误认成 frontmatter 的闭合标记，**正文被整段吞掉**。
+    转义成单行后这个失败模式彻底消失。
+    """
     s = str(v)
     if s == "":
         return '""'
-    if s.translate(_DUMP_SAFE) != s or re.search(r"^\s|\s$|:\s", s):
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if "\n" in s or "\r" in s or s.translate(DUMP_SAFE) != s \
+            or re.search(r"^\s|\s$|:\s", s):
+        esc = (s.replace("\\", "\\\\").replace('"', '\\"')
+                .replace("\r\n", "\\n").replace("\n", "\\n")
+                .replace("\r", "\\n"))
+        return '"' + esc + '"'
     return s
-
-
 def dump(fm: dict) -> str:
     """frontmatter dict → YAML 文本（含首尾 `---`）。"""
     out = ["---"]
