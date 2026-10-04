@@ -321,9 +321,18 @@ def main():
     else:
         mode = args.mode
 
-    if mode == "map_reduce":
-        print("\n▶ map-reduce 模式（长播客）")
-        run_map_reduce(transcript_path, plan_path, args.output, info_path)
+    if mode == "v3":
+        # 长文走 v3 四步管线（D6 拍板 2026-10-04，取代原 map-reduce）
+        # 直接转调 generate_note_v3.py —— 那个薄壳已做好信头/落盘/索引/状态标记
+        print("\n▶ v3 四步管线（长播客）")
+        cmd = [sys.executable, str(SCRIPT_DIR / "generate_note_v3.py"),
+               "--transcript", str(transcript_path),
+               "--info", str(info_path),
+               "--output", str(args.output)]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SCRIPT_DIR))
+        print(r.stdout.rstrip() or r.stderr.rstrip())
+        if r.returncode != 0:
+            raise RuntimeError(f"generate_note_v3.py 失败: {r.returncode}")
     else:
         print("\n▶ skill 模式（短播客）")
         run_generate_note(transcript_path, plan_path, info_path, args.output)

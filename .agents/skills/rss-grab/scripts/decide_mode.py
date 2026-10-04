@@ -31,12 +31,18 @@
 （原设计的「临界区一律 map-reduce」是针对 50K–100K 档的，单一阈值下该规则
 已被阈值本身覆盖）。
 
-## ⚠️ 长文走哪条路径尚未定案
+## ✅ 长文走 v3 四步管线（D6 已拍板，2026-10-04）
 
-本脚本目前把长文一律判给 `map_reduce`，这是**现状延续**，不是 V1.0 的结论。
-长文该继续走 map-reduce 还是改用分块扫描式管线，是一个未定的决策点，
-正在用 4 篇同篇对照实验实测（tasks D1–D5）。D6 拍板后本文件的 `decide()`
-要跟着改。
+D6 决定：长文一律走 v3（clean → 纠错 → 分块扫描 → 合并去重 → 撰写 → 校验），
+**不再走 map-reduce**。依据：4 篇同篇对照 4/4 同向，完全覆盖口径
+Δ +37.7 ~ +79.4pp；map-reduce 的问题是「提到但讲不透」
+（严格 Δ +37.7pp / 宽松仅 +11.4pp），且有结构性硬失败
+（输出预算 4000 被 thinking 吃光导致 map 阶段截断，成功率仅 3/8）。
+
+本仓库的入口是 `scripts/generate_note_v3.py`（薄壳：信头 + 落盘 + 索引）。
+管线本体在 `_shared/build_v3.py`，**入口函数是 `generate_note_body()`**。
+
+⚠️ exit code 约定没变：0 = 短文，1 = 长文。调用方按 mode 字符串分流。
 """
 import pathlib
 import re
@@ -72,7 +78,7 @@ def decide(transcript_path: pathlib.Path) -> tuple[str, str]:
     n = net_len(text)
 
     if is_long_doc(text):
-        return ("map_reduce", f"net_len={n} > {LONG_DOC_THRESHOLD}")
+        return ("v3", f"net_len={n} > {LONG_DOC_THRESHOLD}")
     return ("skill", f"net_len={n} <= {LONG_DOC_THRESHOLD}")
 
 

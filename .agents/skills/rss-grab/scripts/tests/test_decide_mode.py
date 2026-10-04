@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""decide_mode 单测：长文判定（rss 版，口径 2026-10-04 改为净字 > 15,000）。
+"""decide_mode 单测：长文判定（净字 > 15,000 → **v3**，D6 拍板 2026-10-04）。
 
 改口径前的测试用的是「原始字符 ≥ 50,000」，且测试数据没有时间戳 ——
 于是 net_len == len(text)，旧断言在新阈值下**碰巧仍然通过**，
@@ -43,7 +43,7 @@ def test_boundary_15001_is_long():
     with tempfile.TemporaryDirectory() as td:
         t = _write(pathlib.Path(td), "字" * 15001)
         mode, reason = d.decide(t)
-        assert mode == "map_reduce"
+        assert mode == "v3"
         assert "15001" in reason
 
 
@@ -72,7 +72,7 @@ def test_real_regime_flip():
         text = "".join(f"**[{i % 1000:03d}:00]** 字\n" for i in range(18000))
         t = _write(pathlib.Path(td), text)
         mode, _ = d.decide(t)
-        assert mode == "map_reduce"
+        assert mode == "v3"
 
 
 def test_extract_hash8_from_path():
@@ -97,4 +97,4 @@ def test_cli_exit_code_contract():
         long_.write_text("字" * 20000, encoding="utf-8")
         r = subprocess.run([sys.executable, str(SCRIPT_DIR / "decide_mode.py"), str(long_)],
                            capture_output=True, text=True)
-        assert r.returncode == 1 and r.stdout.startswith("map_reduce")
+        assert r.returncode == 1 and r.stdout.startswith("v3")
