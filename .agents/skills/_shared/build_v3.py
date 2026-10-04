@@ -608,7 +608,9 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
 
     Returns:
         (body, report, stats)。`report` 是 `validate()` 的报告 dict；
-        `stats` 含 route / net_chars / typo_applied / attempts 等。
+        `stats` 含 route / net_chars / typo_applied / attempts 等，
+        以及 `stats['llm']` —— LLM 产出的 `tags` / `summary`（**信头要用这两个**，
+        它们不在 `report` 里）。
 
     Raises:
         RuntimeError: 校验连续 MAX_RETRY+1 次未过，或分块路径失败。
@@ -668,6 +670,10 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
                 last_err = f'校验未过: {v['retries_needed']}'
                 print(f'    ⚠️ 第 {attempt} 次校验未过: {last_err}', flush=True)
                 continue
+            # LLM 产出的 tags / summary 在 llm 里，不在校验报告里 ——
+            # 2026-10-04 漏掉这一步，导致 rss 薄壳写出的 frontmatter
+            # `tags` / `summary` 恒为空。放进 stats 一起返回。
+            stats['llm'] = llm
             return (body, v['report'], stats)
         except Exception as e:
             last_err = f'{type(e).__name__}: {e}'
