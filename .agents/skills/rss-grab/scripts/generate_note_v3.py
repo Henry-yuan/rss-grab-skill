@@ -60,6 +60,11 @@ def main() -> int:
                     default=SCRIPT_DIR / "scan_work")
     ap.add_argument("--no-typos", action="store_true",
                     help="跳过错字纠正（仅排障用）")
+    ap.add_argument("--no-index", action="store_true",
+                    help="不追加到生产 rss/notes/INDEX.md（批量重生成到暂存目录时必加，"
+                         "避免污染生产索引；正式切换时再统一重建）")
+    ap.add_argument("--force", action="store_true",
+                    help="目标笔记已存在也重新生成（默认跳过，防止白烧 LLM 调用）")
     a = ap.parse_args()
 
     if a.transcript and a.info:
@@ -72,6 +77,14 @@ def main() -> int:
 
     if not a.output:
         a.output = existing or (SCRIPT_DIR / f"d3out-{t.stem}.md")
+
+    # 断点续跑闸门下推到脚本最前面（V1.0 A8，2026-10-04）。
+    # 批量驱动两个进程从列表两端往中间跑，但任务在启动时就全排进了线程池，
+    # 驱动侧的 skip 判定发生在 worker **领任务那一刻**——两侧都判"还没有"，
+    # 同一篇被跑两遍、白烧两轮 LLM。只有在这里判才拦得住后到的一方。
+    if not a.force and a.output.exists() and a.output.stat().st_size > 500:
+        print(f"⏭️ 已有产物，跳过：{a.output.name} ({a.output.stat().st_size:,} bytes)")
+        return 0
 
     load_env(SCRIPTS_ENV)          # .env 在本目录；缺 MINIMAX/LLM 键会报错
     if not os.environ.get("LLM_API_KEY") and not os.environ.get("MINIMAX_API_KEY"):
@@ -103,14 +116,25 @@ def main() -> int:
     fmv = fm.build(info, summary_llm=llm.get("summary", ""),
                    tags_llm=llm.get("tags", []) or [])
     a.output.parent.mkdir(parents=True, exist_ok=True)
-    a.output.write_text(fm.dump(fmv) + "\n" + body + "\n", encoding="utf-8")
-
-    # 索引
-    src = ""
+    # 原子落盘：先写同目录临时文件再 os.replace。
+    # write_text() 是 open('w')——先截断再逐块写；两进程同时写同一路径会各自截断、
+    # 交错落盘，产出「半截 A + 半截 B」的撕裂文件且**不报错**。
+    # os.replace 在同一文件系统内是原子的，读者只可能看到完整旧版或完整新版。
+    tmp = a.output.with_name(f"{a.output.name}.tmp{os.getpid()}")
     try:
-        src = register_rss_index(info, a.output)
-    except Exception as e:  # noqa: BLE001
-        print(f"   ⚠️ 索引追加失败（不影响笔记）: {type(e).__name__}: {e}")
+        tmp.write_text(fm.dump(fmv) + "\n" + body + "\n", encoding="utf-8")
+        os.replace(tmp, a.output)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+    # 索引（--no-index 时跳过：批量重生成到暂存目录不该碰生产 INDEX.md）
+    src = "skipped"
+    if not a.no_index:
+        try:
+            src = register_rss_index(info, a.output)
+        except Exception as e:  # noqa: BLE001
+            print(f"   ⚠️ 索引追加失败（不影响笔记）: {type(e).__name__}: {e}")
 
     print(f"✅ {a.output}")
     print(f"   路由={stats['route']} 净字={stats['net_chars']:,} "
@@ -118,7 +142,7 @@ def main() -> int:
           f"用时={time.time() - t0:.0f}s 索引={src}")
 
     # 进度日志：按 guid_hash8 标记完成（与订阅流程对齐）
-    if a.guid_hash8:
+    if a.guid_hash8 and not a.no_index:      # 暂存批次不标记订阅状态
         try:
             from subscribe_manager import mark_done
             mark_done(a.guid_hash8)
