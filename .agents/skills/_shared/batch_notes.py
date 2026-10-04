@@ -50,7 +50,7 @@ SOURCES = {
 
 
 def _extract_id(transcript_path: Path, source_cfg: dict) -> str:
-    """从 transcript 文件名提取 id（guid_hash8 / bvid / note_id）。"""
+    """从 transcript 文件名提取 id（guid_hash8，格式 `<title>-<hash8>.transcript.md`）。"""
     import re
     m = re.search(source_cfg["id_re"], transcript_path.name)
     if m:

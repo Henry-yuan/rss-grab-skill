@@ -149,7 +149,7 @@ def call_llm_for_template_choice(
 
 
 def derive_id_from_path(transcript_path: Path) -> str:
-    """从 transcript 文件名派生 id。例：B 站 BV198jE6pE8Y.ai-zh.transcript.md → BV198jE6pE8Y。"""
+    """从 transcript 文件名派生 id。例：1个AI-Agent-和嘉宾聊-939b0cd2.transcript.md → 939b0cd2。"""
     name = transcript_path.name
     name = re.sub(r"\.ai-zh\.transcript\.md$|\.transcript\.md$|\.images\.md$", "", name)
     return name
