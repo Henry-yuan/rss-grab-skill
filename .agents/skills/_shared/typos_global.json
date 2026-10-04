@@ -1,0 +1,155 @@
+{
+  "_comment": "【2026-10-03 起已退出主流程，仅作历史存档】\n旧的 22 条 `A → B` 映射表不再被提示词引用，也不再用于替换。原因：\n  1. 映射表是「全局规则」抽象，会把「这一处该改」压成「这个词到处都是」，\n     位置信息丢失。实测同一篇里 OpenClaw / OpenCode 并存时会连坐误伤。\n  2. 低频条目（1-3 次样本）经常判错：C-Dance → Claude Code 已被证伪，\n     模型结合 video frame / editing 上下文判为 Seedance 才对。\n  3. OpenClaw → Orca（22 次）结论本身是错的——OpenClaw 是另一个真实产品。\n现在提示词用的是 correct_typos.ACOUSTIC_HINTS（7 条高频声学规律，\n措辞是「规律不是结论」，模型可按上下文推翻）。\n详见 docs/实验/错字纠正方案实测-20261003.md",
+  "_source": "2026-09-29 Orca 篇 12 轮分块扫描实测产物统计（docs/实验/chunk-scan-20260929/），200 处命中",
+  "_version": "2026-09-29",
+  "items": [
+    {
+      "original": "Clocko",
+      "target": "Claude Code",
+      "reason": "Claude Code 的高频误识（实验产物 40 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "clock code",
+      "target": "Claude Code",
+      "reason": "英文词被逐词误识（32 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "Cloud Code",
+      "target": "Claude Code",
+      "reason": "Claude→Cloud 同音误识（15 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "Cocoat Code",
+      "target": "Claude Code",
+      "reason": "Claude→Cocoat 误识（1 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "Cocoat",
+      "target": "Claude",
+      "reason": "Claude→Cocoat 误识（3 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "clockhold",
+      "target": "Claude Code",
+      "reason": "Claude Code 的高频误识（9 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "C-Dance",
+      "target": "Claude Code",
+      "reason": "Claude Code 的误识（1 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "Cloud Codex",
+      "target": "Codex",
+      "reason": "Codex→Cloud 同音误识（12 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "coi",
+      "target": "CLI",
+      "reason": "CLI 短词误识（3 次）",
+      "confidence": "medium"
+    },
+    {
+      "original": "clockflare",
+      "target": "Cloudflare",
+      "reason": "Cloudflare 误识（7 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "Clockflare",
+      "target": "Cloudflare",
+      "reason": "Cloudflare 误识（7 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "OpenClaw",
+      "target": "Orca",
+      "reason": "Orca 的 Manager thread 机制被误识成不存在的 OpenClaw（22 次）",
+      "confidence": "low"
+    },
+    {
+      "original": "overpack",
+      "target": "Orca",
+      "reason": "Orca 误识（1 次）",
+      "confidence": "low"
+    },
+    {
+      "original": "酷大",
+      "target": "CUDA",
+      "reason": "CUDA 音译误识（5 次，合并阶段新造）",
+      "confidence": "medium"
+    },
+    {
+      "original": "PLOD",
+      "target": "Plaud",
+      "reason": "逐字母误识 P-L-A-U-D，真实产品为 Plaud（AI 录音硬件）。源里仅 1 次，说话人把字母念了一遍。",
+      "confidence": "high"
+    },
+    {
+      "original": "P-O-A-U-D",
+      "target": "Plaud",
+      "reason": "逐字母误识 P-L-A-U-D，真实产品为 Plaud（AI 录音硬件）。源里仅 1 次，说话人把字母念了一遍。",
+      "confidence": "high"
+    },
+    {
+      "original": "chain box",
+      "target": "chat box",
+      "reason": "chat box 误识（16 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "immunator",
+      "target": "emulator",
+      "reason": "emulator 误识（4 次）",
+      "confidence": "high"
+    },
+    {
+      "original": "The Mammtess",
+      "target": "The Mom Test",
+      "reason": "书名误识（1 次）",
+      "confidence": "medium"
+    },
+    {
+      "original": "The Mamtess",
+      "target": "The Mom Test",
+      "reason": "书名误识",
+      "confidence": "medium"
+    },
+    {
+      "original": "Athropical",
+      "target": "Anthropic",
+      "reason": "源里实际拼作 Athropical（缺 n），正确名 Anthropic",
+      "confidence": "high"
+    },
+    {
+      "original": "Athropeak",
+      "target": null,
+      "reason": "无法确定对应正确名（可能是讲者自造产品名），仅记录不替换",
+      "confidence": "low"
+    }
+  ],
+  "_retired_at": "2026-10-03",
+  "_kept_in_acoustic_hints": [
+    "Clocko",
+    "clock code",
+    "Cloud Code",
+    "cloudcode",
+    "Cocoat",
+    "clockhold",
+    "clockcode",
+    "Cloud Codex",
+    "chain box",
+    "clockflare",
+    "Clockflare",
+    "immunator",
+    "P-L-O-U-D"
+  ]
+}
