@@ -1,0 +1,555 @@
+"""长文/笔记生成管线（源无关的管线本体，本仓库的转写 → 笔记全流程走它）。
+
+> 📦 与主项目共享同一套实现，**本文件是独立实体拷贝，不是软链**。
+> 按项目规则必须**手动双改 + 两边各跑测试**，**禁止写脚本单向覆盖**。
+>
+> **信头归调用方**：本模块只管「怎么把源文变成笔记正文」，
+> frontmatter 组装与索引写盘由各调用方自己做（`rss-grab` 侧用自己的字段表）。
+> 理由：字段表因源而异，把信头焊死在本模块里会让别的源迁就。
+>
+> **与主项目那份的差异：仅 1 处** —— `SYSTEM_PROMPT` 里那句「机器转写存在同音字误识，
+> **〔另一类素材〕字符误识**，请在行文中自然纠正」的后半句在本仓库已删除
+> （本仓库只处理语音转写，不处理图像类素材）。已用 AST 比对确认：**除这 1 行外
+> 两份逻辑完全一致**。其余模块的差异是既有的有意分化（`asr.py` / `env.py` /
+> `batch_notes.py` 为 rss-only 裁剪版）。
+
+## 本模块负责的四步
+
+    清洗 → ①.5 错字纠正 → ② 分块扫描 → ③ 合并去重 → ④ 撰写 → 校验
+
+净字数超过 `LONG_DOC_THRESHOLD` 时自动走分块路径（②③），
+否则维持单次调用。
+
+## 依赖
+
+`chunk_scan` / `correct_typos` / `clean_source` / `validate_v3` 均在同目录 `_shared/` 下。
+调用方需先把该目录放进 `sys.path`。
+
+## 输出契约
+
+`generate_note_body()` 返回 (正文, 校验报告, 统计)，**不写任何文件** ——
+frontmatter 与落盘由调用方做。这样本模块完全不需要知道数据来自哪个源。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+# 喂给模型的元信息白名单：**由调用方设置**（信头归源，不归管线）。
+# 本仓库的 rss 调用方设成自己的字段表；留空则不喂任何元信息。
+PROMPT_INFO_FIELDS: tuple[str, ...] = ()
+
+
+def info_for_prompt(info: dict) -> str:
+    """按 PROMPT_INFO_FIELDS 白名单生成喂给 LLM 的元信息文本。
+
+    白名单机制本身是安全设计：只取显式列出的键，杜绝把 token / 内部字段一起喂进提示词。
+    """
+    lines = []
+    for k in PROMPT_INFO_FIELDS:
+        v = info.get(k)
+        if v is None or v == "":
+            continue
+        if isinstance(v, list):
+            v = "、".join(str(x) for x in v)
+        lines.append(f"- {k}: {v}")
+    return "\n".join(lines)
+
+# ── 配置 ──────────────────────────────────────────────
+MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash-Preview")
+BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1")
+EFFORT = os.environ.get("MINIMAX_EFFORT", "max")
+MAX_COMPLETION = int(os.environ.get("MINIMAX_MAX_COMPLETION", "100000"))
+TIMEOUT = int(os.environ.get("MINIMAX_TIMEOUT", "1800"))
+TEMPERATURE = 0.2
+MAX_RETRY = 2
+HEARTBEAT = 30
+
+ID_RE = re.compile(r"-([0-9a-f]{24})\.(transcript|images)\.md$")
+
+# ── 提示词 ────────────────────────────────────────────
+SYSTEM_PROMPT = """你是笔记生成助手。基于下方机器转写文本，生成结构化中文笔记。
+
+# 输出结构（硬要求）
+
+**不要输出 H1 标题**（# 开头的行）——标题由程序写入文件头。
+
+必须且只能包含这三个二级章节（##）：
+
+## TL;DR
+核心观点 + 适用人群 + 主要话题清单（按序号换行，每个话题单独一行）
+
+## 要点总结
+正文主体。组织方式**按内容性质选**：
+- **有序列表** `1. 2. 3.`：有先后顺序、需要逐条执行的内容
+- **无序列表** `-`：并列要点、罗列清单、特征枚举
+- **表格**：多项事物横向对比、带维度的分类、参数对照
+- **段落**：观点阐释、因果论证、需要连贯行文才能讲清的内容
+- **引用块** `>`：原话、金句、嘉宾或专家的原话
+- **代码块**：命令、配置、伪代码、流程示意
+- **加粗要点行** `- **要点**：说明`：一句话结论带解释
+
+其中三级小标题（###）用于分段，**标题文字直接写内容，不要加数字或汉字序号**。
+
+不得使用其他二级章节（##）。
+
+## 关键引用
+忠实于原文的引用，可轻微润色。标题**恰好是** `## 关键引用`，不要加括号后缀。
+
+# 覆盖度
+
+正文主体必须覆盖转写中的全部主要话题。
+**不要给话题数量设下限**——数字会诱使你为凑数而补造不存在的话题。
+宁可多保留，不要为精简而合并。寒暄、重复、过渡可略。
+
+# 禁止输出以下内容
+
+- 视频元信息（标题 / UP主 / 时长 / 链接 / 标签）——程序自动写入文件头
+- 「信息可信度」章节——你没有联网能力，无法核验任何事实
+- 「错字纠正」章节——纠错记录由程序单独输出
+- 任何讲者 / 嘉宾 / 主持人的人名字段
+- **推广与广告内容**（详见下方「广告」一节）
+
+# 广告
+
+推广与广告不构成笔记内容，遇到就跳过，不要为它们单独成段或单独成行。
+
+判据不是关键词，而是这句话的**作用**：
+
+- 它的作用是**说服读者去看、去���、去加入、去购买** → 广告，丢掉
+- 它的作用是**传递一个事实** → 信息，保留
+
+自检方法：**把这句删掉，读者对内容的理解会不会受影响？**
+不受影响 → 丢掉；会漏掉一件事 → 保留。
+
+常见的广告形态（**举例，不是穷举**，按上面的判据自行判断）：
+
+- 社区/社群的规模宣传（成员数、关注者数、加入方式）
+- 付费课程或产品的推广（价格、学员数、评分、课时数、退款政策、赠品）
+- 试用邀请、优惠码、内测名额
+- 平台自夸式宣传（「最好」「第一」「遥遥领先」「最强」）
+
+判断的是**每一句**，不是每一段：同一段里既有推广又有事实时，
+只丢推广那几句，事实那几句照常写进正文。
+
+**创始人自己讲自家产品的能力和做法不是广告**——
+只有「请你来看看/买买」性质的内容才是。
+
+【反面案例】跳过「我们的课程已迭代 13 期、3000 多名学员、
+在某某平台拿满分好评、14 天无理由退款、赠送一年期会员」
+
+【正面案例】保留「产品每天发布一个 stable 版本，每个版本含上百个 PR」——
+后者说的是迭代节奏，是事实
+
+# 引用规则
+
+- 引用应忠实于转写文本。可以**轻微润色让句子读起来顺**，
+  但**不得扭曲原文观点**——数字、限定条件、因果方向、对比项保持原样
+- **禁止加时间戳**：`[00:12]` `[01:04]` 一律不写
+- 你的解释、评论一律放在引用块之外
+- 引用条目格式：`- <引用>`（不加任何前缀修饰）
+
+## 翻译
+
+笔记正文一律用**中文**。源文是什么语言不影响这一点。
+
+- 源文是外文 → 整篇**译成中文**再写笔记
+- 源文是中文 → 直接写
+
+以下**保留英文原样，不翻译**：
+- 专业术语与技术名词：RAG / Agent / Transformer / prompt / token / harness /
+  embedding / fine-tune / SOW / SaaS / API …
+- 常见的普通英文词：should / could / the / of / and …（这类词译成中文
+  反而会变成生硬直译）
+- 人名、公司名、产品名、机构名的**通用写法**（如 `Anthropic`、`Orca`）
+
+翻译时**不要顺手补充源文没有的内容**。译文里出现的每个数字、每个专名、
+每条判断，都必须能在源文里找到对应。不要因为"读者可能不知道"就加背景说明
+或量化数据——那是补充，不是翻译。
+
+## 引用里的翻译
+
+- 源以外文为主 → 每条引用**写成两行**：第一行中文译文（供阅读），
+  第二行缩进 `  > <外文原句>`（供核对原视频）。第二行必须是源文里的原句
+- 源为中文 → 单行即可
+
+# 段落规则（下游按段落切片后独立检索）
+
+- 每段必须自足：不以「它 / 这个 / 该方法 / 上述 / 前面提到」等指代开头
+- 首次出现的专有名词写全称
+- 不把一个完整论述拆碎
+
+# 具名判据与具体数字
+
+- 访谈中**具名嘉宾给出的可操作判据**（判断标准、提问方式、心法）必须保留，不能只留结论。
+  写"要判断客户是否真的会付费"而不是"访谈提到要重视客户需求"。
+- 源里出现的**具体比例、量级、金额**优先保留原数值，不要概括成"大量""很多""不少"。
+
+# 人物规则
+
+- 正文任何位置**不得出现人名元字段**（如"嘉宾：""讲者：""主持人："）。
+- 人名只允许出现在 `## 关键引用` 内，或作为原文内容自然出现；
+  具名判据的表述里可保留说话人身份（"这位嘉宾给出的判据是…"），但不设独立的元字段行。
+
+# 错字处理
+
+- 机器转写存在同音字误识，请在行文中自然纠正
+- 同时把每次纠正记录进末尾 JSON 的 typos 数组
+- 只记录明确无误的；不确定的不记
+- 同一处有多种可能错法时不要合并成一条，直接跳过
+
+# 末尾输出
+
+笔记 Markdown 正文结束后，空一行，写一行 `---JSON---`，再写一个 JSON 对象。
+全文只输出这三部分，不要任何额外说明。"""
+
+USER_TPL = """## 笔记元信息
+{info}
+
+## 笔记描述
+{desc}
+
+## 机器转写文本（全文）
+{src}
+
+## 末尾 JSON 格式
+{{
+  "summary": "不超过60字的一句话概括",
+  "tags": ["3到8个从内容实质总结的标签"],
+  "typos": [
+    {{"original": "原样抄写", "target": "纠正后", "reason": "依据"}}
+  ]
+}}"""
+
+# ── 长文路径：源太长（净字数 > 15000），一次调用装不下 ──
+LONG_DOC_THRESHOLD = 15000
+CHUNK_SIZE = 10000
+CHUNK_OVERLAP = 1
+SCAN_EFFORT = "xhigh"
+MERGE_EFFORT = "low"
+SCAN_CONCURRENCY = 5
+
+# 阈值口径（2026-07 定稿）：剥离 ASR 时间戳标记后再删除所有空白
+# 分钟 1-3 位（2026-10-04 修）：原 \d{1,2} 剥不掉 **[144:23]** / **[240:00]** 这类
+# 超 100 分钟的标记，超长视频的净字因而被时间戳虚高约 1 倍。
+# 与 _shared/long_doc.py 的 _TS_STRIP 保持一致 —— spec AC-A2-2 要求三源逐篇判定相同。
+_TS_STRIP = re.compile(r"\*\*\[\d{1,3}:\d{2}\]\*\*")
+
+
+def net_len(text: str) -> int:
+    """净字数：剥时间戳标记 → 删所有空白。用于长文阈值判定。"""
+    return len(re.sub(r"\s+", "", _TS_STRIP.sub("", text)))
+
+
+# 长文路径喂给 ④ 的是「主题清单 + 原文」：
+#   主题清单 = 覆盖全文的大纲，防遗忘
+#   原文     = 一手事实，④ 可用它核对、纠正清单里被压缩掉的细节
+# 两者都给的理由：只喂清单，④ 手上一手材料为零，主题被压平的部分无法回补；
+# 只喂原文，长转写容易注意力分散。两者结合最稳。
+# ── 长文路径 ④ 系统提示词（2026-10-01 定稿）────────────────
+# 设计依据：③ 主题层实测 89.0%，而旧 ④ 提示词产出只有 68.7%，
+# 丢的 20 个点几乎全是「把 detail 改写成更顺的话」造成的。
+# 所以把 ④ 从「作者」降级为「排版员」：可重新分节、可轻微润色，
+# 但信息量不得低于输入。
+# 注：本提示词**不含任何数量约束**（H3 个数 / 引用条数 / 句数）——
+#     数量一旦写死，模型会为凑数强行合并或拆分，反而制造丢失。
+SYSTEM_PROMPT_TOPICS = """你是一个笔记撰写者。下方是一篇长转写经分块扫描 + 合并去重后得到的**主题清单**。
+
+主题清单已经覆盖了全文主干。你的任务：把它排版成一篇笔记。
+
+## 核心原则
+
+**输出的信息量不得低于输入的主题清单。**
+
+可以做的事：
+- 按内容逻辑重新分节、调整顺序
+- 为读起来顺畅做轻微润色、理顺句子
+
+不可以做的事：
+- 删掉任何主题
+- 丢掉细节、数字、出处、限定条件
+- 用一句"总之""类似地"代替原本具体的内容
+
+**写完自检**：主题清单里有的东西，是不是都在笔记里了？少了就补回去。
+
+## 必须原样保留的内容
+
+润色句子可以，但下面这些一旦改动就是信息损失：
+
+- **具体数字与单位** —— `400 多个 worktree`、`200 美元`、`90%`、`十一分之一`。
+  数字不能约数化（`49000 颗星` 写成 `接近 5 万` 是损失）
+- **专有名词** —— 产品名、公司名、人名、技术术语，**照抄清单里的写法**
+- **因果关系** —— 因为 / 所以 / 因此 / 导致
+- **限定条件** —— 如果 / 只有…才 / 不能保证 / 仅限 / 前提下
+- **对比项** —— `不是 AWS` 里的 `AWS` 不能省
+
+## 只还原，不补充
+
+你写的是一篇**可信原料层**笔记，下游会拿它当事实依据。
+
+**可以用你的领域知识判断「这个写法到底指什么」**（那是纠错），
+**不能用领域知识往里填源文没有的东西**（那是编造）。
+
+这两种情形最要警惕，是实测里反复出问题的地方：
+
+- **源文只给了定性表述**（「更好」「明显优于」「much better」）
+  → **不要补出具体的比赛名、榜单名、指标名、百分比**
+  实测踩坑：源文只说某网络「明显优于传统计算机视觉系统」，
+  笔记写成「在 ImageNet 竞赛的错误率远低于既有系统」——
+  源文里既没有 ImageNet 这个名称，也没有任何错误率数字。
+
+- **源文给了举例或类比**（「一万个人各学一门课再交流」）
+  → **不要把类比的量级转成结论性数据**
+  实测踩坑：源文说某模型像「一万个人共享知识」那样学习，
+  笔记补出「因此比任何人知道多成千上万倍、只使用了约 2% 的权重」——
+  这两个数字源文里完全不存在。
+
+- **源文说「某主体认为/相信/主张 X」，而现实是 Y**
+  → **笔记必须保留 X，并写明这是该主体的看法。不得把 X 改写成 Y。**
+  实测踩坑：源文说机器人在棱镜后仍认为「物体在它指的位置」
+  （真实位置是正前方，两者背离），讲者正是用这个背离论证
+  机器人拥有「主观体验」；笔记改成「物体在正前方」——
+  机器人和现实一致了，**那个背离正是论证的立足点**，被抹掉了。
+
+  一句话：**主体的错误信念本身就是信息，不要"帮"它纠正。**
+
+判据：**笔记里的每一个数字、每一个专有名词、每一项指标，
+都必须在主题清单里找到对应。找不到就不要写。**
+
+## 翻译
+
+笔记正文一律用**中文**，源文是什么语言不影响这一点。源文是外文就**整篇译成中文**。
+
+以下**保留英文原样，不翻译**：
+- 专业术语与技术名词：RAG / Agent / Transformer / prompt / token / harness /
+  embedding / fine-tune / SOW / SaaS / API …
+- 常见的普通英文词：should / could / would / the / of / and …（译成中文反成生硬直译）
+- 人名、公司名、产品名、机构名的通用写法（如 `Anthropic`、`Orca`）
+
+译文同样受上一节约束：**不得出现源文没有的事实。**
+
+## 结构
+
+- 三个二级标题，顺序固定：`## TL;DR` → `## 要点总结` → `## 关键引用`
+- `## 要点总结` 下面用三级标题分节，**分几节你自己定，按内容自然边界划分**
+- 三级标题不加数字或汉字序号
+- 不要出现空节
+
+## 段落形态
+
+三级标题下面的内容，**组织方式按内容性质选**：
+
+- **有序列表** `1. 2. 3.`：有先后顺序、需要逐条执行的内容
+- **无序列表** `-`：并列要点、罗列清单、特征枚举
+- **表格**：多项事物横向对比、带维度的分类、参数对照
+- **段落**：观点阐释、因果论证、需要连贯行文才能讲清的内容
+- **引用块** `>`：原话、金句
+- **代码块**：命令、配置、伪代码、流程示意
+- **加粗要点行** `- **要点**：说明`：一句话结论带解释
+
+同一篇里不同节可以用不同形态，按这节讲的是什么来定。
+**不要整篇只用一种形态**——全部写成散文是最难读的一种排版。
+也不需要为了凑形态把内容拆碎：形态服务于可读性，不改变信息量。
+
+## TL;DR
+
+- 说清核心结论和适用人群
+- 这里不承载细节，细节由要点总结负责
+
+## 关键引用
+
+- 从主题 detail 里挑最有代表性的句子
+- **可以轻微润色让句子读起来顺**，但**不得扭曲原文观点**：
+  数字、限定条件、因果方向、对比项都要保持原样
+- 覆盖全文不同部分，数量你判断
+- 格式：`- > 引用`
+
+## 广告
+
+社区推广、试用邀请、付费课程（价格 / 学员人数 / 评分 / 课时数）不要单独成段。
+
+## 输出格式
+
+正文 markdown，空一行，写 `---JSON---`，再写一个 JSON 对象。
+全文只输出这三部分，不要额外说明。"""
+
+
+USER_TPL_TOPICS = """## 笔记元信息
+{info}
+
+## 笔记描述
+{desc}
+
+## 主题清单（共 {n} 个主题）
+
+> 这是全文的主干覆盖清单。
+> 排版时可以重新分节和轻微润色，但**信息量不能低于这份清单**。
+
+{topics}
+
+## 末尾 JSON 格式
+{{
+  "summary": "不超过60字的一句话概括",
+  "tags": ["3到8个从内容实质总结的标签"],
+  "typos": [
+    {{"original": "原样抄写", "target": "纠正后", "reason": "依据"}}
+  ]
+}}"""
+
+
+def topics_block(topics: list[dict]) -> str:
+    """主题清单 → 喂给 ④ 的文本。"""
+    lines = []
+    for i, t in enumerate(topics, 1):
+        d = (t.get("detail") or "").strip()
+        fb = []
+        if t.get("has_number"):
+            fb.append("含数字")
+        if t.get("has_person"):
+            fb.append("含人名")
+        mark = f" [{','.join(fb)}]" if fb else ""
+        lines.append(f"{i}. {t.get('title', '').strip()}{mark}"
+                     + (f"\n   {d}" if d else ""))
+    return "\n".join(lines)
+
+JSON_SEP = "---JSON---"
+
+
+# ── LLM 调用 ──────────────────────────────────────────
+def strip_thinking(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def parse_output(raw: str) -> tuple[str, dict]:
+    """三层兜底解析：剥 think → 剥 ```json 围栏 → 取首个完整 JSON 对象。"""
+    text = strip_thinking(raw)
+    if JSON_SEP in text:
+        body, tail = text.split(JSON_SEP, 1)
+    else:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            raise ValueError("输出中找不到 JSON")
+        body, tail = text[: m.start()], m.group(0)
+    tail = tail.strip()
+    tail = re.sub(r"^```(?:json)?\s*", "", tail)
+    tail = re.sub(r"```\s*$", "", tail).strip()
+    try:
+        return body.strip(), json.loads(tail)
+    except json.JSONDecodeError:
+        s = tail.find("{")
+        e = tail.rfind("}")
+        if s < 0 or e <= s:
+            raise ValueError("JSON 解析失败")
+        return body.strip(), json.loads(tail[s: e + 1])
+
+
+def call_llm(client, source: str, info: dict, heartbeat: bool = True) -> str:
+    """调 LLM，带心跳线程（长稿可能跑 5 分钟+）。"""
+    return _call_with_template(client, USER_TPL, source, info, heartbeat)
+
+
+def call_llm_topics(client, topics_text: str, info: dict,
+                    n_topics: int = 0, heartbeat: bool = True) -> str:
+    """长文路径 ④：只喂主题清单，用排版员提示词。
+
+    实测加原文会让保真率从 68.7% 掉到 57.7%（76K 上下文稀释大纲的约束力），
+    因此**不传 src**。
+    """
+    return _call_with_template(client, USER_TPL_TOPICS, topics_text, info,
+                               heartbeat, sys_p=SYSTEM_PROMPT_TOPICS,
+                               n_topics=n_topics)
+
+
+def _call_with_template(client, tpl: str, payload: str, info: dict,
+                        heartbeat: bool, sys_p: str | None = None,
+                        n_topics: int = 0) -> str:
+    user = tpl.format(
+        info=info_for_prompt(info),
+        desc=(info.get("description") or "(无)").strip() or "(无)",
+        src=payload,   # 长文模板不用 {src}（实测加原文掉保真率），保留占位以兼容短文模板
+        topics=payload,
+        n=n_topics,
+    )
+    stop = threading.Event()
+
+    def _beat():
+        t0 = time.time()
+        while not stop.wait(HEARTBEAT):
+            print(f"    … 仍在生成 {int(time.time() - t0)}s", flush=True)
+
+    th = None
+    if heartbeat:
+        th = threading.Thread(target=_beat, daemon=True)
+        th.start()
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            reasoning_effort=EFFORT,
+            max_completion_tokens=MAX_COMPLETION,
+            temperature=TEMPERATURE,
+            timeout=TIMEOUT,
+            messages=[{"role": "system",
+                       "content": sys_p or SYSTEM_PROMPT},
+                      {"role": "user", "content": user}],
+        )
+        return r.choices[0].message.content or ""
+    finally:
+        stop.set()
+
+
+# ── 单篇 ──────────────────────────────────────────────
+def run_long_path(src_path: Path, source: str, client,
+                  work_dir: Path, typo_rules=None) -> dict:
+    """长文路径：①.5 错字纠正 → ② 分块扫描 → ③ 合并去重。
+
+    返回 {"topics": [...], "typo_report": {...}, "scan_stats": {...}}
+    """
+    from chunk_scan import run_merge, run_scan, split_chunks
+    from correct_typos import run_file
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    clean_path = work_dir / (src_path.name.replace(".md", ".clean.md"))
+    typos_path = work_dir / (src_path.name.replace(".md", ".typos.json"))
+
+    # ①.5 错字纠正：**全流程唯一一次替换**。
+    # 2026-10-03 起模型输出的是「逐处判断（段号 + 原文 + 决定）」，
+    # 程序按段精确定位——不再输出映射表做全文替换。
+    # 四组实测误伤均为 0，见 docs/实验/错字纠正方案实测-20261003.md
+    typo_report = run_file(src_path, clean_path, typos_path, client=client)
+    print(f"    [长文] 错字纠正 判定 {typo_report['judgments']} 处 / "
+          f"落成 {typo_report['applied_count']} 处 / "
+          f"成功率 {typo_report['success_rate']:.1%}", flush=True)
+
+    clean_text = clean_path.read_text(encoding="utf-8")
+
+    # ② 分块扫描：**只消费 clean 原文，不再二次套错字规则**
+    # 2026-10-02 移除：此前 ② 前与 ③ 后各再套一次同一套规则，等于把
+    # ①.5 的替换结果又过一遍替换器。两次替换的时序本身就是 bug 温床——
+    # 实测 `ghosty→Ghostty` 在 ①.5 已经产出正确的 Ghostty，② 阶段
+    # `ghost→Ghostty` 又去吃这个 Ghostty（Ghost 是 Ghostty 的真子串），
+    # 11 处全被改成 Ghosttyty 并一路传到终稿。替换只该发生一次。
+    chunks = split_chunks(clean_text, CHUNK_SIZE, CHUNK_OVERLAP)
+    pts = run_scan(chunks, work_dir, client, SCAN_EFFORT,
+                   concurrency=SCAN_CONCURRENCY, stagger=2.0,
+                   empty_retries=1)
+    (work_dir / "points.json").write_text(
+        json.dumps(pts, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"    [长文] ② 扫描 {len(chunks)} 块 -> {len(pts)} 要点", flush=True)
+
+    # ③ 合并去重（同样不再套错字规则）
+    obj = run_merge(pts, work_dir, client, MERGE_EFFORT, "topics")
+    topics = obj.get("topics", [])
+    print(f"    [长文] ③ 合并 -> {len(topics)} 主题", flush=True)
+    if not topics:
+        raise RuntimeError("合并去重返回 0 主题，长文路径无法继续")
+    return {"topics": topics, "typo_report": typo_report,
+            "clean_text": clean_text,
+            "n_points": len(pts), "n_chunks": len(chunks)}
+
+
