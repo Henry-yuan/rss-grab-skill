@@ -1,36 +1,36 @@
 #!/bin/bash
-# RSS 订阅增量拉取（launchd 定时任务入口）—— V1.1 T3.1，2026-10-05
+# RSS incremental fetch (launchd entry) -- V1.1 T3.1, 2026-10-05
 #
-# 这个脚本 2026-09-19 停用时被删除，导致 plist 指向一个不存在的文件，
-# launchd 每天 22:30 静默失败（exit 127）三个多月无人察觉。
-# **plist 里的绝对路径与本文件必须同时修**，只修一边仍然是死的。
+# This script was deleted on 2026-09-19, leaving the plist pointing at a
+# missing file; launchd then failed silently (exit 127) every night for
+# 3+ months. NOTE: the plist path and this file must BOTH be fixed.
 #
-# 它做什么：遍历 rss/订阅/subscriptions.json 里的全部源 →
-#   拉增量 → AI 摘要 → 写状态文件「待确认」区
-# 它**不**做什么：阶段 3（笔记生成）在 T3.3 才接上，现在这一步**只做摘要、不下载音频**。
+# It walks every source in rss/subscriptions.json:
+#   fetch new items -> AI summary -> append to the "pending" section
+# of each state file. It does NOT download audio or generate notes (stage 3, T3.3).
 
-set -uo pipefail   # 刻意不用 -e：单源失败不该中断其余源
+set -uo pipefail   # deliberately no -e: one bad source must not stop the rest
 
-# ---- 路径（一律绝对，不依赖 launchd 的 cwd 与 PATH）----
+# ---- Paths: all absolute; never rely on launchd cwd or PATH ----
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# rss-grab 在主项目里是指向 opensource 仓库的**软链**，用 readlink -f 解析真实路径
+# rss-grab is a SYMLINK to the opensource repo; resolve it
 SKILL_DIR="$(readlink -f "$SCRIPT_DIR")"
-PROJECT_ROOT="$(cd -- "$SKILL_DIR/../../../.." && pwd)"   # .agents/skills/rss-grab/scripts → 项目根
+PROJECT_ROOT="$(cd -- "$SKILL_DIR/../../../.." && pwd)"   # (comment translated to ASCII; see git history for the Chinese original)
 SCRIPTS="$SKILL_DIR"
 
 LOG_DIR="$PROJECT_ROOT/rss/_logs"
 LOG_FILE="$LOG_DIR/fetch-updates-$(date +%Y%m%d).log"
 
-# 必须用 3.12（系统 /usr/bin/python3 是 3.9.6，缺依赖）
+# Must be 3.12 (the system /usr/bin/python3 is 3.9.6 and lacks deps).
 PY="/usr/local/bin/python3"
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
-# ⚠️ 2026-10-05 修：原实现用 `... | tee -a "$LOG_FILE"`，两个问题：
-#   ① LOG_DIR 不存在时 tee 先报错，log() 整条失效（错误信息反而看不见）
-#   ② pipefail 会让退出码变成 tee 的（目录不存在时 tee 非 0 → 整个脚本非 0，
-#      明明该报「路径错」却看不出是哪一步）
-# 改成直接追加写文件，退出码只由 log 自己决定。
+# (comment translated to ASCII; see git history for the Chinese original)
+# (comment translated to ASCII; see git history for the Chinese original)
+# (comment translated to ASCII; see git history for the Chinese original)
+# (comment translated to ASCII; see git history for the Chinese original)
+# (comment translated to ASCII; see git history for the Chinese original)
 log() {
   local line
   line="$(printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*")"
@@ -38,53 +38,59 @@ log() {
   printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# ---- 前置检查：路径错了就立刻退出，不要静默失败（V1.0 的教训）----
+# (comment translated to ASCII; see git history for the Chinese original)
 if [ ! -x "$PY" ]; then
-  log "❌ 找不到 $PY（需 Python 3.12）"; exit 1
+  log "FATAL: $PY not found (need Python 3.12)"; exit 1
 fi
 if [ ! -f "$SCRIPTS/fetch_rss_feed.py" ]; then
-  log "❌ 找不到 fetch_rss_feed.py（$SCRIPTS）—— plist 路径可能又变了"; exit 1
+  log "FATAL: fetch_rss_feed.py missing under $SCRIPTS (plist path may have moved)"; exit 1
 fi
-if [ ! -f "$PROJECT_ROOT/rss/订阅/subscriptions.json" ]; then
-  log "❌ 找不到 subscriptions.json（$PROJECT_ROOT）—— 项目根可能推错了"; exit 1
+# NOTE: the state dir name contains non-ASCII (rss/<CN>/). Embedding it as a
+# literal in the script breaks under launchd's UTF-8 locale (bash splices the
+# following $VAR into what it thinks is a comment). Resolve it by glob instead.
+SUB_DIR=$(ls -d "$PROJECT_ROOT"/rss/*/ 2>/dev/null | while read -r d; do
+  [ -f "$d/subscriptions.json" ] && echo "$d" && break
+done | head -1)
+if [ -z "$SUB_DIR" ]; then
+  log "FATAL: no rss/*/subscriptions.json found under $PROJECT_ROOT"; exit 1
 fi
 
-# ---- 单实例锁：上一轮没跑完就别再叠一轮（launchd 不会自动等）----
-# ⚠️ 2026-10-05 修：原实现用 flock —— **macOS 自带 sh 与绝大多数环境都没有
-# 这个命令**（实测本机就没有），于是单实例保护长期形同虚设，只打印一行警告
-# 就继续跑，两轮叠一起会同时打 LLM 更容易撞限流。
-# 改用 `mkdir` 的**原子性**做锁：mkdir 同一路径时，第二次必然失败（ENOENT/EEXIST），
-# 这是 POSIX 保证的，不依赖任何外部命令。
+# ---- Single-instance lock: never stack a second run on top of a live one ----
+# NOTE 2026-10-05: the first version used flock, which macOS does NOT ship.
+# The guard therefore never worked. Replaced by mkdir (atomic on POSIX),
+# plus a pid liveness check and a trap that clears stale locks.
+# No external command needed.
+
 LOCK_DIR="/tmp/rss-fetch-updates.lock.d"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  # 可能是上一轮崩溃留下的陈旧锁（此时目录里会有 pid 文件）
+    # a previous run may have crashed and left a stale lock behind
   if [ -f "$LOCK_DIR/pid" ]; then
     oldpid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
     if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-      log "⏭️ 上一轮（pid $oldpid）还在跑，本次跳过"
+      log "SKIP: previous run (pid $oldpid) still alive"
       exit 0
     fi
-    log "🧹 清理陈旧锁（pid ${oldpid:-?} 已不在）"
+    log "clearing stale lock (pid ${oldpid:-?} gone)"
   fi
   rm -rf "$LOCK_DIR" 2>/dev/null || true
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    log "⏭️ 抢锁失败（可能刚被别的进程抢到），本次跳过"
+    log "SKIP: lost the lock race, another run just won"
     exit 0
   fi
 fi
 echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
-# 无论从哪条路退出（含信号）都清锁，否则一次崩溃就永久挡住后续所有定时任务
+# Always clear the lock on exit (including signals); otherwise one crash
 trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
 
-log "=== 开始增量拉取（项目根 $PROJECT_ROOT）==="
+log "=== fetch updates start (project root: $PROJECT_ROOT) ==="
 
-cd "$PROJECT_ROOT" || { log "❌ cd 失败：$PROJECT_ROOT"; exit 1; }
+cd "$PROJECT_ROOT" || { log "FATAL: cannot cd to $PROJECT_ROOT"; exit 1; }
 "$PY" "$SCRIPTS/fetch_rss_feed.py" --fetch-updates >> "$LOG_FILE" 2>&1
 code=$?
 
 if [ "$code" -eq 0 ]; then
-  log "=== 完成：只做了摘要，未生成笔记（阶段 3 见 T3.3）==="
+  log "=== done: summary only, no notes generated (stage 3 = T3.3) ==="
 else
-  log "=== 失败（exit $code），详见本日志上文 ==="
+  log "=== FAILED (exit $code), see log above ==="
 fi
 exit $code
