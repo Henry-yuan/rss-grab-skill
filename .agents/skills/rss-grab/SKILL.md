@@ -1,6 +1,6 @@
 ---
 name: rss-grab
-description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到 rss/audio/ → 元数据落到 rss/raw/guid_hash8.info.json（增量去重，二次运行跳过已有）→ ASR 转写（阶段 2，mlx-whisper）→ 生成结构化中文笔记 + INDEX 索引（阶段 3，短播客 skill 模式 / 长播客 map-reduce 模式）。支持订阅模式（阶段 4）：Apple Podcasts 链接自动反推 feed URL → 定时拉增量 → 状态文件勾选 → 抓取做笔记。当用户提供播客 RSS 链接（https://feed.xyzfm.space/xxx 或 https://xxx.com/feed.xml）或 Apple Podcasts 链接并要求"订阅 / 抓下来 / 下载播客 / 拉取期数 / 转写 / 写笔记"时使用。只支持播客音频类 RSS（RSS 2.0 + itunes + audio enclosure），文章/视频/Atom/JSON Feed 识别后提示不处理。依赖：yt-dlp、curl、Python 3.12+、mlx-whisper（Apple Silicon）、LLM_API_KEY。
+description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目录 /tmp/rss-grab-audio/ → 元数据落到 rss/raw/guid_hash8.info.json（增量去重，二次运行跳过已有）→ ASR 转写（阶段 2，mlx-whisper）→ 生成结构化中文笔记 + INDEX 索引（阶段 3，长短播客统一走 v3 四步管线）。支持订阅模式（阶段 4）：Apple Podcasts 链接自动反推 feed URL → 定时拉增量 → 状态文件勾选 → 抓取做笔记。当用户提供播客 RSS 链接（https://feed.xyzfm.space/xxx 或 https://xxx.com/feed.xml）或 Apple Podcasts 链接并要求"订阅 / 抓下来 / 下载播客 / 拉取期数 / 转写 / 写笔记"时使用。只支持播客音频类 RSS（RSS 2.0 + itunes + audio enclosure），文章/视频/Atom/JSON Feed 识别后提示不处理。依赖：yt-dlp、curl、Python 3.12+、mlx-whisper（Apple Silicon）、LLM_API_KEY。
 ---
 
 # RSS Grab
@@ -42,7 +42,7 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到 rss/audi
 
 4. **抓取**：`python3 scripts/fetch_rss_feed.py --pick-subscribe rss/订阅/<节目名>.md [--transcribe]`
    - 读 [x] 期的 guid（按 `<!-- guid:xxx -->` 注释），下载音频 + 转写
-5. **做笔记**：`python3 scripts/regenerate_note.py <guid_hash8>`
+5. **做笔记**：`python3 scripts/generate_note_v3.py <guid_hash8>`（2026-10-05 校正：原写 `regenerate_note.py`，该文件已不存在，生产入口是 `generate_note_v3.py`）
    - 笔记落到 `rss/notes/<源名>/<stem>.md`（按源分目录）
    - 笔记生成成功后状态文件对应期自动标 `[done]` 移入已转化区（mark_done 衔接）
 
@@ -64,7 +64,7 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到 rss/audi
    - 确认后按需下载：
      - `--pick "1,3,5-8"`：按序号/范围选（支持 `last` / `last:3` / 8 位 guid hash）
      - 无参数：默认下载最近 5 期（`--max N` 控制数量）
-5. **下载音频**：对选中每期调 `yt-dlp` 下载到 `rss/audio/<sanitized_title>-<guid_hash8>.<ext>`
+5. **下载音频**：对选中每期调 `yt-dlp` 下载到 `/tmp/rss-grab-audio/<sanitized_title>-<guid_hash8>.<ext>`（2026-10-05 校正：音频为临时原料，落 `/tmp/` 不进项目；见 `fetch_rss_feed.py` 的 `TMP_AUDIO_DIR`，`--cleanup-audio` 可转写后自动清理）
    - 扩展名按 enclosure type 推断（audio/mp4 -> m4a，audio/mpeg -> mp3）
 6. **落 info.json**：`rss/raw/<sanitized_title>-<guid_hash8>.info.json`（feed 元数据 + item 元数据 + 本地路径）
 7. **增量去重**：二次运行同一 feed 时，已有 info.json 的期数跳过（除非 `--force`）
@@ -91,23 +91,60 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到 rss/audi
 
 转写后，生成结构化中文笔记 + 索引登记：
 
-1. **判断模式**：`python3 scripts/decide_mode.py rss/transcripts/<...>.transcript.md`
-   - < 50K 字符 -> skill 模式；>= 50K 字符 -> map_reduce（rss feed 全部是对话/观点类播客，临界区一律 map-reduce，不做标题关键词判断）
-2. **选模板**：`python3 ~/.agents/skills/rss-grab/scripts/adapt_template.py <transcript> --templates-dir ~/.agents/skills/rss-grab/templates`
-   - 调 `scripts/adapt_template.py`（不硬编码路径），传 rss 的 templates-dir
-   - 播客命中「访谈播客」模板
-3. **生成笔记**：
-   - skill 模式（短播客）：`python3 scripts/generate_note.py <transcript> <plan.json> --info-json <info.json> --output <note.md>`
-   - map-reduce 模式（长播客 >50K）：`python3 scripts/regenerate_note.py <guid_hash8>`（自动跑 map_reduce_note.py -> final.json -> generate_note --source summary）
-   - 自动追加 rss/notes/INDEX.md（按 guid_hash8 dedup）
-4. **重生成**：`python3 scripts/regenerate_note.py <guid_hash8> [--mode auto|skill|map_reduce] [--keep-v1]`
-5. **批量抓取**：`python3 scripts/fetch_rss_pending.py [待抓取URL/RSS.md]`
+1. **判断长短**：`python3 scripts/decide_mode.py rss/transcripts/<...>.transcript.md`
+   - 净字 = 剥 `**[mm:ss]**` 时间戳后去所有空白，口径实现在 `_shared/long_doc.py`，阈值 15,000。阈值来源：2026-10-04 由「原始字符 ≥ 50,000」改为净字口径。
+   - **2026-10-05 校正：长短播客统一走 v3 四步管线**（①.5 错字纠错 → ② 分块扫描 → ③ 合并去重 → ④ 撰写）。`decide_mode.py` 两个分支都返回 `("v3", …)`，只用来提示长短，不再分流到别处。此前文档写的「短播客 skill 模式 / 长播客 map-reduce 模式」及「D6 尚未定案」均已作废（D6 已于 2026-10-04 拍板）。
+2. **选模板**（可选，仅 v2 模板路径需要）：`python3 scripts/adapt_template.py <transcript> --templates-dir ~/.agents/skills/rss-grab/templates`
+   - 调 `scripts/adapt_template.py`（不硬编码路径），传 rss 的 templates-dir；播客命中「访谈播客」模板
+   - v3 管线**不需要** plan.json，该步可跳过
+3. **生成笔记（生产入口）**：
+   ```bash
+   python3 scripts/generate_note_v3.py <guid_hash8>
+   # 或显式给路径
+   python3 scripts/generate_note_v3.py \
+     --transcript rss/transcripts/<stem>.transcript.md \
+     --info rss/raw/<stem>.info.json \
+     --output rss/notes/<源名>/<stem>.md
+   ```
+   - 短文走单次调用，长文（净字 > 15,000）自动走四步；两者同一入口
+   - 自动追加 `rss/notes/INDEX.md`（按 guid_hash8 dedup）
+   - 其他开关：`--no-typos`（跳过纠错）、`--no-index`（不写索引）、`--force`（覆盖防重闸门）
+4. **批量抓取**：`python3 scripts/fetch_rss_pending.py [待抓取URL/RSS.md]`
    - 读待抓取文件，批量调 fetch_rss_feed.py 落原料（不生成笔记）
+
+> **2026-10-05 校正（v2 遗留）**：`generate_note_v2.py` / `regenerate_note_v2.py` / `map_reduce_note_v2.py` / `adapt_template.py` 文件仍在、可跑，但已退出主流程。
+> ⚠️ 文档原写的 `scripts/regenerate_note.py`（无 `_v2` 后缀）**该文件不存在**，照着跑必然 `No such file`，新流程不要用。
 
 产物：`rss/notes/<源名>/<sanitized_title>-<guid_hash8>.md` + 全局 `rss/notes/INDEX.md`
 INDEX 列：`| 日期 | 标题 | 作者 | 时长 | 期号 | 源 | 笔记 |`
 
 依赖：LLM_API_KEY（读 scripts/.env，模板见 .env.example）
+
+## 阶段 3 自动化（订阅链路接上笔记生成）
+
+> 2026-10-05 新增（T3.3）。此前「转写完 → 生成笔记」没有脚本，只能人工逐期跑；
+> `asr_podcast.py` / `fetch_rss_feed.py` 当时只打印「阶段 3 后续实现」。现在由下面这个脚本接上。
+
+`scripts/generate_note_for_confirmed.py` = 订阅链路的阶段 3 自动化。
+
+```bash
+python3 scripts/generate_note_for_confirmed.py <状态文件>   # 单个节目
+python3 scripts/generate_note_for_confirmed.py --all          # 遍历订阅表所有源
+python3 scripts/generate_note_for_confirmed.py --all --dry-run  # 只列不调 LLM，不花钱
+```
+
+- **只处理「确认抓取」区 `[x]`** 的期数（2026-10-05 拍板的策略 A）：
+
+  | 标记 | 含义 | 阶段 3 |
+  |---|---|---|
+  | `[ ]` | 待确认（用户还没审） | ❌ 跳过 —— 白烧钱防护 |
+  | `[x]` | 确认抓取 | ✅ 处理 |
+  | `[~]` | 确认不抓 | ❌ 跳过 |
+  | `[done]` | 已转化 | ❌ 跳过 |
+
+- LLM 环节默认 5 并发，`--max-parallel N` 可调
+- 幂等：底层 `generate_note_v3.py` 自带防重闸门，重复调用不重复烧额度、不重复追加 INDEX
+- 建议先跑 `--dry-run` 确认清单再实跑
 
 ## 路径约定
 
@@ -118,7 +155,7 @@ INDEX 列：`| 日期 | 标题 | 作者 | 时长 | 期号 | 源 | 笔记 |`
 | 订阅状态文件 | `./rss/订阅/<节目名>.md` |
 | 运行日志（定时任务时） | `./rss/订阅/.logs/` |
 | 期数元数据 | `./rss/raw/<sanitized_title>-<guid_hash8>.info.json` |
-| 音频文件 | `./rss/audio/<sanitized_title>-<guid_hash8>.<ext>` |
+| 音频文件（临时原料） | `/tmp/rss-grab-audio/<sanitized_title>-<guid_hash8>.<ext>`（2026-10-05 校正：原写 `./rss/audio/`，音频已改存 `/tmp/`，不进项目；`--cleanup-audio` 转写后可清理） |
 | 转写稿（阶段 2） | `./rss/transcripts/<sanitized_title>-<guid_hash8>.transcript.md` |
 | 笔记（阶段 3） | `./rss/notes/<源名>/<sanitized_title>-<guid_hash8>.md` |
 | 索引（阶段 3） | `./rss/notes/INDEX.md` |
@@ -159,5 +196,5 @@ INDEX 列：`| 日期 | 标题 | 作者 | 时长 | 期号 | 源 | 笔记 |`
 - 无 `<guid>` 的 feed 用 pubDate+标题 hash 派生主键
 - 畸形 XML（如爱范儿）解析失败时明确报错（阶段 1 不处理，留待后续按需启用 feedparser）
 - ASR 转写仅 Apple Silicon（mlx-whisper）；长音频（35-60 分钟）转写约 2-3 分钟
-- 超长播客（>2h）转写约 10-15 分钟，笔记走 map-reduce（多次 API 调用）
+- 超长播客（>2h）转写约 10-15 分钟，笔记走 v3 长文四步（多次 API 调用）
 - 订阅模式反推依赖 Apple Podcasts 页面结构（`"feedUrl":"..."` 字段），页面改版时需更新 `resolve_apple_podcast.py`

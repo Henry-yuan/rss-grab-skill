@@ -140,7 +140,7 @@ def main():
     n_fail = sum(1 for r in results if r["status"] == "fail")
     print(f"\n=== 完成：✅ {n_ok} | ❌ {n_fail} ===")
     if n_ok:
-        print(f"\n💡 接下来跑 asr_podcast.py --all 转写，再跑 generate_note.py 生成笔记")
+        print(f"\n💡 接下来跑 asr_podcast.py --all 转写，再跑 generate_note_v2.py 生成笔记")
 
 
 if __name__ == "__main__":

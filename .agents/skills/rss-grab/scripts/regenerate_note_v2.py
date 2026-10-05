@@ -190,10 +190,10 @@ def run_map_reduce(transcript_path: Path, plan_path: Path,
     intermediate_md_path.write_text(intermediate_md, encoding="utf-8")
     print(f"   intermediate.md: {intermediate_md_path} ({len(intermediate_md)} 字符)")
 
-    # 3. 调 generate_note.py --source summary（LLM 按模板骨架重新组织）
-    print("   ▶ 跑 generate_note.py --source summary")
+    # 3. 调 generate_note_v2.py --source summary（LLM 按模板骨架重新组织）
+    print("   ▶ 跑 generate_note_v2.py --source summary")
     cmd = [
-        sys.executable, str(SCRIPT_DIR / "generate_note.py"),
+        sys.executable, str(SCRIPT_DIR / "generate_note_v2.py"),
         str(intermediate_md_path), str(plan_path),
         "--info-json", str(info_path),
         "--output", str(output),
@@ -204,7 +204,7 @@ def run_map_reduce(transcript_path: Path, plan_path: Path,
     if r.returncode != 0:
         print("STDOUT:", r.stdout, file=sys.stderr)
         print("STDERR:", r.stderr, file=sys.stderr)
-        raise RuntimeError(f"generate_note.py 失败: {r.returncode}")
+        raise RuntimeError(f"generate_note_v2.py 失败: {r.returncode}")
     print(r.stdout.strip())
 
     # 4. 清理 summary.md 临时文件
@@ -237,9 +237,9 @@ def _mark_done_args(info_path: Path) -> list[str]:
 
 def run_generate_note(transcript_path: Path, plan_path: Path,
                       info_path: Path, output: Path):
-    """skill 模式：直接跑 generate_note.py（transcript 全文）。"""
+    """skill 模式：直接跑 generate_note_v2.py（transcript 全文）。"""
     cmd = [
-        sys.executable, str(SCRIPT_DIR / "generate_note.py"),
+        sys.executable, str(SCRIPT_DIR / "generate_note_v2.py"),
         str(transcript_path), str(plan_path),
         "--info-json", str(info_path),
         "--output", str(output),
@@ -249,7 +249,7 @@ def run_generate_note(transcript_path: Path, plan_path: Path,
     if r.returncode != 0:
         print("STDOUT:", r.stdout, file=sys.stderr)
         print("STDERR:", r.stderr, file=sys.stderr)
-        raise RuntimeError(f"generate_note.py 失败: {r.returncode}")
+        raise RuntimeError(f"generate_note_v2.py 失败: {r.returncode}")
     print(r.stdout.strip())
 
 
@@ -321,9 +321,18 @@ def main():
     else:
         mode = args.mode
 
-    if mode == "map_reduce":
-        print("\n▶ map-reduce 模式（长播客）")
-        run_map_reduce(transcript_path, plan_path, args.output, info_path)
+    if mode == "v3":
+        # 长文走 v3 四步管线（D6 拍板 2026-10-04，取代原 map-reduce）
+        # 直接转调 generate_note_v3.py —— 那个薄壳已做好信头/落盘/索引/状态标记
+        print("\n▶ v3 四步管线（长播客）")
+        cmd = [sys.executable, str(SCRIPT_DIR / "generate_note_v3.py"),
+               "--transcript", str(transcript_path),
+               "--info", str(info_path),
+               "--output", str(args.output)]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SCRIPT_DIR))
+        print(r.stdout.rstrip() or r.stderr.rstrip())
+        if r.returncode != 0:
+            raise RuntimeError(f"generate_note_v3.py 失败: {r.returncode}")
     else:
         print("\n▶ skill 模式（短播客）")
         run_generate_note(transcript_path, plan_path, info_path, args.output)

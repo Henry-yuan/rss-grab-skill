@@ -6,7 +6,7 @@
   2. 按 token 切分（每块 ~30K tokens，留 1M context 余量）
   3. MAP 阶段: 并发 4 调 LLM API，每块生成段级 JSON
   4. REDUCE 阶段: 调 LLM API 一次，输出完整笔记 JSON
-  5. final.json 交给 generate_note.py --source summary 拼最终 MD
+  5. final.json 交给 generate_note_v2.py --source summary 拼最终 MD
 
 用法:
   python3 map_reduce_note.py <transcript.md>
@@ -33,8 +33,21 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 CHUNK_TOKENS = 30_000          # 每块目标 token 数
 MAX_WORKERS = 4               # map 阶段并发数
 RETRY = 3                     # API 重试次数
-MAP_MAX_TOKENS = 4000         # map 阶段输出上限
-REDUCE_MAX_TOKENS = 16000     # reduce 阶段输出上限
+# 输出预算：**天花板，不是限长工具**。
+# 2026-10-04 从 MAP_MAX_TOKENS=4000 / REDUCE_MAX_TOKENS=16000 统一到这里。
+#
+# 为什么必须放开（实测，见主项目 docs/versions/V1.0/spec.md 实施期决策 #13/#18）：
+# 现模型 MiniMax-M3.1-Flash-Preview 是**推理模型**，thinking token 与正文共享
+# `max_completion_tokens` 预算。原 4,000 的上限里 thinking 独占 70%–100%
+# （tiktoken 实测失败样本的可见输出只剩 485/1,201/524/0 token），正文 JSON 被截断
+# → 3 层 JSON fallback 均无截断修复能力 → 重试 3 次后 RuntimeError。
+# V1.0 D3 对照实验实测：map-reduce 成功率仅 3/8，两篇最长的 4 次尝试全败。
+#
+# ⚠️ **输出长度不靠这个数字控制**：MAP_PROMPT / REDUCE_PROMPT 里没有任何数字长度
+# 上限，长度由「至少 2 条要点」「章节数按内容自然边界」「不要丢失任何片段的核心信息」
+# 这类结构性要求决定。调小此值不会让输出变短，只会让它被截断 —— 那是 bug 不是限长。
+# 要控制篇幅请改提示词。
+MAX_COMPLETION = int(os.environ.get("LLM_MAX_COMPLETION", "100000"))
 TEMPERATURE = 0               # 可复现
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
 from env import load_env
@@ -182,7 +195,7 @@ def fix_json_quotes(text: str) -> str:
     return ''.join(result)
 
 
-def call_api(client, model, messages, max_tokens, label, raw_dump_dir) -> dict:
+def call_api(client, model, messages, max_completion_tokens, label, raw_dump_dir) -> dict:
     """带重试的 API 调用 + JSON fallback 解析。"""
     for attempt in range(1, RETRY + 1):
         try:
@@ -192,14 +205,24 @@ def call_api(client, model, messages, max_tokens, label, raw_dump_dir) -> dict:
                 messages=messages,
                 response_format={"type": "json_object"},
                 temperature=TEMPERATURE,
-                max_tokens=max_tokens,
+                # 参数名必须是 max_completion_tokens：推理模型的 thinking token 计入此预算，
+                # 旧的 max_tokens 在新 API 上语义不同 —— AC-C4 要求改名的原因就在这里。
+                max_completion_tokens=max_completion_tokens,
             )
             dt = time.time() - t0
             content = response.choices[0].message.content
             usage = response.usage
+            # 把 reasoning token 单独打出来：thinking 吃预算这件事此前完全不可见，
+            # 是「4,000 静默截断」迟迟没被发现的原因。
+            reason_tok = "?"
+            if usage is not None:
+                detail = getattr(usage, "completion_tokens_details", None)
+                rt = getattr(detail, "reasoning_tokens", None) if detail else None
+                reason_tok = rt if rt is not None else 0
             print(
                 f"  [{label}] attempt={attempt} ok in {dt:.1f}s "
-                f"tokens={usage.total_tokens if usage else '?'}"
+                f"tokens={usage.total_tokens if usage else '?'} "
+                f"(thinking={reason_tok})"
             )
 
             # 解析前先 strip thinking block（M3 特性，统一正则处理）
@@ -243,6 +266,19 @@ def call_api(client, model, messages, max_tokens, label, raw_dump_dir) -> dict:
                 dump = pathlib.Path(raw_dump_dir) / f"{label}.raw.txt"
                 dump.parent.mkdir(parents=True, exist_ok=True)
                 dump.write_text(content)
+            # 区分「被 max_completion_tokens 截断」与「模型输出的 JSON 真的坏了」。
+            # 截断的判据：内容非空、且结尾既不是 '}' 也没有闭合引号 —— 被切断的 JSON
+            # 必然如此。2026-10-04 之前这里一律报「无法解析 JSON」，把截断说成了格式问题，
+            # 白白排查了很久。
+            tail = content.rstrip()
+            looks_truncated = bool(tail) and not tail.endswith("}") and '"' in tail
+            if looks_truncated:
+                raise ValueError(
+                    f"输出疑似被 max_completion_tokens={max_completion_tokens} 截断"
+                    f"（内容长 {len(content)} 字符，结尾: {tail[-60:]!r}）。"
+                    f"这是**天花板不够**，不是 JSON 格式问题 —— 提高该值或精简提示词，"
+                    f"不要靠改 fallback 解析器绕过"
+                )
             raise ValueError(f"无法解析 JSON（content 前 200 字符: {content[:200]!r}）")
         except Exception as e:
             print(f"  [{label}] attempt={attempt} failed: {type(e).__name__}: {e}")
@@ -327,7 +363,7 @@ def main():
             label = f"map-{inp['index']}/{len(chunks)}"
             fut = executor.submit(
                 call_api, client, model, messages,
-                MAP_MAX_TOKENS, label, str(OUTPUT_DIR),
+                MAX_COMPLETION, label, str(OUTPUT_DIR),
             )
             futures[fut] = inp["index"]
         for fut in as_completed(futures):
@@ -356,7 +392,7 @@ def main():
     final = run_with_heartbeat(
         lambda: call_api(
             client, model, reduce_messages,
-            REDUCE_MAX_TOKENS, "reduce", str(OUTPUT_DIR),
+            MAX_COMPLETION, "reduce", str(OUTPUT_DIR),
         ),
         label="reduce",
         interval=30,

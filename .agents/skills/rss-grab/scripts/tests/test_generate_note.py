@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""generate_note 纯函数单测：format_info_json / sanitize_index_cell / register_rss_index。
+"""generate_note_v2 纯函数单测：format_info_json / sanitize_index_cell / register_rss_index。
+
+注意：三个索引函数自 T2.3 起实现在 `_shared/append_index.py`，此处经
+v2 脚本的 re-export 访问（断言语义不变）；新模块自身的契约由
+`_shared/tests/test_append_index.py` 钉住。
 不测 call_llm（真实 LLM 靠端到端验证）。"""
 import sys, pathlib, tempfile, json
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
-import generate_note as g
+import generate_note_v2 as g
 
 
 def _sample_info():
