@@ -13,6 +13,13 @@
 import re, sys, subprocess, time, pathlib, datetime
 from typing import Optional
 
+# 原料→笔记管道：每条成功入队，独立 worker 收割（见 note_worker.py 顶部说明）
+# scripts → <skill> → skills → _shared，是 parents[2]。
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "_shared"))
+import note_worker  # noqa: E402
+
+_SRC_ID = "rss"
+
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 FETCH_SCRIPT = SCRIPT_DIR / "fetch_rss_feed.py"
 
@@ -101,6 +108,12 @@ def rebuild_md(lines, pending_items, results, date_str):
 
 
 def main():
+    # `--auto-notes`：每抓成功一条就入笔记队列，可另开 note_worker.py 并行收割。
+    # 默认关 —— 「只补原料、笔记之后统一重跑」是正当场景，不该被默认值堵死。
+    auto_notes = "--auto-notes" in sys.argv
+    if auto_notes:
+        # worker 靠这个标记判断「队列空了是不是真的做完了」
+        note_worker.mark_running(_SRC_ID)
     md_path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PENDING_FILE
     if not md_path.exists():
         sys.exit(f"❌ 文件不存在：{md_path}")
@@ -125,7 +138,10 @@ def main():
         print(f"\n--- {url[:80]} ---")
         ok, err = fetch_one(url, out_dir)
         if ok:
-            print(f"  ✅ 抓取完成（原料已落盘）")
+            print("  ✅ 抓取完成（原料已落盘）")
+        if auto_notes:
+            note_worker.enqueue(_SRC_ID, note_id)
+            print(f"     ↪ 已入笔记队列（{note_id}）")
             results.append({"status": "ok", "new_line": f"- [x] {url} ✅ {timestamp}"})
         else:
             print(f"  ❌ 抓取失败：{err[:200]}")
@@ -136,11 +152,19 @@ def main():
     md_path.write_text(new_text, encoding="utf-8")
     print(f"\n📝 已更新文件 {md_path}")
 
+    if auto_notes:
+        note_worker.clear_running(_SRC_ID)  # 抓取端结束，worker 据此收尾
+
     n_ok = sum(1 for r in results if r["status"] == "ok")
     n_fail = sum(1 for r in results if r["status"] == "fail")
     print(f"\n=== 完成：✅ {n_ok} | ❌ {n_fail} ===")
     if n_ok:
-        print(f"\n💡 接下来跑 asr_podcast.py --all 转写，再跑 generate_note_v2.py 生成笔记")
+        print("\n💡 笔记生成："
+              + ("原料已入队列，收割：\n"
+                 f"  python3 .agents/skills/_shared/note_worker.py --source rss --follow"
+                 if auto_notes else
+                 f"  为 {n_ok} 条跑 v3 管线（generate_note_v2 已退出主流程）：\n"
+                 f"    python3 .agents/skills/rss-grab/scripts/generate_note_v3.py <id>"))
 
 
 if __name__ == "__main__":
