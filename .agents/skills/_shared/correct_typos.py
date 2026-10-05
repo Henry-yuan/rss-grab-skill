@@ -537,7 +537,8 @@ def _detect_window(client, effort: str, retries: int,
 
 def detect_typos(text: str, client, effort: str = "high",
                  max_chars: int = 120000, retries: int = 2,
-                 seed: list[dict] | None = None) -> list[dict]:
+                 seed: list[dict] | None = None,
+                 progress: dict | None = None) -> list[dict]:
     """调 LLM 产出单篇的**逐处判断**（段编号 + 原文 + 决定 + 正确写法）。
 
     与旧版的区别：旧版要模型输出「A → B 映射表」，程序拿去做全文替换；
@@ -554,11 +555,27 @@ def detect_typos(text: str, client, effort: str = "high",
     （285,809 字符 / 12,150 段）只有前 120,000 字符进过纠错，**58% 的内容
     从未被检查**，而报告里的 `segments` 仍按全文写 12,150，看上去像全篇都跑过。
     现在按段边界切窗逐窗检测、合并结果，段号为全局编号故无需重映射。
+
+    `progress`（**2026-10-05 V1.1 T1.14.2 新增，可选**）：传入 dict 会被就地回填
+    **真实**进度，供 `run_file` 统计覆盖率：
+
+        progress["windows_total"] = 总窗数
+        progress["windows_ok"]    = **实际成功**的窗数
+        progress["segments_ok"]   = 成功窗覆盖的段数
+
+    ⚠️ **为什么必须有**：run_file 原先算 coverage 用「重算的理论窗数」当分母，
+    某窗检测失败时仍报 1.0 —— 「一个窗都没跑成功」被报成「100% 覆盖」。
+    这是本 docstring 记的 2026-10-05「静默截断」的**同机制第二次发作**：
+    分母选错，把「没做」报成了「做完了」。
     """
     if not client:
         return []
     segs = split_segments(text)
     windows = _window_segments(segs, max_chars)
+    if progress is not None:
+        progress["windows_total"] = len(windows)
+        progress["windows_ok"] = 0
+        progress["segments_ok"] = 0
     if len(windows) > 1:
         print(f"    源文 {len(text):,} 字符 / {len(segs):,} 段 → 分 {len(windows)} 窗纠错"
               f"（单窗上限 {max_chars:,}）", flush=True)
@@ -574,6 +591,9 @@ def detect_typos(text: str, client, effort: str = "high",
             print(f"    ⚠️ 第 {wi}/{len(windows)} 窗检测失败，该窗沿用原文："
                   f"{type(e).__name__}: {str(e)[:110]}", flush=True)
             continue
+        if progress is not None:      # 2026-10-05 V1.1 T1.14.2
+            progress["windows_ok"] += 1
+            progress["segments_ok"] += len(win)
         all_items.extend(items)
     return all_items
 
@@ -622,7 +642,11 @@ def run_file(src: Path, out_path: Path, typos_out: Path,
     # 2026-10-05 修：此处原为 `detect_typos(..., seed=seed)`，但 run_file 的
     # `seed` 参数在阶段一清死代码时已删除 → **有 client 时必然 NameError**。
     # 之所以一直没被发现：现有单测全部走 `client=None` 分支，这行永远不执行。
-    judgments = detect_typos(text, client, effort=effort) if client else []
+    # 2026-10-05 V1.1 T1.14.2：progress 收回**真实**成功窗数，
+    # 避免 coverage 用「重算的理论窗数」当分母。
+    progress: dict = {}
+    judgments = detect_typos(text, client, effort=effort,
+                             progress=progress) if client else []
     out, stats = apply_judgments(text, judgments)
 
     assert_structure_preserved(text, out)
@@ -632,8 +656,16 @@ def run_file(src: Path, out_path: Path, typos_out: Path,
 
     # 覆盖率写进报告：此前 segments/chars_in 都按全文记，**看不出实际送检了多少**。
     # 5 小时播客有 58% 从未进过纠错，报告却像全篇都跑过（见 detect_typos 注释）。
-    windows = _window_segments(segs, 120000) if client else [segs]
-    detected_segments = sum(len(w) for w in windows) if client else 0
+    # ⚠️ 2026-10-05 V1.1 T1.14.2 修：原实现重算 _window_segments 当分母，
+    # 那算的是「应该有多少窗」而非「实际跑了多少窗」。某窗检测失败时 coverage
+    # 仍报 1.0。实测：让 LLM 全部抛异常，coverage 与 success_rate 都报 1.0。
+    if client:
+        windows_total = progress.get("windows_total", 0)
+        windows_ok = progress.get("windows_ok", 0)
+        detected_segments = progress.get("segments_ok", 0)
+    else:
+        windows_total = windows_ok = detected_segments = 0
+    covered = detected_segments > 0
 
     typos_out.parent.mkdir(parents=True, exist_ok=True)
     report = {
@@ -643,12 +675,13 @@ def run_file(src: Path, out_path: Path, typos_out: Path,
         "effort": effort,
         "segments": len(segs),
         "detected_segments": detected_segments,
-        "detected_windows": len(windows) if client else 0,
+        "detected_windows": windows_ok,
+        "detected_windows_total": windows_total,
         "coverage": (round(detected_segments / len(segs), 4)
-                     if (client and segs) else 0.0),
+                     if (covered and segs) else 0.0),
         "judgments": len(judgments),
         "applied_count": stats.get("plan", 0),
-        "success_rate": round(stats.get("success_rate", 1.0), 4),
+        "success_rate": round(stats.get("success_rate", 1.0), 4) if covered else 0.0,
         "neighbor_rescued": stats.get("neighbor_rescued", 0),
         "rejected": stats.get("rejected_list", []),
         "decision_counts": {k[len("decision_"):]: v for k, v in stats.items()
