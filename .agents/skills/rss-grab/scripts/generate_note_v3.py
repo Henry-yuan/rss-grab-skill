@@ -6,7 +6,8 @@
 1. **信头**：`_shared/build_frontmatter.py` 的 17 字段（AC-C2）
 2. **落盘**：正文 + frontmatter 合成 `rss/notes/<节目名>/<标题>-<hash8>.md`
 3. **索引**：`generate_note.register_index()` 追加到 `rss/notes/INDEX.md`
-4. **进度日志**：订阅状态文件按 `guid_hash8` 标记完成
+4. **进度日志**：订阅状态文件里对应期标 `[done]` 移入「已转化」区
+   （`state_path` 与完整 guid 都从 info.json 反查，见 `mark_subscribe_done`）
 
 **D6 已拍板（2026-10-04）：长文走本管线，不再走 map-reduce。**
 依据见 `docs/versions/V1.0/spec.md` 决策记录 #21/#44：4 篇同篇对照 4/4 同向，
@@ -48,6 +49,54 @@ def locate(guid_hash8: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path | 
         raise SystemExit(f"❌ 找不到 info.json: {i}")
     n = next(iter(sorted(root.glob(f"rss/notes/**/*-{guid_hash8}.md"))), None)
     return t, i, n
+
+
+def _write_atomic(path: pathlib.Path, text: str) -> None:
+    """原子落盘：先写同目录临时文件再 os.replace。
+
+    write_text() 是 open('w')——先截断再逐块写；两进程同时写同一路径会各自截断、
+    交错落盘，产出「半截 A + 半截 B」的撕裂文件且**不报错**。
+    os.replace 在同一文件系统内是原子的，读者只可能看到完整旧版或完整新版。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def mark_subscribe_done(info: dict, note_path: pathlib.Path) -> str:
+    """把订阅状态文件里对应期标 [done] 移入「已转化」区，返回一句话结果。
+
+    `state_path` 与**完整 guid** 都从 info.json 反查，与 `regenerate_note_v2`
+    的 `_mark_done_args` 同源：
+
+    - guid 取 `item.guid` —— 状态文件里存的是**完整 guid**，拿 `guid_hash8`
+      （sha256 前 8 位）去全等匹配注定落空；
+    - state_path 由 `feed.title` 在订阅表里匹配节目名、再拼该项的 `state_file`；
+      根目录用 `subscribe_manager.PROJECT_ROOT`，与该模块自己读订阅表的根一致。
+
+    标记失败不该让笔记生成失败（保留原意图），但**必须打出来**：静默
+    `except: pass` 会让「整条接线从未通过」这件事完全看不出来。
+    """
+    try:
+        import subscribe_manager
+        guid = (info.get("item") or {}).get("guid") or ""
+        feed_title = (info.get("feed") or {}).get("title") or ""
+        if not guid or not feed_title:
+            return "跳过：info.json 缺 item.guid / feed.title"
+        for src in subscribe_manager.load_subscriptions().get("sources", []):
+            if src.get("name") == feed_title:
+                state_path = subscribe_manager.PROJECT_ROOT / src["state_file"]
+                ok = subscribe_manager.mark_done(state_path, guid, str(note_path))
+                return (f"已标记 {state_path.name}" if ok
+                        else f"未找到 guid={guid}（{state_path.name}）")
+        return f"跳过：{feed_title} 不在订阅表里"
+    except Exception as e:  # noqa: BLE001
+        return f"失败（不影响笔记）：{type(e).__name__}: {e}"
 
 
 def main() -> int:
@@ -111,22 +160,31 @@ def main() -> int:
     body, report, stats = shared.generate_note_body(
         t, info, client, a.work_root, SCRIPT_DIR / "typos")
 
+    # 源文过短：共享层已跳过正文生成，直接返回 status=empty。注意此时的 stats
+    # **没有** net_chars / route（赋值在闸门之后），下面统计行会 KeyError；
+    # 而且若不在这里收住，会先落一篇空正文笔记并登记进生产 INDEX，
+    # 占位信头又大于防重闸门的 500 字节阈值 → 重跑被判「已跳过」，
+    # 永久卡在空笔记上。故：只落占位信头，且**不进索引**。
+    if stats.get("status") == "empty":
+        fmv = fm.build(info, transcript_status="empty",
+                       summary_llm="（源文内容过少，未生成正文）")
+        _write_atomic(a.output,
+                      fm.dump(fmv) + "\n> ⚠️ 源文内容过少（清洗后 "
+                      f"{stats.get('source_chars')} 字符），未生成正文。\n")
+        print(f"⏭️ 源文过短，落占位：{a.output}")
+        # 占位信头多大取决于 info 里的标题/简介长度（实测最短 480、常见 673+），
+        # 所以「会不会被防重闸门拦下」是**因内容而异**的，不能一句话套死。
+        size = a.output.stat().st_size
+        print(f"   {size:,} bytes "
+              + ("已超防重闸门 500，重跑须加 --force" if size > 500
+                 else "未超防重闸门 500，重跑不受影响"))
+        return 0
+
     # 落盘：信头 + 正文
     llm = stats.get("llm") or {}          # tags / summary 在 LLM 的 JSON 里
     fmv = fm.build(info, summary_llm=llm.get("summary", ""),
                    tags_llm=llm.get("tags", []) or [])
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    # 原子落盘：先写同目录临时文件再 os.replace。
-    # write_text() 是 open('w')——先截断再逐块写；两进程同时写同一路径会各自截断、
-    # 交错落盘，产出「半截 A + 半截 B」的撕裂文件且**不报错**。
-    # os.replace 在同一文件系统内是原子的，读者只可能看到完整旧版或完整新版。
-    tmp = a.output.with_name(f"{a.output.name}.tmp{os.getpid()}")
-    try:
-        tmp.write_text(fm.dump(fmv) + "\n" + body + "\n", encoding="utf-8")
-        os.replace(tmp, a.output)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+    _write_atomic(a.output, fm.dump(fmv) + "\n" + body + "\n")
 
     # 索引（--no-index 时跳过：批量重生成到暂存目录不该碰生产 INDEX.md）
     src = "skipped"
@@ -141,13 +199,12 @@ def main() -> int:
           f"正文={len(body):,} 纠错={stats.get('typo_applied', 0)} 处 "
           f"用时={time.time() - t0:.0f}s 索引={src}")
 
-    # 进度日志：按 guid_hash8 标记完成（与订阅流程对齐）
-    if a.guid_hash8 and not a.no_index:      # 暂存批次不标记订阅状态
-        try:
-            from subscribe_manager import mark_done
-            mark_done(a.guid_hash8)
-        except Exception:
-            pass          # 状态标记失败不该让生成失败
+    # 进度日志：把订阅状态文件里对应期标 [done] 移入「已转化」区。
+    # 开关与上面的索引闸门一致（--no-index = 暂存批次，不碰生产状态），
+    # **不用** guid_hash8 当条件：显式 --transcript/--info 时它为 None，
+    # 会把本来能标记的单篇生成一并跳过。
+    if not a.no_index:
+        print(f"   订阅状态={mark_subscribe_done(info, a.output)}")
     return 0
 
 
