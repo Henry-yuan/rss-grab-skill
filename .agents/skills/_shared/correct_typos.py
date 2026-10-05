@@ -458,6 +458,49 @@ def _base_url() -> str:
     return os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1")
 
 
+# ④ 剥尾逗号（第 4 层容错，2026-10-05 加）
+# 标准 JSON 不允许 `,}` / `,]`，但模型**经常**这么输出；一条尾逗号会让
+# 整轮判断作废并降档重试，代价与实际收益完全不成比例。
+#
+# ⚠️ **不能用 `re.sub(r",\s*([}\]])", r"\1", ...)`** —— 无脑正则不区分
+# 字符串内外，`{"原词": "你好, 世界"}` 里的逗号会被当成尾逗号删掉，
+# **内容被静默破坏**，而这正好是最不能出错的地方（原文要拿去定位替换）。
+# 所以逐字符扫描，只跟踪引号状态（含 `\` 转义），在引号**外**才判定。
+def _strip_trailing_commas(t: str) -> str:
+    """剥掉 `,}` / `,]` 这类尾逗号；字符串字面量**内部**原样保留。"""
+    out = []
+    in_str = False
+    esc = False
+    i, n = 0, len(t)
+    while i < n:
+        c = t[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and t[j] in " \t\r\n":
+                j += 1
+            if j < n and t[j] in "}]":
+                i += 1          # 丢掉这个逗号，逗号后的空白保留
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _parse_json(raw: str) -> dict:
     t = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
     t = re.sub(r"^```(?:json)?\s*", "", t)
@@ -465,7 +508,21 @@ def _parse_json(raw: str) -> dict:
     s, e = t.find("{"), t.rfind("}")
     if s < 0 or e < 0:
         raise ValueError(f"无法从返回中解析 JSON: {raw[:200]}")
-    return json.loads(t[s:e + 1])
+    body = t[s:e + 1]
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        # ④ **只在原样解析失败后**才剥尾逗号，且只重试一次。
+        # 对每次调用都无脑剥一遍会掩盖真实的解析错误——报告里就再也
+        # 看不出这次返回到底是什么形态，出错时无从判断是模型的锅还是解析的锅。
+        fixed = _strip_trailing_commas(body)
+        if fixed != body:
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+        # 剥完仍失败（或压根没尾逗号）→ 抛**原异常**，不吞。
+        raise exc
 
 
 def _find_env_dir() -> pathlib.Path | None:

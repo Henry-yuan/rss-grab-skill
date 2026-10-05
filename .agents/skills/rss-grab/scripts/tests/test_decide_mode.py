@@ -21,11 +21,11 @@ def _write(td: pathlib.Path, text: str) -> pathlib.Path:
 
 
 def test_short_transcript_skill_mode():
-    """净字 10,000 ≤ 15,000 → skill。"""
+    """净字 10,000 ≤ 15,000 → v3（短文路径，同样走 v3 四步管线）。"""
     with tempfile.TemporaryDirectory() as td:
         t = _write(pathlib.Path(td), "字" * 10000)
         mode, reason = d.decide(t)
-        assert mode == "skill"
+        assert mode == "v3"      # D6（2026-10-04）拍板：长短文统一走 v3
         assert "10000" in reason
 
 
@@ -34,7 +34,7 @@ def test_boundary_exactly_15000_is_short():
     with tempfile.TemporaryDirectory() as td:
         t = _write(pathlib.Path(td), "字" * 15000)
         mode, reason = d.decide(t)
-        assert mode == "skill"
+        assert mode == "v3"      # D6（2026-10-04）拍板：长短文统一走 v3
         assert "15000" in reason
 
 
@@ -59,9 +59,9 @@ def test_timestamps_are_stripped_before_judging():
         # （4 位分钟不是合法 ASR 标记），造数据时必须取模，否则净字会虚高。
         text = "".join(f"**[{i % 1000:03d}:00]** 短\n" for i in range(6000))
         t = _write(pathlib.Path(td), text)
-        assert len(text) > 50000          # 旧口径会判 map_reduce
+        assert len(text) > 50000          # 旧口径会判长文
         mode, reason = d.decide(t)
-        assert mode == "skill"
+        assert mode == "v3"
         assert "6000" in reason
 
 
@@ -91,7 +91,8 @@ def test_cli_exit_code_contract():
         short.write_text("字" * 100, encoding="utf-8")
         r = subprocess.run([sys.executable, str(SCRIPT_DIR / "decide_mode.py"), str(short)],
                            capture_output=True, text=True)
-        assert r.returncode == 0 and r.stdout.startswith("skill")
+        # exit 0 = 短文；route 为 v3（D6 拍板后长短文同路由）
+        assert r.returncode == 0 and r.stdout.startswith("v3")
 
         long_ = td / "长-f35eb04d.transcript.md"
         long_.write_text("字" * 20000, encoding="utf-8")
