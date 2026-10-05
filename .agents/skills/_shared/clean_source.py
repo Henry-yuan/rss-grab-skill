@@ -59,7 +59,7 @@ def clean_source(text: str) -> tuple[str, dict]:
         "chars_in": len(text),
         "banner_removed": 0,
         "meta_removed": 0,
-        "token_removed": 0,
+        "token_stripped": 0,
     }
     out = text
 
@@ -76,10 +76,14 @@ def clean_source(text: str) -> tuple[str, dict]:
     out = BANNER.sub(_drop_banner, out)
 
     # 2. 分享凭据
+    # ⚠️ 2026-10-05 T1.14.2：原名 token_removed，实为 0/1 布尔，与同 dict 里
+    # banner_removed / meta_removed（真计数，+= 1 累加几处）不是一个东西，
+    # 读报告的人会当成「剥了几处」。strip_share_token 是纯 re.sub、
+    # 不返回次数，所以这里只能是布尔 → 改名让它说实话。
     before = out
     out = strip_share_token(out)
     if out != before:
-        stats["token_removed"] = 1
+        stats["token_stripped"] = 1
 
     # 3. 归一化空行（连续 3+ 空行压成 2）
     out = re.sub(r"\n{3,}", "\n\n", out)

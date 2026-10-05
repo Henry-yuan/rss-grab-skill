@@ -196,33 +196,6 @@ def _load_env() -> None:
         pass
 
 
-def apply_typo_rules(text: str, rules: list[dict] | None) -> tuple[str, int]:
-    """对文本套用错字规则。rules 为空则原样返回。
-
-    在两个位置调用：
-      ② 扫描前——源里的 ASR 错拼不进模型
-      ③ 合并后——抓合并阶段 LLM 新造/放大的错拼
-    """
-    # ⚠️ **2026-10-05 已停用**：原实现依赖 `correct_typos` 的 v2 链路
-    # （`build_rules` / `apply_typos`），该链路已从生产入口不可达并被删除。
-    # 且纠错自 V1.0 起统一在 ①.5（分块之前）完成，这里再套一遍是重复劳动。
-    # 保留空实现只为不打断 `run_scan` / `run_merge` 的签名。
-    return text, 0
-
-
-def correct_merge_output(obj: dict, rules: list[dict] | None) -> tuple[dict, int]:
-    """③ 合并完成后对主题标题/detail 再套一次错字规则。"""
-    if not rules:
-        return obj, 0
-    total = 0
-    for t in obj.get("topics", []):
-        for k in ("title", "detail"):
-            if isinstance(t.get(k), str) and t[k]:
-                t[k], n = apply_typo_rules(t[k], rules)
-                total += n
-    return obj, total
-
-
 def split_chunks(text: str, target: int = 5000, overlap: int = 1) -> list[dict]:
     """按 [mm:ss] 段界切块，块间 overlap 段。
 
@@ -326,15 +299,13 @@ def _parse_json(raw: str) -> dict:
 
 def run_scan(chunks, out_dir: Path, client, effort: str,
              concurrency: int = 1, stagger: float = 2.0,
-             empty_retries: int = 1, typo_rules: list[dict] | None = None
-             ) -> list[dict]:
+             empty_retries: int = 1) -> list[dict]:
     """② 逐块抽取要点。
 
     并发模式下：
       - 最多 concurrency 个块同时在飞，块间 stagger 秒错开发射
       - 每块完成立刻追加写 pts_dir/scan-<i>.json（断点续跑的唯一依据）
       - 返回 0 要点的块自动重试 empty_retries 次
-    typo_rules 非空时，**每块在进模型前**先套错字纠正（② 阶段）。
     """
     pts_dir, raw_dir = out_dir / "points", out_dir / "raw"
     pts_dir.mkdir(parents=True, exist_ok=True)
@@ -346,9 +317,6 @@ def run_scan(chunks, out_dir: Path, client, effort: str,
     def one(c: dict) -> list[dict]:
         """抽一块；失败/空结果按 empty_retries 重试。"""
         chunk_text = c["text"]
-        typo_n = 0
-        if typo_rules:
-            chunk_text, typo_n = apply_typo_rules(chunk_text, typo_rules)
         user = SCAN_USER.format(idx=c["index"], total=len(chunks),
                                 start=c["start"] or "?", chunk=chunk_text)
         attempt, pts, err, el = 0, [], None, 0.0
@@ -376,7 +344,6 @@ def run_scan(chunks, out_dir: Path, client, effort: str,
             json.dumps({"block": c["index"], "start": c["start"],
                         "chars": c["chars"], "elapsed": el, "n": len(pts),
                         "attempts": attempt, "err": err,
-                        "typo_fixed": typo_n,
                         "prompt_sha": _PROMPT_SHA},
                        ensure_ascii=False, indent=2), encoding="utf-8")
         (pts_dir / f"scan-{c['index']:02d}.json").write_text(
@@ -405,12 +372,14 @@ def run_scan(chunks, out_dir: Path, client, effort: str,
 
     log = []
     for c in chunks:
+        # ⚠️ 2026-10-05 T1.14.2：原先此处有 `if not pf.exists(): status="missing"`
+        # 分支，但 `one()` 无提前 return、每块必写 pts 文件，且异常在块内被 try
+        # 吞掉后仍会落盘 —— **该分支不可达**，scan-log.json 里 `status:"missing"`
+        # 恒不出现，是一条永远为假的字段。
+        # 现在直接读：pts 文件真的缺失 = 落盘链路坏了，让它崩，不要静默记一个
+        # 没人看、且永远不会出现的状态。
         pf = pts_dir / f"scan-{c['index']:02d}.json"
         rf = raw_dir / f"scan-{c['index']:02d}.json"
-        if not pf.exists():
-            log.append({"block": c["index"], "chars": c["chars"],
-                        "points": None, "status": "missing"})
-            continue
         rec = json.loads(rf.read_text(encoding="utf-8"))
         log.append({"block": c["index"], "chars": c["chars"],
                     "points": len(json.loads(pf.read_text(encoding="utf-8"))),
@@ -424,15 +393,12 @@ def run_scan(chunks, out_dir: Path, client, effort: str,
     return allpts
 
 
-def run_merge(points, out_dir: Path, client, effort: str, tag: str,
-              typo_rules: list[dict] | None = None) -> dict:
+def run_merge(points, out_dir: Path, client, effort: str, tag: str) -> dict:
     """③ 合并去重。
 
     目录由本函数自建：不能依赖 run_scan 先跑过（--merge-only 路径不会跑 run_scan，
     缺目录会让已付费的 LLM 返回在落盘时崩掉，输出全丢）。
 
-    typo_rules 非空时，**合并完成后对主题标题/detail 再套一次**（③ 阶段），
-    抓合并阶段 LLM 新造或放大的错拼。
     """
     (out_dir / "raw").mkdir(parents=True, exist_ok=True)
     (out_dir / "merged").mkdir(parents=True, exist_ok=True)
@@ -451,9 +417,8 @@ def run_merge(points, out_dir: Path, client, effort: str, tag: str,
     t0 = time.time()
     raw = _call(client, MERGE_SYS, user, effort)
     obj = _parse_json(raw)
-    obj, typo_n = correct_merge_output(obj, typo_rules)
     (out_dir / "raw" / f"merge-{tag}.json").write_text(
-        json.dumps({"elapsed": round(time.time() - t0, 1), "typo_fixed": typo_n,
+        json.dumps({"elapsed": round(time.time() - t0, 1),
                     "raw": raw[:6000]},
                    ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "merged" / f"topics-{tag}.json").write_text(
@@ -497,9 +462,6 @@ def main() -> int:
     client = OpenAI(api_key=os.environ["MINIMAX_API_KEY"],
                     base_url=BASE_URL, timeout=TIMEOUT)
 
-    # ── 错字规则：种子表 + （可选）单篇检测结果 ──
-    typo_rules: list[dict] = []
-
     # ── 合并步单独实验：复用已有要点，跳过分块与抽取 ──
     if args.merge_only:
         pts = json.loads(Path(args.merge_only).read_text(encoding="utf-8"))
@@ -507,8 +469,7 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
         mtag = args.tag or f"merge{args.merge_effort}"
         print(f"[merge-only] 载入 {len(pts)} 条要点 <- {args.merge_only}", flush=True)
-        obj = run_merge(pts, out, client, args.merge_effort, mtag,
-                        typo_rules=typo_rules)
+        obj = run_merge(pts, out, client, args.merge_effort, mtag)
         print(f"[merge-only] -> {len(obj.get('topics', []))} 主题，"
               f"写入 {out / 'merged' / f'topics-{mtag}.json'}", flush=True)
         return 0
@@ -521,8 +482,6 @@ def main() -> int:
         f"scan_effort: {args.scan_effort}\nmerge_effort: {args.merge_effort}\n"
         f"concurrency: {args.concurrency}\nstagger: {args.stagger}\n"
         f"empty_retries: {args.empty_retries}\n"
-        f"typos_enabled: {bool(typo_rules)}\n"
-        f"typos_applied_rules: {sum(1 for r in typo_rules if r.get('applied'))}\n"
         f"scan_prompt_sha: {_PROMPT_SHA}\n"
         f"model: {MODEL}\nbase_url: {BASE_URL}\ntag: {tag}\n"
         f"started_at: {datetime.now().isoformat(timespec='seconds')}\n",
@@ -537,7 +496,7 @@ def main() -> int:
 
     pts = run_scan(chunks, out, client, args.scan_effort,
                    concurrency=args.concurrency, stagger=args.stagger,
-                   empty_retries=args.empty_retries, typo_rules=typo_rules)
+                   empty_retries=args.empty_retries)
     (out / "points" / f"points-{tag}.json").write_text(
         json.dumps(pts, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[chunk-scan] 抽取完成：{len(pts)} 条要点", flush=True)
@@ -546,8 +505,7 @@ def main() -> int:
         print("[chunk-scan] --no-merge，跳过 ③ 合并", flush=True)
         return 0
 
-    obj = run_merge(pts, out, client, args.merge_effort, tag,
-                    typo_rules=typo_rules)
+    obj = run_merge(pts, out, client, args.merge_effort, tag)
     (out / "metrics.json").write_text(json.dumps({
         "tag": tag, "size": args.size, "overlap": args.overlap,
         "scan_effort": args.scan_effort, "merge_effort": args.merge_effort,

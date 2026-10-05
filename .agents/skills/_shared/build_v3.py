@@ -237,7 +237,6 @@ USER_TPL = """## 笔记元信息
 _SOURCE_SUFFIXES = ('.transcript.md',)
 
 MIN_SOURCE_CHARS = 200
-LONG_DOC_THRESHOLD = 15000
 CHUNK_SIZE = 10000
 CHUNK_OVERLAP = 1
 SCAN_EFFORT = "xhigh"
@@ -248,17 +247,11 @@ MERGE_EFFORT = "low"
 # 峰值 LLM 并发 = 篇目并发 × 本值。
 SCAN_CONCURRENCY = 8
 
-# 阈值口径（2026-07 定稿）：剥离 ASR 时间戳标记后再删除所有空白
-# 分钟 1-3 位（2026-10-04 修）：原 \d{1,2} 剥不掉 **[144:23]** / **[240:00]** 这类
-# 超 100 分钟的标记，超长视频的净字因而被时间戳虚高约 1 倍。
-# 与 _shared/long_doc.py 的 _TS_STRIP 保持一致 —— spec AC-A2-2 要求三源逐篇判定相同。
-_TS_STRIP = re.compile(r"\*\*\[\d{1,3}:\d{2}\]\*\*")
-
-
-def net_len(text: str) -> int:
-    """净字数：剥时间戳标记 → 删所有空白。用于长文阈值判定。"""
-    return len(re.sub(r"\s+", "", _TS_STRIP.sub("", text)))
-
+# ⚠️ 2026-10-05 T1.14.2：净字口径与长文阈值此前在本文件里**另抄了一份**
+# （`_TS_STRIP` + `net_len` + `LONG_DOC_THRESHOLD`），而 test_long_doc.py 只测
+# long_doc 那份 —— 副本从未被验证，且两处各改各的必然漂移。
+# 现在统一从 long_doc 引。口径只有一处定义 = 只可能被测到一次。
+from long_doc import LONG_DOC_THRESHOLD, net_len  # noqa: E402,F401
 
 # 长文路径喂给 ④ 的是「主题清单 + 原文」：
 #   主题清单 = 覆盖全文的大纲，防遗忘
@@ -582,7 +575,7 @@ def _call_with_template(client, tpl: str, payload: str, info: dict,
 
 # ── 单篇 ──────────────────────────────────────────────
 def run_long_path(src_path: Path, source: str, client,
-                  work_dir: Path, typo_rules=None) -> dict:
+                  work_dir: Path) -> dict:
     """长文路径：①.5 错字纠正 → ② 分块扫描 → ③ 合并去重。
 
     返回 {"topics": [...], "typo_report": {...}, "scan_stats": {...}}
