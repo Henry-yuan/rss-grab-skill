@@ -89,8 +89,28 @@ cd "$PROJECT_ROOT" || { log "FATAL: cannot cd to $PROJECT_ROOT"; exit 1; }
 code=$?
 
 if [ "$code" -eq 0 ]; then
-  log "=== done: summary only, no notes generated (stage 3 = T3.3) ==="
+  log "=== stage 1 ok: fetch + AI summaries done ==="
 else
-  log "=== FAILED (exit $code), see log above ==="
+  log "=== stage 1 FAILED (exit $code), see log above ==="
 fi
+
+# ---- Stage 3: generate notes for items the user marked [x] (T3.3) ----
+# Runs even when stage 1 failed: its input is the state file, not the feed.
+# Only [x] items are processed, so unconfirmed episodes cost nothing.
+# NOTE: keep every comment in this file ASCII-only. Under launchd's UTF-8
+# locale bash splices the following $VAR into what it thinks is a comment
+# and aborts with "unbound variable" (cost us 3 months of silent exit 127).
+if [ -f "$SCRIPTS/generate_note_for_confirmed.py" ]; then
+  log "=== stage 3: notes for confirmed ([x]) items ==="
+  "$PY" "$SCRIPTS/generate_note_for_confirmed.py" --all >> "$LOG_FILE" 2>&1
+  note_code=$?
+  if [ "$note_code" -eq 0 ]; then
+    log "=== stage 3 done (nothing to do, or all notes ok) ==="
+  else
+    log "=== stage 3 returned $note_code (some notes FAILED); stage 1 result is unaffected ==="
+  fi
+else
+  log "WARN: generate_note_for_confirmed.py not found under $SCRIPTS; stage 3 skipped"
+fi
+
 exit $code
