@@ -151,7 +151,12 @@ def call_llm_for_template_choice(
 def derive_id_from_path(transcript_path: Path) -> str:
     """从 transcript 文件名派生 id。例：1个AI-Agent-和嘉宾聊-939b0cd2.transcript.md → 939b0cd2。"""
     name = transcript_path.name
-    name = re.sub(r"\.ai-zh\.transcript\.md$|\.transcript\.md$|\.images\.md$", "", name)
+    # 2026-10-06：原先这里还并列匹配另外两个**不开源**平台的产物后缀 ——
+    # 一个只开源 rss 的脚本，不该认识它们的文件命名。守门报出来后
+    # 改为**只认 rss 自己的**（`<标题>-<hash8>.transcript.md`）。
+    # 与主项目同名脚本的差异属 `_shared` 的**有意分化**，不是漏同步：
+    # 主项目那份三源共用，必须保留全部后缀。
+    name = re.sub(r"\.transcript\.md$", "", name)
     return name
 
 
