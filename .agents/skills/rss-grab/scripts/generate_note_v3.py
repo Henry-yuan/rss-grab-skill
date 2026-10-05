@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 import time
 
@@ -126,7 +127,30 @@ def main() -> int:
         ap.error("需要 <guid_hash8> 或 --transcript + --info")
 
     if not a.output:
-        a.output = existing or (SCRIPT_DIR / f"d3out-{t.stem}.md")
+        # ⚠️ 2026-10-05（与 bili 侧同源修复）：原先默认落
+        # `SCRIPT_DIR / f"d3out-{t.stem}.md"` —— **skill 脚本目录内部**，
+        # 那是调试期用的临时路径，漏进了默认值。后果：首次生成的新笔记
+        # 会落进 `.agents/skills/rss-grab/scripts/`，还在那儿自动建 INDEX.md
+        # （bili 侧实测踩过，rss 侧代码完全相同）。
+        # 已有笔记走 `existing` 分支才正常，所以「重跑」看着没事、
+        # 「首次生成」却落错地方。
+        if existing:
+            a.output = existing
+        else:
+            info = json.loads(pathlib.Path(i).read_text(encoding="utf-8"))
+            # hash8：位置参数优先；`--transcript` 分支从源文件名尾部取
+            # （`<标题>-<hash8>.transcript.md`），别用 `t.stem` —— 它只剥 `.md`，
+            # 会留下 `...-6505cacd.transcript` 这种尾巴。
+            m = re.search(r"-([0-9a-f]{8})\.transcript\.md$", t.name)
+            hash8 = a.guid_hash8 or (m.group(1) if m else t.name)
+            # 源目录名 = feed.title（与既有 `rss/notes/<节目名>/` 布局一致，
+            # 实测 十字路口Crossing / 独树不成林 都是这么来的）。
+            # ⚠️ 不要自造 `_source_dir` 之类字段 —— info.json 里根本没有它。
+            from fetch_rss_feed import sanitize_title
+            source_dir = (info.get("feed") or {}).get("title") or "Unknown"
+            a.output = (_SHARED.parent.parent.parent / "rss" / "notes" / source_dir /
+                        f"{sanitize_title((info.get('item') or {}).get('title') or hash8)}"
+                        f"-{hash8}.md")
 
     # 断点续跑闸门下推到脚本最前面（V1.0 A8，2026-10-04）。
     # 批量驱动两个进程从列表两端往中间跑，但任务在启动时就全排进了线程池，
