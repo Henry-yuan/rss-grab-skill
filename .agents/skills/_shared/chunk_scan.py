@@ -203,11 +203,11 @@ def apply_typo_rules(text: str, rules: list[dict] | None) -> tuple[str, int]:
       ② 扫描前——源里的 ASR 错拼不进模型
       ③ 合并后——抓合并阶段 LLM 新造/放大的错拼
     """
-    if not rules:
-        return text, 0
-    from correct_typos import apply_typos
-    out, hits = apply_typos(text, rules)
-    return out, sum(h.get("occurrences", 0) for h in hits)
+    # ⚠️ **2026-10-05 已停用**：原实现依赖 `correct_typos` 的 v2 链路
+    # （`build_rules` / `apply_typos`），该链路已从生产入口不可达并被删除。
+    # 且纠错自 V1.0 起统一在 ①.5（分块之前）完成，这里再套一遍是重复劳动。
+    # 保留空实现只为不打断 `run_scan` / `run_merge` 的签名。
+    return text, 0
 
 
 def correct_merge_output(obj: dict, rules: list[dict] | None) -> tuple[dict, int]:
@@ -485,12 +485,6 @@ def main() -> int:
                     help="只跑 ② 逐块抽取，跳过 ③ 合并")
     ap.add_argument("--merge-only", default=None, metavar="POINTS_JSON",
                     help="跳过 ①②，直接对已有 points.json 跑 ③ 合并（合并步实验用）")
-    ap.add_argument("--typos", action="store_true",
-                    help="启用专名错字纠正：② 扫描前 + ③ 合并后各套一次")
-    ap.add_argument("--typos-seed", default=None,
-                    help="错字词表路径（默认用脚本目录下的 typos_global.json）")
-    ap.add_argument("--typos-json", default=None,
-                    help="已生成的 correct_typos.py 报告 JSON（补充单篇检测结果）")
     ap.add_argument("--tag", default=None)
     args = ap.parse_args()
 
@@ -505,16 +499,6 @@ def main() -> int:
 
     # ── 错字规则：种子表 + （可选）单篇检测结果 ──
     typo_rules: list[dict] = []
-    if args.typos or args.typos_json:
-        from correct_typos import build_rules, load_global
-        seed = load_global(Path(args.typos_seed) if args.typos_seed else None)
-        det = None
-        if args.typos_json:
-            det = json.loads(
-                Path(args.typos_json).read_text(encoding="utf-8")).get("typos")
-        typo_rules = build_rules(seed, det)
-        n_ap = sum(1 for r in typo_rules if r.get("applied"))
-        print(f"[typos] 规则 {len(typo_rules)} 条，其中 {n_ap} 条会执行替换", flush=True)
 
     # ── 合并步单独实验：复用已有要点，跳过分块与抽取 ──
     if args.merge_only:
