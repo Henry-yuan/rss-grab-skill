@@ -229,6 +229,13 @@ USER_TPL = """## 笔记元信息
 
 # ── 长文路径：源太长（净字数 > 15000），一次调用装不下 ──
 # 源文清洗后的字符数下限。低于此值不调 LLM（见 generate_note_body 内的说明）。
+# T2.7: source-file suffixes stripped from the stem. Data-driven so that
+# adding a type is one line and cannot half-apply again.
+# NOTE: this rss-only repo only ever sees '.transcript.md'. The main project
+# keeps a second entry for its other source type -- that literal is exactly
+# what the open-source boundary forbids here, so it is not carried over.
+_SOURCE_SUFFIXES = ('.transcript.md',)
+
 MIN_SOURCE_CHARS = 200
 LONG_DOC_THRESHOLD = 15000
 CHUNK_SIZE = 10000
@@ -653,7 +660,15 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
     """
     from clean_source import load_and_clean
     from validate_v3 import validate
-    stem = src_path.name.replace('.transcript.md', '')
+    # T2.7: strip every known source-file suffix, not just one.
+    # A source whose suffix was not stripped got its report named
+    # '<title>-<id><suffix>.typos.json' (suffix left in the middle).
+    for _sfx in _SOURCE_SUFFIXES:
+        if src_path.name.endswith(_sfx):
+            stem = src_path.name[: -len(_sfx)]
+            break
+    else:
+        stem = src_path.name
     stats: dict = {'stem': stem, 'route': '', 'attempts': 0}
     source, cstat = load_and_clean(src_path)
     stats['source_chars'] = len(source)
