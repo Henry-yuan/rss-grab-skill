@@ -350,10 +350,11 @@ def run_scan(chunks, out_dir: Path, client, effort: str,
             json.dumps(pts, ensure_ascii=False, indent=2), encoding="utf-8")
         with lock:
             done[0] += 1
-            tm = f" 纠错{typo_n}处" if typo_n else ""
+            # 2026-10-05：typo_rules 通路移除时 `typo_n` 的赋值被删、
+            # 这处读取漏删 → run_scan 必 NameError（与主项目同一个事故）。
             print(f"    [{done[0]:2d}/{len(chunks)}] 块{c['index']:2d} "
                   f"({c['start'] or '?'}) {c['chars']:5d}字 -> {len(pts):2d} 要点  "
-                  f"{el:6.1f}s{tm}{'  ' + err if err else ''}", flush=True)
+                  f"{el:6.1f}s{'  ' + err if err else ''}", flush=True)
         return pts
 
     if concurrency <= 1:
@@ -423,9 +424,9 @@ def run_merge(points, out_dir: Path, client, effort: str, tag: str) -> dict:
                    ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "merged" / f"topics-{tag}.json").write_text(
         json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    tm = f"，纠错 {typo_n} 处" if typo_n else ""
+    # 2026-10-05：同上，原 `+ f"，纠错 {typo_n} 处"` 的读取漏删 → run_merge 必 NameError。
     print(f"    合并({effort}) {len(points)} 要点 -> {len(obj.get('topics', []))} 主题 "
-          f"{time.time() - t0:.1f}s{tm}", flush=True)
+          f"{time.time() - t0:.1f}s", flush=True)
     return obj
 
 
