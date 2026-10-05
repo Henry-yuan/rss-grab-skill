@@ -1,3 +1,7 @@
 openai>=1.0
+# frontmatter 序列化（17 字段契约的 dump / 读回校验）+ 单测直接 import yaml，
+# 缺它测试在 collection 阶段就 ImportError。此前靠 CI runner 镜像自带侥幸通过，
+# 新用户按本文件安装后跑测试会挂。
+PyYAML>=6.0
 # ASR 转写（仅 macOS Apple Silicon；其他平台请用 faster-whisper，见 README）
 mlx-whisper>=0.4

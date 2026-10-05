@@ -2,6 +2,7 @@
 """跨 skill 共享：ASR 转写本地媒体文件 + 格式化 transcript md。
 
 复用 mlx-whisper large-v3-turbo 模型（tools/asr-poc/models/）。
+该目录被 .gitignore 排除，clone 后通常不存在 —— 此时自动回退到 HF 仓库名下载。
 
 用法：
   from asr import transcribe_local, format_transcript_md, audio_duration
@@ -26,6 +27,11 @@ from paths import find_project_root
 
 PROJECT_ROOT = find_project_root()
 WHISPER_MODEL_PATH = PROJECT_ROOT / "tools" / "asr-poc" / "models" / "whisper-large-v3-turbo"
+# 本地模型缺失时的兜底：把 HuggingFace 仓库名交给 mlx-whisper，让它自己下载。
+# 依据 mlx_whisper.load_models.load_model 的实现 —— 它先试 `Path(x).exists()`，
+# 为假就直接 `snapshot_download(repo_id=x)`。即 path_or_hf_repo 这个参数
+# **本来就同时接受「本地路径」与「仓库名」**，不是只认本地路径。
+WHISPER_HF_REPO = "mlx-community/whisper-large-v3-turbo"
 MODEL_NAME = "mlx-whisper large-v3-turbo"
 
 
@@ -60,17 +66,22 @@ def transcribe_local(media_path: Path, language: str = "zh") -> dict:
          "language": str, "duration": float, "text": str}
 
     Raises:
-        RuntimeError: 模型不存在 / 转写失败
+        RuntimeError: 转写失败
     """
-    if not WHISPER_MODEL_PATH.exists():
-        raise RuntimeError(
-            f"Whisper 模型不存在: {WHISPER_MODEL_PATH}\n"
-            f"请确认 tools/asr-poc/models/whisper-large-v3-turbo/ 软链接是否就绪")
+    # ⚠️ 2026-10-06：此前本地模型不存在时直接 raise，等于「ASR 对所有 clone 用户
+    # 必然失败」——.gitignore 排除了 tools/，仓库里不可能带得动这个模型目录。
+    # 改为回退到 HF 仓库名，由 mlx-whisper 自动下载（缓存在 ~/.cache/huggingface）。
+    if WHISPER_MODEL_PATH.exists():
+        model_ref = str(WHISPER_MODEL_PATH)
+    else:
+        print(f"  本地模型未找到（{WHISPER_MODEL_PATH}），"
+              f"将从 HuggingFace 自动下载 {WHISPER_HF_REPO}，首次运行较慢…")
+        model_ref = WHISPER_HF_REPO
 
     import mlx_whisper
     result = mlx_whisper.transcribe(
         str(media_path),
-        path_or_hf_repo=str(WHISPER_MODEL_PATH),
+        path_or_hf_repo=model_ref,
         language=language,
         initial_prompt="以下是简体中文的转写。",
     )

@@ -36,9 +36,13 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目
    > 本条曾漏设 `reasoning_effort`，而官方「不设 = Max」，短摘要一直跑在 Max 上；
    > 已加测试 `test_summary_effort.py` 锁住（变异验证过）。
    - 每期完成增量写状态文件"待确认"区
-   - 可配定时任务（launchd/cron）每天自动跑 `--fetch-updates`，命令幂等、重复执行安全；日志 `rss/订阅/.logs/`
+   - 可配定时任务（launchd/cron）每天自动跑 `--fetch-updates`，命令幂等、重复执行安全；日志 `rss/_logs/`
    - 示例（launchd plist 的 ProgramArguments，每天 22:30）：
-     `/usr/bin/python3 <project-root>/scripts/fetch_rss_feed.py --fetch-updates`
+     `/bin/bash <project-root>/scripts/run_fetch_updates.sh`
+     > ⚠️ **不要**在 plist 里直接写 `python3`（2026-10-06 校正：原写 `/usr/bin/python3`，
+     > 那是系统自带 3.9.6、缺依赖，跑必挂）。正确做法是让 plist 调上面那个
+     > `run_fetch_updates.sh`，脚本内部已强制 `PY="/usr/local/bin/python3"`。
+     > **Python 必须是 3.12+**，该约束已写死在脚本里，不需要在 plist 重复配置。
 
 ### 审阅勾选
 
@@ -162,7 +166,7 @@ python3 scripts/generate_note_for_confirmed.py --all --dry-run  # 只列不调 L
 | 项目根 | `<project-root>/` |
 | 订阅表 | `./rss/订阅/subscriptions.json` |
 | 订阅状态文件 | `./rss/订阅/<节目名>.md` |
-| 运行日志（定时任务时） | `./rss/订阅/.logs/` |
+| 运行日志（定时任务时） | `./rss/_logs/`（2026-10-06 校正：原写 `./rss/订阅/.logs/`；实盘 launchd 输出落 `rss/_logs/launchd.out.log` 与 `rss/_logs/fetch-updates-*.log`） |
 | 期数元数据 | `./rss/raw/<sanitized_title>-<guid_hash8>.info.json` |
 | 音频文件（临时原料） | `/tmp/rss-grab-audio/<sanitized_title>-<guid_hash8>.<ext>`（2026-10-05 校正：原写 `./rss/audio/`，音频已改存 `/tmp/`，不进项目；`--cleanup-audio` 转写后可清理） |
 | 转写稿（阶段 2） | `./rss/transcripts/<sanitized_title>-<guid_hash8>.transcript.md` |
