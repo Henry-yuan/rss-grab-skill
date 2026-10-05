@@ -188,6 +188,52 @@ def test_sources_regenerate_script_runnable():
     print("✅ test_sources_regenerate_script_runnable")
 
 
+def test_批量默认不碰生产索引(monkeypatch):
+    """2026-10-05：批量跑默认给子进程加 --no-index，要动生产状态得显式加 --index。
+
+    起因是薄壳的 mark_subscribe_done() 触发条件改成了「只看 --no-index」
+    （显式传 --transcript/--info 时 guid_hash8 为 None，旧条件会漏标记），
+    于是批量跑会真的去改订阅状态文件。批量重生成常用于试参数/换模型，
+    默认就动生产状态太危险。
+    """
+    import subprocess
+    seen = []
+
+    class _R:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        seen.append(list(cmd))
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    bn._run_regenerate(Path("/x/gen.py"), "abc", touch_index=False)
+    assert "--no-index" in seen[-1], f"默认没加保护：{seen[-1]}"
+
+    bn._run_regenerate(Path("/x/gen.py"), "abc", touch_index=True)
+    assert "--no-index" not in seen[-1], f"显式 --index 仍被塞了保护：{seen[-1]}"
+    print("✅ test_批量默认不碰生产索引")
+
+
+def test_子进程脚本真的认得_no_index():
+    """声明了要传 --no-index，脚本就必须真有这个选项，否则 argparse 直接报错断路。"""
+    import subprocess
+    for name, cfg in bn.SOURCES.items():
+        script = Path(cfg["regenerate"])
+        if not script.exists():
+            continue
+        r = subprocess.run([sys.executable, str(script), "--help"],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0
+        assert "--no-index" in r.stdout, (
+            f"源 {name} 的脚本没有 --no-index 选项，批量入口传了会被 argparse 打断"
+        )
+    print("✅ test_子进程脚本真的认得_no_index")
+
+
 if __name__ == "__main__":
     simple = [
         test_extract_id_rss,

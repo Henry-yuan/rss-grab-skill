@@ -75,9 +75,19 @@ def _has_existing_note(source_cfg: dict, id_: str) -> bool:
     return False
 
 
-def _run_regenerate(regenerate_script: Path, id_: str) -> tuple[bool, str]:
-    """跑 regenerate_note.py 单期，返回 (ok, msg)。"""
+def _run_regenerate(regenerate_script: Path, id_: str,
+                     touch_index: bool = False) -> tuple[bool, str]:
+    """跑 generate_note_v3.py 单期，返回 (ok, msg)。
+
+    ⚠️ 2026-10-05：默认给子进程加 `--no-index`。
+    薄壳的 mark_subscribe_done() 触发条件已改为「只看 --no-index」
+    （显式传 --transcript/--info 时 guid_hash8 为 None，旧条件会漏标记），
+    代价是**批量跑会真的去改生产 INDEX 和订阅状态文件**。批量重生成常用于
+    试参数/换模型，默认就动生产状态太危险。改成默认不动、要动显式加 --index。
+    """
     cmd = [sys.executable, str(regenerate_script), id_]
+    if not touch_index:
+        cmd.append("--no-index")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if r.returncode == 0:
@@ -96,6 +106,8 @@ def main():
     ap.add_argument("--force", action="store_true", help="强制重生成（默认跳过已有笔记）")
     ap.add_argument("--max", type=int, default=0,
                     help="本次最多生成 N 篇笔记（默认全部待生成；已有的始终跳过）")
+    ap.add_argument("--index", action="store_true",
+                    help="允许子进程改生产 INDEX / 订阅状态（默认**不**动生产状态）")
     args = ap.parse_args()
 
     source_cfg = SOURCES[args.source]
@@ -149,7 +161,8 @@ def main():
                 time.sleep(wait)
             semaphore.acquire()  # 占一个并发位（熔断后这里等更久）
             id_ = _extract_id(tp, source_cfg)
-            fut = pool.submit(_run_regenerate, source_cfg["regenerate"], id_)
+            fut = pool.submit(_run_regenerate, source_cfg["regenerate"], id_,
+                              args.index)
             # 关键修复：future 完成后必须释放信号量位，否则 20 个位被永久占用，
             # 第 21 篇 semaphore.acquire() 永久阻塞，整个循环卡死（20 篇后停滞的根因）
             fut.add_done_callback(_release_slot)
