@@ -2,12 +2,16 @@
 """生成笔记（Step 2）：读 transcript 全文 + 适配后模板，调 LLM 生成结构化笔记（rss 版）。
 
 用法:
-    python3 scripts/generate_note.py <transcript_path> <template_plan_path> --info-json <info.json> --output <note.md>
+    python3 scripts/generate_note_v2.py <transcript_path> <template_plan_path> --info-json <info.json> --output <note.md>
 
 与同系列笔记生成脚本的差异（本版为 rss 播客适配）：
-  - get_capture_mtime：路径 rss/raw + rss/transcripts，按 guid_hash8 找
-  - register_rss_index：按 guid_hash8 dedup，列 = 日期/标题/作者/时长/期号/笔记
   - format_info_json：适配 rss 的 feed/item/local 三层结构
+
+**索引写入已抽走（V1.1 T2.3）**：get_capture_mtime / sanitize_index_cell /
+format_duration_mm_ss / register_rss_index 现在住在 `_shared/append_index.py`。
+本文件是它们的历史所在——把它们抽出去，才谈得上「把这个 v2 脚本归档」。
+下面的 import 只是 **re-export**：本文件自己的 main() 仍要调
+`register_rss_index`，而任何仍从这里导入的调用方不会因此断掉。
 """
 from __future__ import annotations
 
@@ -24,7 +28,15 @@ from openai import OpenAI
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
 from env import load_env
-from paths import find_project_root
+
+# V1.1 T2.3：索引函数已抽到 _shared/append_index.py，这里只做 re-export ——
+# 本文件 main() 的索引追加仍走这条线，不在 v2 文件里留第二份实现。
+from append_index import (  # noqa: F401  (re-export，理由见模块 docstring)
+    format_duration_mm_ss,
+    get_capture_mtime,
+    register_rss_index,
+    sanitize_index_cell,
+)
 
 
 def read_template_body(template_path: Path) -> str:
@@ -201,103 +213,6 @@ def inject_note_metadata(
         if m:
             return fm_block + note_md[m.end():]
     return fm_block + note_md
-
-
-def get_capture_mtime(guid_hash8: str):
-    """从 rss/raw/<...>-<hash8>.info.json 找抓取 mtime（INDEX 日期用抓取时间）。"""
-    project_root = find_project_root()
-    raw_dir = project_root / "rss" / "raw"
-    if not raw_dir.exists():
-        return None
-    for info_path in raw_dir.glob(f"*-{guid_hash8}.info.json"):
-        return datetime.datetime.fromtimestamp(info_path.stat().st_mtime)
-    return None
-
-
-def sanitize_index_cell(s: str) -> str:
-    """清洗 INDEX.md 表格单元格：| -> /，换行->空格，去控制字符。"""
-    if not s:
-        return ""
-    s = str(s).replace("|", "/")
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"\x1b\[[0-9;]*m", "", s)
-    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
-    return s.strip()
-
-
-def format_duration_mm_ss(seconds):
-    """秒数 -> 'm:ss' 或 'h:mm:ss'。"""
-    if seconds is None or seconds <= 0:
-        return ""
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h > 0:
-        return f"{h}:{m:02d}:{sec:02d}"
-    return f"{m}:{sec:02d}"
-
-
-def register_rss_index(info: dict, note_path: Path, source_name: str = "",
-                       index_path: Path | None = None) -> str:
-    """在 rss/notes/INDEX.md 追加一行（按 guid_hash8 dedup）。
-
-    INDEX.md 格式: | 日期 | 标题 | 作者 | 时长 | 期号 | 源 | 笔记 |
-    返回 "added" / "exists" / "skipped"
-
-    index_path 默认全局 rss/notes/INDEX.md（不随笔记目录变，审查反馈 P5）；
-    测试可传临时路径。
-    """
-    if index_path is None:
-        project_root = find_project_root()
-        index_path = project_root / "rss" / "notes" / "INDEX.md"
-    item = info.get("item", {})
-    feed = info.get("feed", {})
-    guid_hash8 = item.get("guid_hash8", "")
-    if not guid_hash8:
-        print("  WARN: register_index: info 缺 guid_hash8，跳过 INDEX 追加")
-        return "skipped"
-
-    capture_mtime = get_capture_mtime(guid_hash8)
-    if capture_mtime:
-        today = capture_mtime.strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  WARN: get_capture_mtime 没找到 raw，INDEX 时间用 now() 兜底")
-
-    title = sanitize_index_cell(item.get("title", ""))
-    author = sanitize_index_cell(feed.get("author", ""))
-    duration = format_duration_mm_ss(item.get("duration_seconds"))
-    src = sanitize_index_cell(source_name or feed.get("title", ""))
-    # 相对 INDEX.md 的链接（笔记可能在子目录 rss/notes/<源名>/）
-    try:
-        rel = note_path.resolve().relative_to(index_path.parent.resolve())
-        md_link = f"[{note_path.stem}](./{rel.as_posix()})"
-    except ValueError:
-        md_link = f"[{note_path.stem}](./{note_path.name})"
-
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    import fcntl
-    with index_path.open("a+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            f.seek(0)
-            existing = f.read()
-            if f"| {guid_hash8} |" in existing:
-                return "exists"
-            line = f"| {today} | {title} | {author} | {duration} | {guid_hash8} | {src} | {md_link} |\n"
-            if not existing:
-                header = (
-                    "# RSS 播客笔记索引\n\n"
-                    "> 按抓取时间倒序排列。新增笔记时在此追加一行。\n\n"
-                    "| 日期 | 标题 | 作者 | 时长 | 期号 | 源 | 笔记 |\n"
-                    "|---|---|---|---|---|---|---|\n"
-                )
-                f.write(header)
-            f.write(line)
-            f.flush()
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    return "added"
 
 
 def main():

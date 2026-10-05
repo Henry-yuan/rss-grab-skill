@@ -98,8 +98,8 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到 rss/audi
    - 调 `scripts/adapt_template.py`（不硬编码路径），传 rss 的 templates-dir
    - 播客命中「访谈播客」模板
 3. **生成笔记**：
-   - skill 模式（短播客）：`python3 scripts/generate_note.py <transcript> <plan.json> --info-json <info.json> --output <note.md>`
-   - map-reduce 模式（长播客，净字 > 15,000）：`python3 scripts/regenerate_note.py <guid_hash8>`（自动跑 map_reduce_note.py -> final.json -> generate_note --source summary）
+   - skill 模式（短播客）：`python3 scripts/generate_note_v2.py <transcript> <plan.json> --info-json <info.json> --output <note.md>`
+   - map-reduce 模式（长播客，净字 > 15,000）：`python3 scripts/regenerate_note.py <guid_hash8>`（自动跑 map_reduce_note_v2.py -> final.json -> generate_note_v2 --source summary）
    - 自动追加 rss/notes/INDEX.md（按 guid_hash8 dedup）
 4. **重生成**：`python3 scripts/regenerate_note.py <guid_hash8> [--mode auto|skill|map_reduce] [--keep-v1]`
 5. **批量抓取**：`python3 scripts/fetch_rss_pending.py [待抓取URL/RSS.md]`

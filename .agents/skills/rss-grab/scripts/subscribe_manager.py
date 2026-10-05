@@ -317,7 +317,7 @@ def collect_known_guids(state: dict) -> set[str]:
 def _relativize_note_path(state_path: Path, note_path: str) -> str:
     """笔记路径统一转成相对状态文件所在目录的相对路径再落盘。
 
-    调用方（generate_note --output）传的是绝对路径，直接落盘会让状态文件在
+    调用方（generate_note_v2 --output）传的是绝对路径，直接落盘会让状态文件在
     项目迁移后全部变成死链（2026-09-19 迁移实测）。相对路径先按 CWD 锚到
     绝对再转；无法转换（如跨盘）时保留原样。
     """

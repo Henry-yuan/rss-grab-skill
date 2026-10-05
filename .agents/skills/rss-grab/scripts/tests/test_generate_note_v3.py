@@ -26,7 +26,7 @@ sys.path.insert(0, str(SCRIPTS_DIR.parent.parent / "_shared"))
 
 import build_frontmatter as fm          # noqa: E402
 import build_v3                        # noqa: E402
-import generate_note                   # noqa: E402
+import append_index                      # noqa: E402
 import generate_note_v3 as v3          # noqa: E402
 import subscribe_manager as sm         # noqa: E402
 
@@ -189,7 +189,10 @@ def _run_main(monkeypatch, tmp_path, argv, empty: bool = True):
         monkeypatch.delenv(var, raising=False)
 
     indexed: list = []
-    monkeypatch.setattr(generate_note, "register_rss_index",
+    # T2.3 起薄壳从 _shared/append_index 取索引入口（不再是 v2 的 generate_note），
+    # 而那行 import 在 main() 内部、每次调用时才执行 —— 所以探针必须打在
+    # append_index 上，打在 generate_note 上会「改了但没生效」且测试照样绿。
+    monkeypatch.setattr(append_index, "register_rss_index",
                         lambda info, out: indexed.append(out) or "ok")
     marked: list = []
     # raising=False：探针装不上也不该让测试报 AttributeError ——

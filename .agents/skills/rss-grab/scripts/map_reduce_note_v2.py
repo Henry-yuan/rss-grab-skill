@@ -6,7 +6,7 @@
   2. 按 token 切分（每块 ~30K tokens，留 1M context 余量）
   3. MAP 阶段: 并发 4 调 LLM API，每块生成段级 JSON
   4. REDUCE 阶段: 调 LLM API 一次，输出完整笔记 JSON
-  5. final.json 交给 generate_note.py --source summary 拼最终 MD
+  5. final.json 交给 generate_note_v2.py --source summary 拼最终 MD
 
 用法:
   python3 map_reduce_note.py <transcript.md>

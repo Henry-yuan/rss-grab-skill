@@ -5,7 +5,8 @@
 
 1. **信头**：`_shared/build_frontmatter.py` 的 17 字段（AC-C2）
 2. **落盘**：正文 + frontmatter 合成 `rss/notes/<节目名>/<标题>-<hash8>.md`
-3. **索引**：`generate_note.register_index()` 追加到 `rss/notes/INDEX.md`
+3. **索引**：`_shared/append_index.register_rss_index()` 追加到 `rss/notes/INDEX.md`
+   （V1.1 T2.3 从 v2 的 `generate_note.py` 抽到共享模块，v2 侧只留 re-export）
 4. **进度日志**：订阅状态文件里对应期标 `[done]` 移入「已转化」区
    （`state_path` 与完整 guid 都从 info.json 反查，见 `mark_subscribe_done`）
 
@@ -142,7 +143,7 @@ def main() -> int:
 
     import build_v3 as shared
     import build_frontmatter as fm
-    from generate_note import register_rss_index
+    from append_index import register_rss_index
     from openai import OpenAI
 
     # 信头交给共享模块（info_for_prompt 按此白名单取）
