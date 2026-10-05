@@ -35,3 +35,7 @@ HANDOFF.md
 # 落在 git 跟踪的 scripts/ 目录下，一旦 push 就把生产数据带出去了。
 # 与 `_shared/` 的契约、错误信息、目录结构都无关，是纯粹的运行产物。
 **/scripts/typos/
+
+# 长文路径的中间产物（.clean.md / points/ / topics/）——每次重跑都重写，
+# 单次即 MB 级，且可由源文 + 管线完全重建
+**/scripts/scan_work/
