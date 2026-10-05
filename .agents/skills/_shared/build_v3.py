@@ -705,6 +705,16 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
         stats['n_points'] = long_info['n_points']
         stats['n_chunks'] = long_info['n_chunks']
         stats['n_topics'] = len(long_info['topics'])
+        # 2026-10-05 补：长文的纠错在 run_long_path 内部完成，其报告原先**只返回
+        # 给调用方打印，从未回填 stats**。而 stats['typo_applied'] 只有短文分支
+        # 会赋值 → 于是**所有长文笔记的统计行一律显示「纠错=0 处」**，哪怕实际
+        # 落成了 160 处。不影响产物质量（clean 文本确实被 ② 消费了），
+        # 但会让任何拿这个字段做验收的判断得出错误结论。
+        tr = long_info.get('typo_report') or {}
+        stats['typo_applied'] = tr.get('applied_count', 0)
+        stats['typo_success_rate'] = tr.get('success_rate', 0.0)
+        stats['typo_judgments'] = tr.get('judgments', 0)
+        stats['typo_coverage'] = tr.get('coverage', 0.0)
     last_err = None
     retry_hint = ""          # 首轮为空；校验不过后带上真原因回灌
     for attempt in range(1, MAX_RETRY + 2):
