@@ -335,8 +335,22 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     """返回 {ok, body, report, retries_needed}。
 
     ok=False 表示内容级失败，编排层应带错误信息重试。
+    `retries_needed` 是**失败原因的完整清单**（多条 = 同时踩了多条），
+    编排层应把它回灌给模型；ok=True 时恒为空列表。
     """
     rep, ok = {}, True
+    # 所有「内容级失败」的原因统一收口到这里。
+    # 此前每处 ok=False 各自把原因写进 report 的某个子键，而 retries_needed
+    # 只读 C3_sections.error —— 于是 summary 为空这类失败取到的是 'unknown'，
+    # 编排层拿不到真原因，只能原参数盲重试。fail() 是**唯一**的置假入口：
+    # 新增阻断检查时必须走 fail()，否则原因会再次从 retries_needed 丢失。
+    reasons: list[str] = []
+
+    def fail(reason: str) -> None:
+        nonlocal ok
+        ok = False
+        reasons.append(reason)
+
     body2, has_tldr, has_quote, has_body = normalize_sections(body)
     rep["C3_sections"] = {"tldr": has_tldr, "quote": has_quote, "body": has_body}
 
@@ -356,11 +370,27 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     # C3 硬章节
     if not (has_tldr and has_quote):
         rep["C3_sections"]["error"] = "缺少 TL;DR 或 关键引用"
-        ok = False
-    # C4 判定重试：内容级缺失
-    if not re.search(r"##\s*TL;DR[\s\S]*?(##\s*关键引用|$)", body2):
-        rep["C3_sections"]["error"] = "两章节顺序或结构异常"
-        ok = False
+        fail(rep["C3_sections"]["error"])
+    # C4 判定重试：章节顺序
+    #
+    # ⚠️ 2026-10-05 重写。此前是
+    #   `re.search(r"##\s*TL;DR[\s\S]*?(##\s*关键引用|$)", body2)`
+    # **永远绿**：正则里的 `$` 没有 re.MULTILINE，匹配的是字符串末尾；只要
+    # `## TL;DR` 存在，`[\s\S]*?` 一定能一路走到串尾 → 必然匹配成功。
+    # 于是这条「检查顺序」的校验**只在 TL;DR 整个缺失时才报**（而那种情况已被
+    # 上一条抓到），真正的顺序颠倒（`关键引用` 跑到 `要点总结` 前面）一条都抓不到。
+    # 这与 2026-10-04 守门测试「扫描根错一层、上线起就在漏扫」是同一类毛病：
+    # **看起来在检查，实际不检查**。
+    #
+    # 现在改成：取实际 H2 序列，与期望顺序逐位比对。
+    order_seen = [h.strip() for h in re.findall(r"^##\s+(.+?)\s*$", body2, re.M)]
+    order_want = ["TL;DR", "要点总结", "关键引用"]
+    pos = [order_seen.index(s) for s in order_want if s in order_seen]
+    if pos != sorted(pos):
+        got = " → ".join(s for s in order_seen if s in order_want)
+        rep["C3_sections"]["error"] = f"章节顺序异常：{got}"
+        fail(rep["C3_sections"]["error"])
+    rep["C3_sections"]["order"] = " → ".join(s for s in order_seen if s in order_want)
 
     body_d, dupfix = dedup_tldr_topics(body2)
     rep["C4_tldr_dedup"] = {"removed": dupfix}
@@ -405,8 +435,8 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     dup = bool(s) and tldr_head and PUNCT.sub("", normalize(s))[:60] == tldr_head
     rep["C11_summary"] = {"len": len(s), "truncated": truncated, "dup_with_tldr": dup}
     if not s:
-        ok = False
         rep["C11_summary"]["error"] = "summary 为空"
+        fail(rep["C11_summary"]["error"])
 
     # C13 压缩比（观测）
     ratio = len(body) / max(1, len(source))
@@ -429,5 +459,9 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     rep["C15_block_kinds"] = {"kinds": sorted(block_kinds(body))}
 
     rep["h3_count"] = len(H3.findall(body))
+    if not ok and not reasons:
+        # 兜底：ok=False 却一条原因都没有，只可能是有人绕过 fail() 直接置假。
+        # 宁可回 'unknown' 也不能给编排层一个空列表（空列表会被当成「无需重试」）。
+        reasons.append("unknown")
     return {"ok": ok, "body": body, "report": rep,
-            "retries_needed": [] if ok else [rep.get("C3_sections", {}).get("error", "unknown")]}
+            "retries_needed": reasons}

@@ -489,26 +489,54 @@ def parse_output(raw: str) -> tuple[str, dict]:
         return body.strip(), json.loads(tail[s: e + 1])
 
 
-def call_llm(client, source: str, info: dict, heartbeat: bool = True) -> str:
-    """调 LLM，带心跳线程（长稿可能跑 5 分钟+）。"""
-    return _call_with_template(client, USER_TPL, source, info, heartbeat)
+# ── 校验失败回灌 ──────────────────────────────────────
+# 此前重试是**同参数盲重试**：retries_needed 只进了 print 字符串，从未回灌模型，
+# 于是连着 3 次用同样参数、同样失败（validate() 的 docstring 却承诺
+# 「编排层应带错误信息重试」）。
+# 刻意克制：只把失败原因拼成一句附加指令附在 user 消息末尾，
+# 不重发提示词、不复述规则 —— 提示词本身已是几万字符，再加只会稀释约束。
+RETRY_HINT_HEAD = '【上一次输出未通过校验，请修正后重出】'
+
+
+def build_retry_hint(reasons) -> str:
+    """把 validate() 的 retries_needed 压成一句附加指令；无原因则返回空串。
+
+    返回空串是**正常路径**（首次生成），调用方不必特判。
+    """
+    rs = [str(r).strip() for r in (reasons or []) if str(r).strip()]
+    if not rs:
+        return ''
+    return RETRY_HINT_HEAD + '：' + '；'.join(rs) + '。'
+
+
+def call_llm(client, source: str, info: dict, heartbeat: bool = True,
+             retry_hint: str = "") -> str:
+    """调 LLM，带心跳线程（长稿可能跑 5 分钟+）。
+
+    retry_hint：校验失败原因（可选），非空时附在 user 消息末尾回灌给模型。
+    """
+    return _call_with_template(client, USER_TPL, source, info, heartbeat,
+                               retry_hint=retry_hint)
 
 
 def call_llm_topics(client, topics_text: str, info: dict,
-                    n_topics: int = 0, heartbeat: bool = True) -> str:
+                    n_topics: int = 0, heartbeat: bool = True,
+                    retry_hint: str = "") -> str:
     """长文路径 ④：只喂主题清单，用排版员提示词。
 
     实测加原文会让保真率从 68.7% 掉到 57.7%（76K 上下文稀释大纲的约束力），
     因此**不传 src**。
+
+    retry_hint：同上，两条路径一致。
     """
     return _call_with_template(client, USER_TPL_TOPICS, topics_text, info,
                                heartbeat, sys_p=SYSTEM_PROMPT_TOPICS,
-                               n_topics=n_topics)
+                               n_topics=n_topics, retry_hint=retry_hint)
 
 
 def _call_with_template(client, tpl: str, payload: str, info: dict,
                         heartbeat: bool, sys_p: str | None = None,
-                        n_topics: int = 0) -> str:
+                        n_topics: int = 0, retry_hint: str = "") -> str:
     user = tpl.format(
         info=info_for_prompt(info),
         desc=(info.get("description") or "(无)").strip() or "(无)",
@@ -516,6 +544,8 @@ def _call_with_template(client, tpl: str, payload: str, info: dict,
         topics=payload,
         n=n_topics,
     )
+    if retry_hint:
+        user = user.rstrip() + "\n\n" + retry_hint
     stop = threading.Event()
 
     def _beat():
@@ -676,19 +706,23 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
         stats['n_chunks'] = long_info['n_chunks']
         stats['n_topics'] = len(long_info['topics'])
     last_err = None
+    retry_hint = ""          # 首轮为空；校验不过后带上真原因回灌
     for attempt in range(1, MAX_RETRY + 2):
         stats['attempts'] = attempt
         try:
             if is_long:
-                raw = call_llm_topics(client, topics_block(long_info['topics']), info, n_topics=len(long_info['topics']))
+                raw = call_llm_topics(client, topics_block(long_info['topics']), info, n_topics=len(long_info['topics']), retry_hint=retry_hint)
                 body, llm = parse_output(raw)
                 v = validate(body, long_info['clean_text'], info, llm)
             else:
-                raw = call_llm(client, source, info)
+                raw = call_llm(client, source, info, retry_hint=retry_hint)
                 body, llm = parse_output(raw)
                 v = validate(body, source, info, llm)
             if not v['ok']:
                 last_err = f'校验未过: {v['retries_needed']}'
+                # 关键：把真原因带上，否则下一轮还是同参数盲赌
+                retry_hint = build_retry_hint(v['retries_needed'])
+                stats['last_retry_hint'] = retry_hint
                 print(f'    ⚠️ 第 {attempt} 次校验未过: {last_err}', flush=True)
                 continue
             # LLM 产出的 tags / summary 在 llm 里，不在校验报告里 ——
