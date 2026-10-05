@@ -13,7 +13,7 @@
 各源约定：
   rss:  transcripts rss/transcripts/<title>-<hash8>.transcript.md
         笔记        rss/notes/（按源分目录 rss/notes/<源名>/）
-        regenerate  rss-grab/scripts/regenerate_note.py <hash8>
+        regenerate  rss-grab/scripts/generate_note_v3.py <hash8>
 """
 from __future__ import annotations
 

@@ -22,7 +22,7 @@ flowchart TB
     C --> D{你审阅勾选<br/>状态文件三区}
     D -->|确认抓取| E[下载音频<br/>yt-dlp]
     E --> F[本地 ASR 转写<br/>mlx-whisper]
-    F --> G[生成结构化中文笔记<br/>skill / map-reduce]
+    F --> G[生成结构化中文笔记<br/>v3 四步管线]
     G --> H[rss/notes/ 沉淀]
 ```
 
@@ -41,16 +41,16 @@ flowchart TB
 - **本地抓取 + 本地转写**：抓取与 ASR 转写（mlx-whisper，Apple Silicon 本地推理）都在你机器上完成；原始音频不离开设备，转写文本仅在与 LLM API 交互时上传（见「LLM 配置」）
 - **三区状态机**：每源一份 Markdown 状态文件（待确认 / 确认 / 已转化），跟你用邮箱一样自然
 - **Apple Podcasts 反推**：粘一个 Apple 链接，自动反推 RSS feed URL 订阅
-- **长度自适应**：短播客用 skill 模式（快），长播客自动切 map-reduce（细）
-- **笔记模板可自定义**：笔记结构由 `templates/` 下的 Markdown 模板驱动（带 `style` / `description` / `required_sections` frontmatter），新增或改一个模板文件即可定制输出结构，不用改代码；生成前 LLM 会按内容自动挑选最匹配的模板（当前内置「访谈播客」中文模板）
+- **长度自适应**：长短播客统一走 v3 四步管线，净字 15,000 只决定「一次调用」还是「分块扫描」——用户无感，入口只有一个
+- **笔记结构可自定义**：v3 的输出结构由 `_shared/build_v3.py` 顶部的 prompt 模板驱动（`USER_TPL` / `USER_TPL_TOPICS`），改模板字符串即可调整产出风格，不用改管线逻辑
 
-**为什么支持 map-reduce**：长播客（转写稿 >50K 字符，约 2 小时以上）单次塞给 LLM 生成笔记会超出模型 context、或质量下降。rss-grab 自动做 **map-reduce 分治**：先把转写稿按 token 切成多块、并发各跑一次 LLM 生成段级摘要（MAP），再把段级摘要合并成一次调用输出完整笔记（REDUCE）。好处：
+**为什么长短文分两条路**：超长播客（转写稿净字 > 15,000，约 2 小时以上）单次塞给 LLM 会超出 context 或质量下降。v3 自动走四步：①.5 错字纠错（LLM 出映射表、程序确定性替换）→ ② 按块扫描提要点 → ③ 合并去重 → ④ 撰写 → 程序化校验。好处：
 - **无长度上限**：多长的音频都能转成完整笔记（>2h 的访谈、特辑都行）
 - **更省 token**：每块只精读一次，摘要精简后再汇总，比一次塞全文便宜
 - **质量更高**：每块单独精读不丢上下文，长播客的笔记完整度反而更好
 - **断点恢复**：分段处理，单块失败可重试，不用全量重来
 
-触发是自动的：`decide_mode` 按字符数判断（<50K skill / ≥50K map-reduce），用户无感。实测多数播客（35-60 分钟，20-40K 字符）走 skill 模式。
+触发是自动的：`decide_mode.py` 按**净字数**判断（净字 = 剥 `**[mm:ss]**` 时间戳后去所有空白，阈值 15,000，实现在 `_shared/long_doc.py`），用户无感。实测多数播客（35-60 分钟）走单次调用。
 
 **实测（2026-08，MacBook Pro M1 16GB）**：
 - 本地转写模型跑得动——**2 篇共约 2.5 小时音频，转写约 10 分钟**（mlx-whisper large-v3-turbo，Apple Silicon 加速）
@@ -69,7 +69,7 @@ flowchart TB
 | AI 摘要 | 每期根据简介调用LLM生成"一句话概括"，用户无需打开音频即可判断是否值得听 |
 | 批量下载 | 利用 yt-dlp 下载音频（串行 + CDN 礼仪间隔） |
 | ASR 转写 | mlx-whisper large-v3-turbo（仅 Apple Silicon），带**时长完整性校验** |
-| 笔记生成 | 模板自适应 + 长度档位（<50K skill 模式 / ≥50K map-reduce），20 并发批量 |
+| 笔记生成 | v3 四步管线（错字纠错 → 分块扫描 → 合并去重 → 撰写 → 校验），长短文同一入口，批量 20 并发 |
 | Apple Podcasts 反向解析 | 网页链接 → RSS feed URL 自动提取 |
 | LLM 兼容 | OpenAI 兼容接口，不绑定任何特定服务，可配任意兼容服务 |
 
@@ -81,7 +81,8 @@ flowchart TB
 - **发射间隔**：每请求间隔 ≥2s（摘要 ≥5s），避免瞬时请求风暴
 - **429 熔断降级**：遇到限流自动降并发（摘要 20→15；笔记 20→15→10），并指数退避重试
 - **断点续跑**：中断后重跑自动跳过已处理项（checkpoint 落盘），不会重复消耗 token
-- **map-reduce 分片并发 4**：长播客 MAP 阶段分块并行精读
+- **v3 分块扫描并发**：长播客②步分块并行精读（单块失败自动沿用原文并告警，不静默丢内容）
+- **阶段 3 自动化默认 5 并发**（`NOTE_MAX_PARALLEL` 可调）：`generate_note_for_confirmed.py` 只处理「确认抓取」区的 `[x]`，待确认 `[ ]` / 确认不抓 `[~]` / 已转化 `[done]` 一律跳过——不为用户没审过的内容烧 token
 
 ## 跟同类项目对比
 
@@ -91,7 +92,7 @@ flowchart TB
 | **本地 ASR** | ✅ mlx-whisper | ❌ 云端 | ❌ | ❌ | ✅ Whisper |
 | **增量订阅模式** | ✅ 三区状态机 | ✅ 自动 | ✅ | ❌ 静态 | ❌ |
 | **Apple Podcasts 反推** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **中文模板自适应** | ✅ | ⚠️ 英文优先 | ⚠️ 通用 | ⚠️ 通用 | ⚠️ 通用 |
+| **中文结构化笔记** | ✅ | ⚠️ 英文优先 | ⚠️ 通用 | ⚠️ 通用 | ⚠️ 通用 |
 | **离线运行** | ⚠️ 转写离线/摘要需联网 | ❌ | ⚠️ | ❌ | ✅ |
 | **跨平台** | ❌ macOS only | ✅ Web/App | ✅ Docker | ✅ Actions | ✅ Tauri |
 | **开源协议** | ✅ MIT | ❌ | ✅ | ✅ | ✅ MIT |
@@ -137,7 +138,7 @@ flowchart TB
  拉取新期数，把待确认区里感兴趣的几期转写并生成笔记"
 ```
 
-Agent 会读取 `.agents/skills/rss-grab/SKILL.md` 的指令，自动完成：订阅反推 → 拉增量 → AI 摘要 → 三区状态文件 → 勾选抓取 → ASR 转写 → 模板笔记。**无需记住任何命令**——skill 会把每一步要执行什么、产物落在哪都告诉你。
+Agent 会读取 `.agents/skills/rss-grab/SKILL.md` 的指令，自动完成：订阅反推 → 拉增量 → AI 摘要 → 三区状态文件 → 勾选抓取 → ASR 转写 → v3 笔记。**无需记住任何命令**——skill 会把每一步要执行什么、产物落在哪都告诉你。
 
 > 💡 把 `.agents/skills/` 当作"技能库"：除了 `rss-grab` 主 skill，共享模块 `_shared/`（ASR、env 加载、路径定位、批量笔记）会被 skill 自动引用，一并放入即可。
 
@@ -178,9 +179,15 @@ python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py --fetch-updates
 
 # 3. 审阅：打开 rss/订阅/<节目名>.md，把想听的勾为 [x]（确认抓取）
 
-# 4. 批量下载 + 转写 + 笔记
+# 4. 批量下载 + 转写
 python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py --pick-subscribe rss/订阅/<节目名>.md
 python3 .agents/skills/rss-grab/scripts/batch_transcribe.py
+
+# 5. 为「确认抓取」区 [x] 的期数生成笔记（只处理已勾选的，不烧无谓 token）
+python3 .agents/skills/rss-grab/scripts/generate_note_for_confirmed.py --all --dry-run  # 先看清单
+python3 .agents/skills/rss-grab/scripts/generate_note_for_confirmed.py --all            # 再实跑
+
+# 或全量批量（扫所有转写稿）
 python3 .agents/skills/rss-grab/scripts/batch_notes.py
 ```
 
@@ -208,9 +215,9 @@ python3 .agents/skills/rss-grab/scripts/batch_notes.py
 .agents/skills/
 ├── rss-grab/                  # 主 skill（SKILL.md = 给 Agent 的指令文档）
 │   ├── scripts/               # 流水线脚本（CLI 可直接调用）
-│   ├── templates/             # 笔记模板（当前含「访谈播客」中文模板）
+│   ├── templates/             # v2 遗留的 Markdown 笔记模板（v3 生产路径不读此目录）
 │   └── SKILL.md               # Agent 指令：触发条件 + 阶段 1-4 工作流 + 路径约定
-└── _shared/                   # 共享模块（ASR 转写、.env 加载、路径定位、批量笔记）
+└── _shared/                   # 共享模块（ASR 转写、.env 加载、路径定位、批量笔记、v3 管线本体）
 
 rss/                           # 运行数据（安装后由脚本生成，不入 git）
 ├── 订阅/                    # 订阅表 + 每源状态文件（待确认/确认/已转化 三区）
@@ -227,6 +234,8 @@ rss/                           # 运行数据（安装后由脚本生成，不�
 python3 -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/tests/ -v
 ```
 
+其中 `test_open_source_guard.py` 是**开源边界守门测试**：扫描全仓库，禁止出现非本项目的平台特征（其他采集源、专有字段名、主项目路径等）。它拦的是「git 历史不可逆」的那类事故——文件删了也留在历史里，只能前置拦截。改本仓库任何文件后都应跑一遍。
+
 ## 免责声明
 
 本项目仅供个人学习与内容管理使用。抓取内容（RSS feed、音频）版权归原作者/平台所有；请遵守各平台服务条款与内容许可，勿将本工具用于任何商业或侵权用途。RSS 是公开标准，但请尊重播客作者的下载礼仪（脚本已内置请求间隔）。
@@ -237,7 +246,7 @@ python3 -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/
 - [ ] **桌面 GUI**：基于 Tauri 包装 CLI，降低非技术用户门槛
 - [ ] **更多 LLM 适配**：OpenAI / DeepSeek / Gemini / 本地 Ollama 一键切换（当前需手动配 base_url）
 - [ ] **知识库联动**：Obsidian / Notion / Logseq 笔记自动同步
-- [ ] **英文播客模板**：当前仅「访谈播客」中文模板，补英文场景 2-3 个
+- [ ] **英文播客 prompt 模板**：v3 输出结构目前偏中文访谈场景，补英文场景 2-3 套 `USER_TPL` 变体
 - [ ] **GitHub Actions CI**：单测自动跑，发布 release tag
 
 ## Acknowledgments
