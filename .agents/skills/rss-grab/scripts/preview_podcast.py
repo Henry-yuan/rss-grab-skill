@@ -105,6 +105,16 @@ def summarize_one(client, model, item: dict, label: str,
                 # 参数名必须是 max_completion_tokens（AC-C4）：推理模型的 thinking
                 # token 计入此预算，旧的 max_tokens 语义不同。
                 max_completion_tokens=SUMMARY_MAX_COMPLETION,
+                # ⚠️ 2026-10-05 补：此前**完全没设** reasoning_effort —— 而官方
+                # 「不设 = Max」。V1.0 spec 的验收判据第 3 条明确要求
+                # 「三源在用管线的每个 chat.completions.create 调用点都带
+                #  reasoning_effort + max_completion_tokens + timeout」，
+                # 本文件当时漏改（旁边那条注释恰好在讲 thinking token 计入
+                # 预算，两个参数本是配套的）。
+                # 取 high 而非 max：摘要只需读一遍简介写两句话；
+                # 16000 预算在 Max 下实测 65/65 通过（2026-10-05），high 更宽松。
+                # 环境变量可覆盖，命名沿用 LLM_ 前缀与本仓其他设置一致。
+                reasoning_effort=os.environ.get("LLM_EFFORT", "high"),
             )
             content = resp.choices[0].message.content
             summary = strip_thinking_blocks(content)

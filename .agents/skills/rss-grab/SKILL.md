@@ -26,6 +26,15 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目
    - 遍历 `rss/订阅/subscriptions.json` 所有源
    - 对比状态文件已有 guid，只拉新增期
    - 新增期跑 AI 摘要（OpenAI 兼容 LLM，单期纯文本，20 并发 + 2s 间隔 + 429 熔断降级 + checkpoint 恢复）
+   > **摘要的 LLM 参数**（2026-10-05 补，勿删 `reasoning_effort`）：
+   > `model` 来自 `LLM_MODEL`；`reasoning_effort` 默认 **high**（`LLM_EFFORT` 可覆盖）；
+   > `max_completion_tokens` **16000**（`LLM_SUMMARY_MAX_COMPLETION`）；
+   > `timeout` 600s 挂在 OpenAI client 上。
+   > ⚠️ `max_completion_tokens` **不与笔记统一**：笔记走 v3 的 `100000`，
+   > 摘要保持 16000（V1.0 spec 明确「值保留、只改参数名」）—— 输出就一两句，
+   > 给 100000 是浪费。**改任一个都要看另一条判据，别顺手统一。**
+   > 本条曾漏设 `reasoning_effort`，而官方「不设 = Max」，短摘要一直跑在 Max 上；
+   > 已加测试 `test_summary_effort.py` 锁住（变异验证过）。
    - 每期完成增量写状态文件"待确认"区
    - 可配定时任务（launchd/cron）每天自动跑 `--fetch-updates`，命令幂等、重复执行安全；日志 `rss/订阅/.logs/`
    - 示例（launchd plist 的 ProgramArguments，每天 22:30）：
