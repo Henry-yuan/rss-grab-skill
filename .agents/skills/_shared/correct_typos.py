@@ -137,10 +137,13 @@ DETECT_USER = """以下是待校对的转写内容（每段前面有 L编号）�
 # （2026-10-03 实测：让模型复述原文上下文当定位，21 条里 16 条匹配失败，
 #   因为它会把 `**[16:57]** ghosty,` 读通成「你之前好像还提到了一个词ghosty」，
 #   原文里根本没有这种连续文本）。
-SEG_HEAD = re.compile(r"^\*\*\[\d{1,2}:\d{2}\]\*\*|^#{1,3}\s")
+# ⚠️ 分钟数必须支持 3 位（2026-10-05 修）：\d{1,2} 匹配不上 **[144:23]** / **[325:41]** 这类超长视频的时间戳 → has_ts 判定失败 → split_segments 退化按空行切，段结构与模型预期完全错位，模型把**时间戳数字当成段号**报回来，实测 5 篇超长文因此静默丢弃 76 条能修的纠错。
+# 与 `_shared/long_doc.py` 的 `_TS_STRIP` 同一处修法（那边当晚已改，
+# 本文件漏改——两处曾经不一致，教训：同类问题要 grep 全项目，不只改你正在看的那处）。
+SEG_HEAD = re.compile(r"^\*\*\[\d{1,3}:\d{2}\]\*\*|^#{1,3}\s")
 # 段首标记（比 SEG_HEAD 多吃掉标记本身和它后面的空白）
-SEG_LEAD = re.compile(r"^\s*(?:\*\*\[\d{1,2}:\d{2}\]\*\*|\#{1,3}\s+)[ \t]*")
-TS_MARK = re.compile(r"^\*\*\[\d{1,2}:\d{2}\]\*\*", re.M)
+SEG_LEAD = re.compile(r"^\s*(?:\*\*\[\d{1,3}:\d{2}\]\*\*|\#{1,3}\s+)[ \t]*")
+TS_MARK = re.compile(r"^\*\*\[\d{1,3}:\d{2}\]\*\*", re.M)
 
 
 def split_segments(text: str) -> list[str]:
@@ -171,7 +174,7 @@ def _norm_seg(s: str) -> str:
     归一化是必要的——模型给的 `original` 常带多一个字
     （实测有把「进步」报成「进步的」的情况），精确匹配会漏。
     """
-    s = re.sub(r"^\s*\*\*\[\d{1,2}:\d{2}\]\*\*\s*", "", s)
+    s = re.sub(r"^\s*\*\*\[\d{1,3}:\d{2}\]\*\*\s*", "", s)
     s = re.sub(r"^\s*#{1,3}\s+", "", s)
     return re.sub(r"[^\w\u4e00-\u9fff]", "",
                   unicodedata.normalize("NFKC", s).lower())
@@ -401,12 +404,17 @@ def apply_judgments(text: str, judgments: list[dict]) -> tuple[str, dict]:
             stat["span_nl"] += 1
             continue
         # 区间与已接受的那条重叠 → 放弃这一处。
-        # 模型偶尔对**同一处报两遍完全相同的判断**（实测 NotebookLM 636941a1：
-        # `Zedcool→ZCOOL` 与 `Andrew Kaparty→Andrej Karpathy` 各重复一次）。
-        # 倒序叠加时每条都用「按原文算的」a0/a1，而前一条已经把文本改短了，
-        # 第二条的 out[a1:] 就从偏后的位置切 → 多切掉几个字符。
-        # 实测刚好切掉一个换行：行数 2707 -> 2706，assert 失败 → 整篇长文作废。
-        # 单条重复查不出来（单独应用每条都不改行数），只有成对叠加才暴露。
+        #
+        # ⚠️ 这个拒因**混装两种不同故障**，不要当成一种来排查（2026-10-05 修正注释）：
+        # ① 模型对同一处报了两遍相同判断（实测 `Zedcool→ZCOOL`、
+        #    `Andrew Kaparty→Andrej Karpathy`）。倒序叠加时每条都用「按原文算的」
+        #    a0/a1，而前一条已把文本改短，第二条的 out[a1:] 就从偏后的位置切 →
+        #    多切掉字符。**实测刚好切掉一个换行**（2707→2706），assert 失败 →
+        #    整篇长文作废。单条查不出来，只有成对叠加才暴露。
+        # ② **同一个词在文中出现多次**（实测 `QGPT` 在 seg 1236 与 1250 各出现一次，
+        #    相隔 14 段）。邻段搜索把两条判断解析到了同一段同一位置 →
+        #    区间重叠 → 第二条被拒。**这是「宁可不动」的正常代价，不是 bug**，
+        #    但排查时若只按「模型重复报同一处」去找，会找不到原因。
         if any(a0 < k1 and k0 < a1 for k0, k1, *_ in plan):
             rejected.append({**it, "why": "overlaps_earlier"})
             stat["overlap"] += 1
@@ -484,6 +492,49 @@ def load_global(path: Path | None = None) -> list[dict]:
     return json.loads(p.read_text(encoding="utf-8")).get("items", [])
 
 
+def _window_segments(segs: list[str], max_chars: int) -> list[list[tuple[int, str]]]:
+    """把段序列切成若干窗，每窗字符数 ≤ max_chars，**段边界对齐**（不切半段）。
+
+    每项是 `(全局段号, 段文本)`。段号用**全局**编号而不是窗内重编，
+    这样各窗返回的 judgments 合并后无需再修正偏移，`apply_judgments`
+    直接按全局段号定位即可 —— 这是分窗能安全合并的前提。
+    """
+    windows: list[list[tuple[int, str]]] = []
+    cur: list[tuple[int, str]] = []
+    cur_len = 0
+    for i, s in enumerate(segs, 1):
+        # 单段本身就超限（极少见）时也照样成窗，不切半段：
+        # 切半段会让 ASR 时间戳标记被拦腰截断，破坏 assert_structure_preserved
+        if cur and cur_len + len(s) > max_chars:
+            windows.append(cur)
+            cur, cur_len = [], 0
+        cur.append((i, s))
+        cur_len += len(s)
+    if cur:
+        windows.append(cur)
+    return windows
+
+
+def _detect_window(client, effort: str, retries: int,
+                   numbered: str) -> list[dict]:
+    """对**一窗**跑 LLM 逐处判断，含降档重试。返回该窗的 judgments（可能为空）。"""
+    user = DETECT_USER.format(numbered=numbered)
+    order = [effort] + [e for e in EFFORT_FALLBACK if e != effort][:retries]
+    last = None
+    for eff in order:
+        try:
+            raw = _call(client, DETECT_SYS, user, eff)
+            items = _parse_json(raw).get("judgments", [])
+        except Exception as e:  # noqa: BLE001
+            last = f"{type(e).__name__}: {str(e)[:120]}"
+            print(f"    ↻ 检测失败（{eff}）：{last}", flush=True)
+            continue
+        # 0 条判断是**正常结果**——这段本来就没错字。
+        # 曾把它当失败，白白降档重试 3 次（短文批量时尤其明显）。
+        return items
+    raise RuntimeError(f"专名检测失败，已降档重试 {len(order)} 次：{last}")
+
+
 def detect_typos(text: str, client, effort: str = "high",
                  max_chars: int = 120000, retries: int = 2,
                  seed: list[dict] | None = None) -> list[dict]:
@@ -497,204 +548,50 @@ def detect_typos(text: str, client, effort: str = "high",
     `seed` 保留参数只为兼容旧调用；新提示词里声学规律是写死的
     `ACOUSTIC_HINTS`，不再从种子表渲染——那张表已从「执行指令」
     降级为「提示」，且删到只剩高频项。
+
+    ⚠️ 2026-10-05 改为**分窗覆盖全文**。此前是 `split_segments(text[:max_chars])`
+    —— 超出 max_chars 的尾部**直接丢掉，且不报错**：实测 5 小时播客
+    （285,809 字符 / 12,150 段）只有前 120,000 字符进过纠错，**58% 的内容
+    从未被检查**，而报告里的 `segments` 仍按全文写 12,150，看上去像全篇都跑过。
+    现在按段边界切窗逐窗检测、合并结果，段号为全局编号故无需重映射。
     """
-    segs = split_segments(text[:max_chars])
-    numbered = "\n".join(f"L{i}: {s.strip()}" for i, s in enumerate(segs, 1))
-    user = DETECT_USER.format(numbered=numbered)
-    order = [effort] + [e for e in EFFORT_FALLBACK if e != effort][:retries]
-    last = None
-    for i, eff in enumerate(order):
+    if not client:
+        return []
+    segs = split_segments(text)
+    windows = _window_segments(segs, max_chars)
+    if len(windows) > 1:
+        print(f"    源文 {len(text):,} 字符 / {len(segs):,} 段 → 分 {len(windows)} 窗纠错"
+              f"（单窗上限 {max_chars:,}）", flush=True)
+
+    all_items: list[dict] = []
+    for wi, win in enumerate(windows, 1):
+        numbered = "\n".join(f"L{i}: {s.strip()}" for i, s in win)
         try:
-            raw = _call(client, DETECT_SYS, user, eff)
-            items = _parse_json(raw).get("judgments", [])
+            items = _detect_window(client, effort, retries, numbered)
         except Exception as e:  # noqa: BLE001
-            last = f"{type(e).__name__}: {str(e)[:120]}"
-            print(f"    ↻ 检测失败（{eff}）：{last}", flush=True)
+            # 单窗失败**不丢弃已得结果**，也不让整篇纠错崩掉：
+            # 调用方本就对纠错失败不阻断，退化成「这窗沿用原文」。
+            print(f"    ⚠️ 第 {wi}/{len(windows)} 窗检测失败，该窗沿用原文："
+                  f"{type(e).__name__}: {str(e)[:110]}", flush=True)
             continue
-        if not items:
-            # 0 条判断是**正常结果**——这篇本来就没错字。
-            # 曾把它当失败，白白降档重试 3 次（短文批量时尤其明显）。
-            return []
-        return items
-    raise RuntimeError(f"专名检测失败，已降档重试 {len(order)} 次：{last}")
+        all_items.extend(items)
+    return all_items
 
 
-def _seed_block(seed: list[dict], source_text: str) -> str:
-    """把种子词表渲染成给 LLM 的参考块。
-
-    关键：每条都标注它在**当前这篇**里到底出现没有。
-    种子表是历史积累的，`original` 拼法常常对不上具体某篇的实际形态
-    （真实踩坑：表里写 Anthropical，源里其实是 Athropical），
-    标注出来能让 LLM 自己判断该不该用、怎么改。
-    """
-    if not seed:
-        return ""
-    lines = ["", "## 已知错拼参考表（仅供参考，以本转写上下文为准）", ""]
-    hit, miss = [], []
-    for it in seed:
-        o = (it.get("original") or "").strip()
-        t = (it.get("target") or "（无 target）")
-        c = (it.get("confidence") or "?").lower()
-        row = f"- `{o}` → `{t}`（{c}）"
-        if not o:
-            continue
-        (hit if re.search(re.escape(o), source_text, re.IGNORECASE)
-         else miss).append(row)
-    if hit:
-        lines.append("### 在本转写中出现的条目")
-        lines += hit
-        lines.append("")
-    if miss:
-        lines.append("### ⚠️ 表里有、但本转写中未出现（请忽略，"
-                     "除非你在文中找到它的其他形态）")
-        lines += miss
-        lines.append("")
-    lines.append("表未覆盖的新错拼照常要抽出来。")
-    lines.append("")
-    return "\n".join(lines)
 
 
-def _normalize_items(items: list) -> list[dict]:
-    """只保留 original 非空、且带 target 或显式 null 的。"""
-    out = []
-    for it in items:
-        o = (it.get("original") or "").strip()
-        if not o:
-            continue
-        out.append({
-            "original": o,
-            "target": (it.get("target") or None),
-            "reason": (it.get("reason") or "").strip(),
-            "confidence": (it.get("confidence") or "low").strip().lower(),
-        })
-    return out
 
 
-def build_rules(seed: list[dict], detected: list[dict] | None = None,
-                min_confidence: str = "high") -> list[dict]:
-    """合并种子表与单篇检测表。detected 优先（更贴合当前这篇）。
-
-    过滤规则：
-      - target 为空 → 丢弃（无法确定正确名，不该替换）
-      - confidence 低于 min_confidence → 保留在报告里，但**不作为替换规则**
-      - 同一 original 出现多次，取 confidence 最高的那条
-    """
-    order = {"low": 0, "medium": 1, "high": 2}
-    floor = order.get(min_confidence, 2)
-    merged: dict[str, dict] = {}
-
-    for it in list(seed) + list(detected or []):
-        o = (it.get("original") or "").strip()
-        if not o:
-            continue
-        t = (it.get("target") or "").strip()
-        c = (it.get("confidence") or "low").strip().lower()
-        prev = merged.get(o)
-        # 同置信度时**后者胜出**（detected 在后，更贴合当前这篇）；
-        # 只有先前的置信度严格更高时才保留它。
-        if prev and order.get(prev["confidence"], 0) > order.get(c, 0):
-            continue
-        merged[o] = {
-            "original": o, "target": t or None,
-            "reason": (it.get("reason") or "").strip(),
-            "confidence": c, "occurrences": 0, "applied": False,
-        }
-
-    applied = [v for v in merged.values()
-               if v["target"] and order.get(v["confidence"], 0) >= floor]
-    for v in merged.values():
-        v["applied"] = v in applied
-    return list(merged.values())
 
 
-def _pat(original: str) -> re.Pattern:
-    """错拼字样 → 大小写不敏感的字面匹配。
-
-    纯字面匹配，不做词边界推断：专名错拼常与标点/中文直接相连，
-    加 \\b 反而会漏（中文与英文之间不存在词边界）。
-    """
-    return re.compile(re.escape(original), re.IGNORECASE)
 
 
-def apply_typos(text: str, items: list[dict]) -> tuple[str, list[dict]]:
-    """按规则替换。返回 (新文本, 命中的规则列表)。
-
-    不改结构：只做字面替换，`**[mm:ss]**` 等标记原样保留。
-
-    **单遍 + 保护区**（2026-10-02 修）：此前是逐条链式替换——每条规则都在
-    上���条的输出上再跑一遍。两个后果：
-
-    1. 链式污染：`ghosty → Ghostty` 先跑产出 `Ghostty`，紧接着
-       `ghost → Ghostty` 又去吃这个 `Ghostty`（`Ghost` 是 `Ghostty` 的
-       真子串），结果变成 `Ghostty` + 残留的 `ty` = `Ghosttyty`。
-       实测在 Orca 篇把 11 处正确的 `Ghostty` 全改坏。
-    2. 链式放大会把一条规则的产物喂给下一条，错误逐级放大。
-
-    修法两条一起上：
-      · 单遍：只读原文、只写输出，替换产物永不被再次扫描
-      · 保护区：原文中已经写对的 target 先标出来，落在保护区内的
-        匹配一律跳过——**已经正确的词不该被纠错规则再碰**
-    """
-    rules = [it for it in items if it.get("target") and it.get("applied")]
-    # 长字样优先：交替式里先注册的先匹配
-    rules.sort(key=lambda x: -len(x["original"]))
-    if not rules:
-        return text, []
-
-    # ── 保护区：原文中所有 target 的出现区间 ──
-    protected: list[tuple[int, int]] = []
-    for t in {it["target"] for it in rules if len(it["target"]) >= 3}:
-        for m in re.finditer(re.escape(t), text, re.IGNORECASE):
-            protected.append((m.start(), m.end()))
-
-    def guarded(s: int, e: int) -> bool:
-        return any(s >= ps and e <= pe for ps, pe in protected)
-
-    # ── 单遍：合并成一条交替式，一次遍历 ──
-    groups = {f"g{i}": it for i, it in enumerate(rules)}
-    combined = re.compile(
-        "|".join(f"(?P<g{i}>{re.escape(it['original'])})" for i, it in enumerate(rules)),
-        re.IGNORECASE,
-    )
-
-    out: list[str] = []
-    hits: list[dict] = []
-    pos = 0
-    for m in combined.finditer(text):
-        it = groups[m.lastgroup]
-        if guarded(m.start(), m.end()):
-            continue
-        out.append(text[pos:m.start()])
-        out.append(it["target"])
-        pos = m.end()
-        it["occurrences"] = it.get("occurrences", 0) + 1
-        if it not in hits:
-            hits.append(it)
-    out.append(text[pos:])
-    return "".join(out), hits
 
 
-def correct_text(text: str, seed: list[dict], detected: list[dict] | None = None,
-                 min_confidence: str = "high") -> tuple[str, dict]:
-    """一步到位：合并规则 → 替换 → 统计。"""
-    items = build_rules(seed, detected, min_confidence)
-    out, hits = apply_typos(text, items)
-    skipped = [i for i in items if i["target"] and not i["applied"]]
-    unknown = [i for i in items if not i["target"]]
-    return out, {
-        "chars_in": len(text), "chars_out": len(out),
-        "applied_count": len(hits),
-        "occurrences": sum(i["occurrences"] for i in hits),
-        "skipped_low_confidence": [
-            {"original": i["original"], "target": i["target"],
-             "confidence": i["confidence"]} for i in skipped],
-        "unknown_target": [i["original"] for i in unknown],
-        "items": items,
-    }
 
 
 # ── 时间戳标记的完整性校验 ────────────────────────────────
-TS_LINE = re.compile(r"^\*\*\[\d{1,2}:\d{2}\]\*\*", re.M)
+TS_LINE = re.compile(r"^\*\*\[\d{1,3}:\d{2}\]\*\*", re.M)
 
 
 def assert_structure_preserved(before: str, after: str) -> None:
@@ -714,23 +611,29 @@ def assert_structure_preserved(before: str, after: str) -> None:
 
 
 def run_file(src: Path, out_path: Path, typos_out: Path,
-             seed: list[dict] | None = None, client=None,
-             effort: str = "high") -> dict:
+             client=None, effort: str = "high") -> dict:
     """完整流程：读源 → LLM 逐处判断 → 按段精确替换 → 写 .clean.md + typos JSON。
 
-    `seed` 只为兼容旧调用方保留，新流程不使用（声学规律见 ACOUSTIC_HINTS）。
     无 client 时退化为「只做结构切分、不替换」，用于离线跑批。
     """
     text = src.read_text(encoding="utf-8")
     segs = split_segments(text)
 
-    judgments = detect_typos(text, client, effort=effort, seed=seed) if client else []
+    # 2026-10-05 修：此处原为 `detect_typos(..., seed=seed)`，但 run_file 的
+    # `seed` 参数在阶段一清死代码时已删除 → **有 client 时必然 NameError**。
+    # 之所以一直没被发现：现有单测全部走 `client=None` 分支，这行永远不执行。
+    judgments = detect_typos(text, client, effort=effort) if client else []
     out, stats = apply_judgments(text, judgments)
 
     assert_structure_preserved(text, out)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(out, encoding="utf-8")
+
+    # 覆盖率写进报告：此前 segments/chars_in 都按全文记，**看不出实际送检了多少**。
+    # 5 小时播客有 58% 从未进过纠错，报告却像全篇都跑过（见 detect_typos 注释）。
+    windows = _window_segments(segs, 120000) if client else [segs]
+    detected_segments = sum(len(w) for w in windows) if client else 0
 
     typos_out.parent.mkdir(parents=True, exist_ok=True)
     report = {
@@ -739,6 +642,10 @@ def run_file(src: Path, out_path: Path, typos_out: Path,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "effort": effort,
         "segments": len(segs),
+        "detected_segments": detected_segments,
+        "detected_windows": len(windows) if client else 0,
+        "coverage": (round(detected_segments / len(segs), 4)
+                     if (client and segs) else 0.0),
         "judgments": len(judgments),
         "applied_count": stats.get("plan", 0),
         "success_rate": round(stats.get("success_rate", 1.0), 4),
