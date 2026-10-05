@@ -214,12 +214,12 @@ def quote_coverage(body: str, source: str) -> dict:
     quotes = [q for q in quotes if len(normalize(q)) >= 6]
     total = len(quotes)
     if not total:
-        return {"total": 0, "exact": 0, "similar": 0, "similar_085": 0,
-                "unverified": 0, "traceable": 1.0, "ratio": 1.0,
+        return {"total": 0, "exact": 0, "similar": 0, "similar_060": 0,
+                "unverified": 0, "traceable": None, "ratio": None,
                 "translated": foreign}
     if foreign:
         # 外文源引用为译文，不做逐字回源
-        return {"total": total, "exact": 0, "similar": 0, "similar_085": 0,
+        return {"total": total, "exact": 0, "similar": 0, "similar_060": 0,
                 "unverified": 0, "traceable": None, "ratio": None,
                 "translated": True, "note": "外文源，引用为译文，跳过校验"}
     exact = sim = unver = 0
@@ -234,7 +234,7 @@ def quote_coverage(body: str, source: str) -> dict:
             sim += 1
         else:
             unver += 1
-    return {"total": total, "exact": exact, "similar": sim, "similar_085": sim,
+    return {"total": total, "exact": exact, "similar": sim, "similar_060": sim,
             "unverified": unver, "traceable": (exact + sim) / total,
             "ratio": exact / total, "translated": False}
 
@@ -435,7 +435,10 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     if m:
         tldr_head = PUNCT.sub("", normalize(m.group(1)))[:60]
     dup = bool(s) and tldr_head and PUNCT.sub("", normalize(s))[:60] == tldr_head
-    rep["C11_summary"] = {"len": len(s), "truncated": truncated, "dup_with_tldr": dup}
+    rep["C11_summary"] = {"len": len(s), "truncated": truncated,
+                      "dup_with_tldr": dup,
+                      "raw_len": len(str(llm.get("summary") or "").strip()),
+                      "limit": 60}
     if not s:
         rep["C11_summary"]["error"] = "summary 为空"
         fail(rep["C11_summary"]["error"])
