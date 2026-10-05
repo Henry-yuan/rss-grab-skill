@@ -42,7 +42,12 @@ SOURCES = {
     "rss": {
         "transcripts": PROJECT_ROOT / "rss" / "transcripts",
         "notes": PROJECT_ROOT / "rss" / "notes",
-        "regenerate": PROJECT_ROOT / ".agents" / "skills" / "rss-grab" / "scripts" / "regenerate_note.py",
+        # 2026-10-05 修：本行原指向 regenerate_note.py，该文件 2026-10-05 已改名
+        # 归档为 regenerate_note_v2.py（v2 退役），**路径指向不存在的文件**。
+        # 真正的 v3 生产入口是 generate_note_v3.py：收裸 <guid_hash8> 位置参数，
+        # transcript / info / 产物路径由它 locate() 自动推导，自带 --force 防重闸门，
+        # 所以 arg_mode 仍用默认的 "id"。改后 SOURCES 由 test_batch_notes 守门断言存在性。
+        "regenerate": PROJECT_ROOT / ".agents" / "skills" / "rss-grab" / "scripts" / "generate_note_v3.py",
         "id_re": r"-([0-9a-f]{8})\.transcript\.md$",   # <title>-<hash8>.transcript.md
         "id_name": "guid_hash8",
     },

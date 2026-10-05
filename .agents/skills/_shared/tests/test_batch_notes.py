@@ -155,6 +155,39 @@ def test_429_semaphore_real_effect():
     print("✅ test_429_semaphore_real_effect")
 
 
+def test_sources_regenerate_script_exists():
+    """守门：SOURCES 里每一源的 regenerate 脚本必须**真实存在于磁盘**。
+
+    2026-10-05 补这条的原因：切 v3 时只改了单篇入口，`batch_notes.py` 的
+    SOURCES 没跟着改，rss 指向 `regenerate_note.py` —— 该文件 2026-10-05 已改名
+    归档为 `regenerate_note_v2.py`（v2 退役）→ **路径指向不存在的文件**。
+    本文件原有的用例只测纯逻辑，**从不碰 SOURCES 里的路径**，所以抓不到。
+    """
+    for name, cfg in bn.SOURCES.items():
+        script = Path(cfg["regenerate"])
+        assert script.exists(), (
+            f"源 {name} 的 regenerate 脚本不存在：{script}\n"
+            f"  批量入口会在真正生成时直接失败。请改指该源当前的 v3 生产入口。"
+        )
+    print("✅ test_sources_regenerate_script_exists")
+
+
+def test_sources_regenerate_script_runnable():
+    """守门：SOURCES 里的脚本必须能 `--help` 跑通（文件在 ≠ 入口能用）。"""
+    import subprocess
+    for name, cfg in bn.SOURCES.items():
+        script = Path(cfg["regenerate"])
+        if not script.exists():          # 存在性由上一条负责报错
+            continue
+        r = subprocess.run([sys.executable, str(script), "--help"],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, (
+            f"源 {name} 的 regenerate 脚本 --help 退出码 {r.returncode}："
+            f"{r.stderr.strip()[:300]}"
+        )
+    print("✅ test_sources_regenerate_script_runnable")
+
+
 if __name__ == "__main__":
     simple = [
         test_extract_id_rss,
@@ -162,6 +195,8 @@ if __name__ == "__main__":
         test_notes_dir_not_exists,
         test_429_breaker_logic,
         test_429_semaphore_real_effect,
+        test_sources_regenerate_script_exists,
+        test_sources_regenerate_script_runnable,
     ]
     for t in simple:
         t()
