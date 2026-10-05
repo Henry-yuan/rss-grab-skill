@@ -58,11 +58,19 @@ def find_pending_urls(lines):
     return pending
 
 
-def fetch_one(url: str, out_dir: pathlib.Path) -> tuple[bool, str]:
-    """调 fetch_rss_feed.py 抓一个 feed（--max 5 默认下最近 5 期）。"""
+def fetch_one(url: str, out_dir: pathlib.Path,
+              auto_notes: bool = False) -> tuple[bool, str]:
+    """调 fetch_rss_feed.py 抓一个 feed（--max 5 默认下最近 5 期）。
+
+    `auto_notes` 只是**透传**给子进程 —— 真正的入队在 fetch_rss_feed.py
+    的 item 循环里（只有那里拿得到 guid_hash8）。
+    """
+    cmd = [sys.executable, str(FETCH_SCRIPT), url, "--out-dir", str(out_dir)]
+    if auto_notes:
+        cmd.append("--auto-notes")
     try:
         r = subprocess.run(
-            [sys.executable, str(FETCH_SCRIPT), url, "--out-dir", str(out_dir)],
+            cmd,
             capture_output=True, text=True, timeout=1800,
         )
         if r.returncode == 0:
@@ -136,12 +144,18 @@ def main():
     results = []
     for orig_idx, url in pending:
         print(f"\n--- {url[:80]} ---")
-        ok, err = fetch_one(url, out_dir)
+        # ⚠️ 2026-10-06 修**我自己引入的两个 P0**（AST 自检抓出来的）：
+        #   ① 缩进错位：`results.append(成功)` 落在 `if auto_notes:` 里 ——
+        #      于是**不开 --auto-notes 时，每次成功都被记成失败**写进状态文件。
+        #   ② 变量名错：本格子里的标识符是 url，我写的是 note_id → NameError。
+        # 现在：成功/失败按 ok 分支，入队是成功之后的**独立一步**。
+        # ⚠️ 2026-10-06 修正：`--auto-notes` 的入队**不在这一层**。
+        # 本脚本的循环是 **feed 级**（一次抓一整个 feed），手里没有 guid_hash8，
+        # 在这 enqueue 只会拿到未定义变量。正确位置是 `fetch_rss_feed.py`
+        # 的 item 循环（那里才拿得到 hash8）——本脚本只透传 --auto-notes 给它。
+        ok, err = fetch_one(url, out_dir, auto_notes=auto_notes)
         if ok:
             print("  ✅ 抓取完成（原料已落盘）")
-        if auto_notes:
-            note_worker.enqueue(_SRC_ID, note_id)
-            print(f"     ↪ 已入笔记队列（{note_id}）")
             results.append({"status": "ok", "new_line": f"- [x] {url} ✅ {timestamp}"})
         else:
             print(f"  ❌ 抓取失败：{err[:200]}")

@@ -37,6 +37,9 @@ from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+# scripts → rss-grab → skills → _shared
+sys.path.insert(0, str(SCRIPT_DIR.parent / "_shared"))
+import note_worker  # noqa: E402
 sys.path.insert(0, str(SCRIPT_DIR))
 import parse_rss
 import derive_rss_id
@@ -725,6 +728,8 @@ def main():
                     help="单期重跑 AI 摘要（传 guid），结果写回状态文件")
     ap.add_argument("--unsubscribe", type=str, default="",
                     help="退订：传节目名，从订阅表删除 + 状态文件标记已退订")
+    ap.add_argument("--auto-notes", action="store_true",
+                    help="每抓成功一期就入笔记队列，可另开 note_worker.py 并行收割")
     args = ap.parse_args()
 
     # ---- 订阅模式命令分支（不需要 rss_url）----
@@ -848,6 +853,12 @@ def main():
         n_ok += 1
         new_raw_paths.append(raw_path)
         downloaded_audio.append(audio_path)
+        # 2026-10-06：入队在**这里**（item 循环内），不在 fetch_rss_pending.py ——
+        # 那个脚本的循环是 **feed 级**（一次抓一整个 feed），手里根本没有
+        # guid_hash8，在那层 enqueue 只会拿到未定义的变量。
+        if args.auto_notes:
+            note_worker.enqueue("rss", guid_hash8)
+            print(f"     ↪ 已入笔记队列（{guid_hash8}）")
 
         if i < len(items):
             print(f"  ...sleep {SLEEP_BETWEEN}s (CDN 礼仪)")
