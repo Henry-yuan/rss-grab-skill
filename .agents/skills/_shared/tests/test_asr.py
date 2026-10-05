@@ -101,3 +101,63 @@ def test_audio_duration_invalid_file():
         f.write(b"not audio")
         f.flush()
         assert asr.audio_duration(pathlib.Path(f.name)) is None
+
+
+# ========== is_asr_failed 转写内容可信度（2026-10-05 补入） ==========
+#
+# 本仓库此前**没有** ASR 失败检测，幻觉完全裸奔：
+#   - asr_podcast.check_duration 只比时长 → 幻觉时间戳铺满全程照样通过
+#   - build_v3 的 200 字符下限 → 「字幕志愿者」重复 40 分钟 = 2000 字符，放行
+# 下面每条断言都做过变异验证：把幻觉模式表清空，幻觉两条必须变红。
+
+def _segs(n, text):
+    return [{"start": float(i), "end": float(i) + 1, "text": text} for i in range(n)]
+
+
+def test_段数过少算失败():
+    failed, reason = asr.is_asr_failed(_segs(1, "any content at all"))
+    assert failed is True
+    assert "segments" in reason
+
+
+def test_幻觉输出算失败():
+    """whisper 在无语音时的固定输出：必须拦下，不能拿去生成笔记。"""
+    for text in ("字幕志愿者", "字幕君", "字幕组", "字幕字幕字幕",
+                 "Thanks for watching!", "Subtitles by the Amara.org community"):
+        failed, reason = asr.is_asr_failed(_segs(6, text))
+        assert failed is True, f"幻觉「{text}」应判失败"
+        assert "幻觉" in reason
+
+
+def test_任何语种的正常转写都不算失败():
+    """这是本函数存在的意义：**与语种无关**。
+
+    判据只看「有没有内容」，绝不能把非中文内容误判成失败 ——
+    主项目曾用「中文字符 < 50」当判据，实测 5 份真实英文访谈笔记中招，
+    转写稿顶部还挂了假的「未识别到有效内容」横幅。
+    """
+    for text in ("Welcome back to the show, today we talk about AI.",
+                 "こんにちは、今日の番組です",
+                 "OK so 这个 topic 很有意思"):
+        failed, reason = asr.is_asr_failed(_segs(8, text))
+        assert failed is False, f"「{text[:20]}…」应判成功，实际：{reason}"
+
+
+def test_签名里没有语种旋钮():
+    """`min_chinese_chars` 不得以任何形式回来 —— 那是被删掉的错误判据。"""
+    import inspect
+    assert "min_chinese_chars" not in inspect.signature(asr.is_asr_failed).parameters
+    src = inspect.getsource(asr.is_asr_failed)
+    assert "chinese" not in src.lower() and "\\u4e00" not in src
+
+
+def test_asr_podcast_接上了内容校验():
+    """守门：光有函数不够，asr_podcast 必须真的调它。
+
+    变异验证点：把 asr_podcast 里的 `is_asr_failed(...)` 调用删掉，这条必须变红。
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "rss-grab" / "scripts" / "asr_podcast.py").read_text(encoding="utf-8")
+    assert "is_asr_failed" in src, "asr_podcast 没有调用 is_asr_failed —— 函数是死的"
+    assert "asr_untrustworthy" in src, "没有把不可信转写拦下来落盘"

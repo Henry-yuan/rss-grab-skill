@@ -113,6 +113,17 @@ def transcribe_one(info_path: Path, transcripts_dir: Path,
     if real_duration:
         print(f"     校验: ASR {asr_duration:.0f}s ≈ 音频 {real_duration:.0f}s ✅")
 
+    # 转写**内容**可信度校验（2026-10-05 补入，与主项目对齐）：
+    # 时长校验只比时长，拦不住「幻觉转写」—— whisper 在无语音输入时会
+    # 输出固定文本并把时间戳铺满全程，时长对得上、字符数也过得了
+    # build_v3 的 200 字符下限，于是这份垃圾会被标成 ok 拿去生成笔记。
+    segs = result["segments"]
+    seg_text = " ".join(s.get("text", "") for s in segs)
+    failed, fail_reason = shared_asr.is_asr_failed(segs, seg_text)
+    if failed:
+        print(f"  ⚠️  转写不可信：{fail_reason}，跳过落盘")
+        return False, f"asr_untrustworthy: {fail_reason}"
+
     source = info.get("item", {}).get("link") or info.get("feed", {}).get("link") or ""
     md = shared_asr.format_transcript_md(
         result["segments"], title=title, source=source,
