@@ -438,6 +438,112 @@ def apply_judgments(text: str, judgments: list[dict]) -> tuple[str, dict]:
     return out, dict(stat)
 
 
+# ── 残留率：clean 文本里「能修而没修」的下界（T2.6，2026-10-05）──
+#
+# 为什么 `success_rate` 不够
+# -------------------------
+# M1 答的是「**改了的里面有多少改对**」（精确率），不答「**该改的改没改**」
+# （召回）。V1.0 实测：clean 文本里仍残留约 12 处能修而没修的错字，
+# 而真正改坏的只有 3 处 —— M1 高达 98.31%，**完全掩盖了「召回≈0」**。
+# 98.31% 读起来像「纠错几乎完美」，实际含义是「几乎没改，所以没什么可改坏」。
+#
+# 判据（**纯程序判定，一次 LLM 都不额外调**）
+# ------------------------------------------
+# 残留 = clean 文本里仍存在、且**模型从未提及**的音近候选：
+#   候选 = `ACOUSTIC_SUSPECTS`（`ACOUSTIC_HINTS` 那几条声学规律的**可执行副本**）
+#   排除 = 模型在 ±`NEIGHBOR` 段内提过同一个词
+#          —— `keep` / `uncertain` 是「模型看过并决定不改」，
+#             按 T2.6 口径**不算残留**（那是模型的判断，不是漏掉）
+#
+# 判 `replace` 但被程序拒掉的条目也**不计入残留**：它们的失败模式不同，
+# 已经在 `rejected` 字段里逐条列明，混进来会让这个数字含义不明。
+#
+# ⚠️ **它是下界，不是真值**（三条局限，验收时必须一起看）：
+#   1. 只认硬编码的 9 条音近写法。**中文音近错字**（`虎精`/`化销`/`有余`）
+#      一处也扫不出来 —— 那需要 LLM 重新判断，等于再烧一遍钱，本任务不做。
+#   2. 候选来自「声学规律」而非上下文，所以**存在误报**：
+#      `chain box` / `immunator` 在别的语境里可能是真词。
+#      缓解手段：报告同时给出 `residual_items` 逐条可核 ——
+#      **数字必须配证据一起看**，不能只看总数。
+#   3. 模型在**别处**提过同词的候选会被漏报（同一段 ±`NEIGHBOR` 内才算「提过」）。
+#      这是刻意的：宁可报不出，也不能乱报。
+ACOUSTIC_SUSPECTS = (
+    ("clock", "o"),          # `Clocko` → Claude Code（20 篇 76 次）
+    ("clock", "code"),       # `clock code` / `clockcode` → Claude Code
+    ("cloud", "code"),       # `Cloud Code` / `cloudcode` → Claude Code
+    ("cocoat",),             # `Cocoat` → Claude Code
+    ("clock", "hold"),       # `clockhold` → Claude Code
+    ("cloud", "codex"),      # `Cloud Codex` → Codex（12 次）
+    ("chain", "box"),        # `chain box` → chat box（16 次）⚠️ 可能是真词
+    ("clock", "flare"),      # `clockflare` → Cloudflare（7 次）
+    ("immunator",),          # `immunator` → emulator（4 次）⚠️ 可能是真词
+)
+
+# 逐条判定段内是否命中。`ACOUSTIC_HINTS` 是**散文**，程序不该去解析它 ——
+# 所以可执行副本写死在这里，并用单测逐条回查 `ACOUSTIC_HINTS`，
+# 两边一旦漂移立刻红（见 test_residual_rate 的对拍用例）。
+#
+# 前后各加一道「不得再接字母数字」的边界：不加的话 `Clocko` 会命中 `Clockout`。
+# 词内允许空格/连字符/下划线，因为规律本身有 `clock code` 这种带空格的写法。
+_SUSPECT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    + "|".join(r"[\s\-_]*".join(p) for p in ACOUSTIC_SUSPECTS)
+    + r")(?![A-Za-z0-9])", re.I)
+
+# `residual_items` 只列前 N 条，防止一篇长文塞爆 typos JSON。
+# **计数仍按全部命中**（`RESIDUAL_ITEMS_MAX` 只截证据列表，不截数字）。
+RESIDUAL_ITEMS_MAX = 20
+
+
+def _norm_token(s: str) -> str:
+    """候选匹配的归一化：NFKC + 只留字母数字 + 小写。
+
+    比 `_norm_seg` 更严：`_norm_seg` 保留中文与下划线，那是**定位替换**用的；
+    这里要比的全是纯 ASCII 词，混进中文只会让匹配语义变模糊。
+    """
+    return re.sub(r"[^0-9A-Za-z]+", "", unicodedata.normalize("NFKC", s).lower())
+
+
+def scan_residual_candidates(clean_text: str, judgments: list[dict],
+                             detected_ids: set[int]) -> tuple[int, list[dict]]:
+    """扫 clean 文本里「符合音近规律、但模型压根没报过」的位置。
+
+    → (残留处数, 证据列表)。
+
+    ⚠️ **只在 `detected_ids` 指定的段里扫**：没送检过的段模型没看过，
+    那里有错字属于**覆盖问题**（看 `coverage`），不是**残留问题**。
+    分子分母必须落在同一批段上，否则这个率没有意义。
+
+    `judgments` 为空**不是**提前返回的理由 —— 那正是「召回≈0」本身：
+    模型一处都没报，clean 文本里的候选就全是残留。
+    """
+    if not detected_ids:
+        return 0, []
+    # 模型提过的词 → 段号列表（±NEIGHBOR 容差，与替换时的邻域搜索同一口径：
+    # 模型报段号偶尔偏一位，已实测 43 处，用同一套容差才不自相矛盾）
+    mentioned: dict[str, list[int]] = {}
+    for it in judgments or []:
+        tok = _norm_token(str(it.get("original") or ""))
+        if not tok:
+            continue
+        try:
+            si = int(str(it.get("seg", "")).strip().lstrip("Ll"))
+        except (TypeError, ValueError):
+            continue
+        mentioned.setdefault(tok, []).append(si)
+
+    items: list[dict] = []
+    for k, sg in enumerate(split_segments(clean_text), 1):
+        if k not in detected_ids:
+            continue
+        for m in _SUSPECT_RE.finditer(sg):
+            tok = _norm_token(m.group(0))
+            if any(abs(si - k) <= NEIGHBOR for si in mentioned.get(tok, ())):
+                continue      # 模型看过这一处（keep/uncertain/已改）→ 不算残留
+            items.append({"seg": k, "token": m.group(0)})
+    return len(items), items
+
+
 def _call(client, sys_p: str, user_p: str, effort: str = "medium",
           timeout: int = 1800) -> str:
     r = client.chat.completions.create(
@@ -619,6 +725,7 @@ def detect_typos(text: str, client, effort: str = "high",
         progress["windows_total"] = 总窗数
         progress["windows_ok"]    = **实际成功**的窗数
         progress["segments_ok"]   = 成功窗覆盖的段数
+        progress["segment_ids"]   = 成功窗覆盖的**段号列表**（T2.6 残留率用）
 
     ⚠️ **为什么必须有**：run_file 原先算 coverage 用「重算的理论窗数」当分母，
     某窗检测失败时仍报 1.0 —— 「一个窗都没跑成功」被报成「100% 覆盖」。
@@ -633,6 +740,9 @@ def detect_typos(text: str, client, effort: str = "high",
         progress["windows_total"] = len(windows)
         progress["windows_ok"] = 0
         progress["segments_ok"] = 0
+        # T2.6：只有**计数**不够算残留率 —— 分子（残留处数）与分母（已检测段数）
+        # 必须落在同一批段上，否则「未送检那段里的错字」会被算成「模型漏改了」。
+        progress["segment_ids"] = []
     if len(windows) > 1:
         print(f"    源文 {len(text):,} 字符 / {len(segs):,} 段 → 分 {len(windows)} 窗纠错"
               f"（单窗上限 {max_chars:,}）", flush=True)
@@ -651,6 +761,7 @@ def detect_typos(text: str, client, effort: str = "high",
         if progress is not None:      # 2026-10-05 V1.1 T1.14.2
             progress["windows_ok"] += 1
             progress["segments_ok"] += len(win)
+            progress["segment_ids"].extend(i for i, _ in win)   # T2.6
         all_items.extend(items)
     return all_items
 
@@ -725,6 +836,25 @@ def run_file(src: Path, out_path: Path, typos_out: Path,
     covered = detected_segments > 0
 
     typos_out.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── 残留率（T2.6）：M1 之外的另一半，M1 只测「改得对不对」 ──
+    #
+    # ⚠️ **没检测过就报 None，绝不报 0**：0 会被读成「一处残留都没有、
+    # 全部改完了」—— 这与 T1.14.2 修掉的 coverage / success_rate 兜底说谎
+    # 是同一族错误。没送检的段里有没有错字，本指标**答不了**，
+    # 答不了就必须说「未检测」（None），不能拿 0 充数。
+    detected_ids = set(progress.get("segment_ids", [])) if client else set()
+    if covered and detected_ids:
+        residual_count, residual_items = scan_residual_candidates(
+            out, judgments, detected_ids)
+        # 分母 = **已检测段数**（不是全文段数）：coverage 报的就是这个真实值，
+        # 拿全文段数当分母会让「没送检」被算成「改干净了」。
+        # 保留 6 位小数而非 4 位：密度天然很小（1 处 / 12,150 段 = 0.00008），
+        # 四舍五入到 4 位就是 0.0 —— 又是同一个「报 0 即说谎」的坑。
+        residual_rate = round(residual_count / detected_segments, 6)
+    else:
+        residual_count = residual_items = residual_rate = None
+
     report = {
         "source": src.name,
         "clean": out_path.name,
@@ -739,6 +869,17 @@ def run_file(src: Path, out_path: Path, typos_out: Path,
         "judgments": len(judgments),
         "applied_count": stats.get("plan", 0),
         "success_rate": round(stats.get("success_rate", 1.0), 4) if covered else 0.0,
+        # 残留率：clean 文本里「能修而没修」的**确定性下界**（详见
+        # scan_residual_candidates 上方的判据与局限说明）。
+        # 三个字段是配套的：None = 未检测（不是 0）；`residual_rate` 是
+        # **每段残留处数的密度**，不是「漏改率」—— 真值要 LLM 才知道
+        # 「总共有多少该改的」。`residual_items` 是逐条证据，只列前
+        # RESIDUAL_ITEMS_MAX 条但**计数按全部命中**，
+        # 所以 `len(residual_items) < residual_count` 是正常的，不是 bug。
+        "residual_count": residual_count,
+        "residual_rate": residual_rate,
+        "residual_items": (residual_items[:RESIDUAL_ITEMS_MAX]
+                           if residual_items is not None else None),
         "neighbor_rescued": stats.get("neighbor_rescued", 0),
         "rejected": stats.get("rejected_list", []),
         "decision_counts": {k[len("decision_"):]: v for k, v in stats.items()
