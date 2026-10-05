@@ -61,69 +61,104 @@ def test_notes_dir_not_exists():
     print("✅ test_notes_dir_not_exists")
 
 
-def test_todo_build_with_max(monkeypatch, tmp_path):
-    """--max 限定：待生成 > max 时截断，剩余留待下次。"""
+def test_todo_build_with_max(tmp_path):
+    """--max 限定：待生成 > max 时截断，剩余留待下次。
+
+    ⚠️ 2026-10-05 T1.14.2：本测试原先把「todo 收集 + --max 截断」两段逻辑
+    **抄进测试体**再断言 —— 测的是副本。生产代码改了这里不会红。
+    现在直接调 bn.collect_todo / bn.apply_max_limit，测的是生产实现本身。
+    """
     transcripts_dir = tmp_path / "transcripts"
     transcripts_dir.mkdir()
     for i in range(5):
         (transcripts_dir / f"标题-{i}-abc{i}2345.transcript.md").write_text("x", encoding="utf-8")
 
-    # 模拟主流程的 todo 收集 + --max
     cfg = bn.SOURCES["rss"].copy()
     cfg["transcripts"] = transcripts_dir
-    cfg["notes"] = tmp_path / "notes"
+    cfg["notes"] = tmp_path / "notes"          # 空目录 = 都没笔记
+    sources = sorted(transcripts_dir.glob("*.transcript.md"))
 
-    todo = []
-    for tp in sorted(transcripts_dir.glob("*.transcript.md")):
-        id_ = bn._extract_id(tp, cfg)
-        if bn._has_existing_note(cfg, id_):
-            continue
-        todo.append(tp)
+    todo = bn.collect_todo(sources, cfg, force=False)
+    assert len(todo) == 5, "5 份转写稿、0 份笔记 -> 全部待生成"
 
-    assert len(todo) == 5
-    # --max 2
-    if len(todo) > 2:
-        todo, rest = todo[:2], todo[2:]
+    todo, rest = bn.apply_max_limit(todo, 2)
     assert len(todo) == 2
     assert len(rest) == 3
+
+    # --max 0 = 不限
+    todo2, rest2 = bn.apply_max_limit(todo + rest, 0)
+    assert len(todo2) == 5 and rest2 == []
+
+    # --max 大于待生成数 = 全部本轮跑完
+    todo3, rest3 = bn.apply_max_limit(todo + rest, 99)
+    assert len(todo3) == 5 and rest3 == []
     print("✅ test_todo_build_with_max")
 
 
+def test_collect_todo_skips_existing_and_force(tmp_path):
+    """collect_todo 真的跳过已有笔记；force=True 时全收。
+
+    变异验证点：把 collect_todo 里的 `if force: continue` 删掉，这条必须变红。
+    """
+    transcripts_dir = tmp_path / "transcripts"
+    notes_dir = tmp_path / "notes"
+    transcripts_dir.mkdir()
+    notes_dir.mkdir()
+
+    for i in range(3):
+        (transcripts_dir / f"标题-{i}-abc{i}2345.transcript.md").write_text("x", encoding="utf-8")
+    # 给第 1 篇造出已有笔记
+    (notes_dir / "标题-1-abc12345.md").write_text("y", encoding="utf-8")
+
+    cfg = bn.SOURCES["rss"].copy()
+    cfg["transcripts"] = transcripts_dir
+    cfg["notes"] = notes_dir
+
+    todo = bn.collect_todo(sorted(transcripts_dir.glob("*.transcript.md")), cfg, force=False)
+    assert len(todo) == 2, "已有笔记的那篇必须被跳过"
+    assert all("标题-1-" not in t.name for t in todo)
+
+    todo_forced = bn.collect_todo(sorted(transcripts_dir.glob("*.transcript.md")), cfg, force=True)
+    assert len(todo_forced) == 3, "force=True 必须全收"
+    print("✅ test_collect_todo_skips_existing_and_force")
+
+
 def test_429_breaker_logic():
-    """429 熔断逻辑：首次 429 降 20->15，二次降 15->10，无 429 复位。"""
+    """429 熔断：首次 429 降 20->15，二次降 15->10，连续无 429 复位。
+
+    ⚠️ 2026-10-05 T1.14.2：本测试原先把熔断控制流抄进测试体，只读了两个常量。
+    那份副本**漏掉了「连续无 429 复位」整条 else 分支**——生产里复位逻辑坏掉，
+    测试照样全绿。现在直接调生产函数 bn.apply_429_breaker。
+    """
     breaker = [0]
     active_limit = [20]
 
-    # 首次 429（正则匹配）
     msg = "RateLimitError: 429"
-    if re.search(r"429|RateLimit(?:Error)?", msg):
-        breaker[0] += 1
-        if breaker[0] == 1 and active_limit[0] > bn.FALLBACK_WORKERS_2:
-            active_limit[0] = bn.FALLBACK_WORKERS
+    assert bn.apply_429_breaker(msg, breaker, active_limit) == bn.FALLBACK_WORKERS
     assert active_limit[0] == 15
     assert breaker[0] == 1
 
-    # 二次 429
-    if re.search(r"429|RateLimit(?:Error)?", msg):
-        breaker[0] += 1
-        if breaker[0] == 1 and active_limit[0] > bn.FALLBACK_WORKERS_2:
-            active_limit[0] = bn.FALLBACK_WORKERS
-        elif breaker[0] >= 2 and active_limit[0] > bn.FALLBACK_WORKERS_2:
-            active_limit[0] = bn.FALLBACK_WORKERS_2
-    assert active_limit[0] == 10
+    # 二次 429 -> 第二档
+    bn.apply_429_breaker(msg, breaker, active_limit)
+    assert active_limit[0] == bn.FALLBACK_WORKERS_2
     assert breaker[0] == 2
 
-    # 无 429 复位
-    ok_msg = "成功"
-    if re.search(r"429|RateLimit(?:Error)?", ok_msg):
-        breaker[0] += 1
-    else:
-        breaker[0] = 0
-    assert breaker[0] == 0
+    # 第三次 429：已到最低档，不再降（不能降穿）
+    bn.apply_429_breaker(msg, breaker, active_limit)
+    assert active_limit[0] == bn.FALLBACK_WORKERS_2, "最低档不能再降"
+    assert breaker[0] == 3
 
-    # 429 正则不误匹配正文里的普通数字（如 "429" 出现在内容里）
-    normal_msg = "笔记完成，共 3 篇"
-    assert not re.search(r"429|RateLimit(?:Error)?", normal_msg)
+    # 连续一次无 429 -> 计数复位（**旧副本没有这条断言**）
+    assert bn.apply_429_breaker("成功", breaker, active_limit) == bn.FALLBACK_WORKERS_2
+    assert breaker[0] == 0, "无 429 必须复位计数"
+
+    # 复位后再遇 429，应重新从第一档降，而不是直接跳到最低档
+    active_limit[0] = 20
+    bn.apply_429_breaker(msg, breaker, active_limit)
+    assert active_limit[0] == bn.FALLBACK_WORKERS, "复位后应从第一档重新降"
+
+    # 429 正则不误匹配正文里的普通数字
+    assert not re.search(r"429|RateLimit(?:Error)?", "笔记完成，共 3 篇")
     print("✅ test_429_breaker_logic")
 
 

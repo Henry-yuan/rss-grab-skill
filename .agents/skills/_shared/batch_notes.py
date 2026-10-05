@@ -97,6 +97,61 @@ def _run_regenerate(regenerate_script: Path, id_: str,
         return False, "超时（1 小时）"
 
 
+def collect_todo(sources: list[Path], source_cfg: dict, force: bool) -> list[Path]:
+    """从候选源文件里挑出「还没笔记」的，即本次要生成的那些。
+
+    force=True 时全收（用于强制重生成）。
+
+    ⚠️ 2026-10-05 T1.14.2：这段原先内联在 main() 里，测试文件**把它重抄了一份**
+    到测试体内再断言 —— 测的是副本，不是生产代码。生产逻辑改了测试不会红，
+    而这份「保护网」看上去一直绿。现已抽成函数，测试直接调它。
+    """
+    todo = []
+    for tp in sources:
+        if force:
+            todo.append(tp)
+            continue
+        if _has_existing_note(source_cfg, _extract_id(tp, source_cfg)):
+            continue
+        todo.append(tp)
+    return todo
+
+
+def apply_max_limit(todo: list[Path], max_n: int) -> tuple[list[Path], list[Path]]:
+    """`--max N` 限定本次最多处理 N 篇，其余留到下次。
+
+    返回 (本次要跑的, 留到下次的)。max_n <= 0 表示不限。
+
+    ⚠️ 2026-10-05 T1.14.2：同 collect_todo，原先内联在 main()，测试重抄副本。
+    """
+    if max_n > 0 and len(todo) > max_n:
+        return todo[:max_n], todo[max_n:]
+    return todo, []
+
+
+def apply_429_breaker(msg: str, breaker: list[int], active_limit: list[int]) -> int:
+    """429 熔断：连续遇 429 逐级降并发，连续一次无 429 则复位计数。
+
+    返回降级后的并发上限（未降级时为原值）。调用方据此决定要不要打印降级日志。
+
+    状态用可变的单元素 list 承载，是为了让调用处能跨迭代更新；
+    若改成返回元组，调用方还得自己写复位逻辑 —— 那又是一处分叉。
+
+    ⚠️ 2026-10-05 T1.14.2：同上，原先内联在 main() 的循环里，测试重抄了副本。
+    那份副本**只抄了 2 个分支、漏掉了「连续无 429 复位」**，
+    所以复位逻辑坏掉也不会被测出来。现在测试直接调本函数。
+    """
+    if re.search(r"429|RateLimit(?:Error)?", msg):
+        breaker[0] += 1
+        if breaker[0] == 1 and active_limit[0] > FALLBACK_WORKERS_2:
+            active_limit[0] = FALLBACK_WORKERS
+        elif breaker[0] >= 2 and active_limit[0] > FALLBACK_WORKERS_2:
+            active_limit[0] = FALLBACK_WORKERS_2
+    else:
+        breaker[0] = 0
+    return active_limit[0]
+
+
 def main():
     ap = argparse.ArgumentParser(description="批量笔记生成（20 并发，可暂停续跑）—— rss 专用")
     ap.add_argument("--source", choices=["rss"], required=True,
@@ -117,21 +172,11 @@ def main():
         return
 
     # 收集待处理 transcript（跳过已有笔记）
-    todo = []
-    for tp in sorted(transcripts_dir.glob("*.transcript.md")):
-        id_ = _extract_id(tp, source_cfg)
-        if args.force:
-            todo.append(tp)
-            continue
-        if _has_existing_note(source_cfg, id_):
-            continue
-        todo.append(tp)
+    todo = collect_todo(sorted(transcripts_dir.glob("*.transcript.md")),
+                        source_cfg, args.force)
 
     # --max 限定本次最多生成 N 篇
-    if args.max > 0 and len(todo) > args.max:
-        todo, rest = todo[:args.max], todo[args.max:]
-    else:
-        rest = []
+    todo, rest = apply_max_limit(todo, args.max)
     total_transcripts = len(list(transcripts_dir.glob("*.transcript.md")))
     print(f"=== 批量笔记[{args.source}]: 共 {total_transcripts} 期 transcript, "
           f"待生成笔记 {len(todo)}"
@@ -196,16 +241,10 @@ def main():
                     print(f"  {status} [{done_count[0]+fail_count[0]}/{len(todo)}] {tp.name[:50]}")
 
                     # 429 熔断降并发：改 active_limit + 用 acquire 数量控制
-                    if re.search(r"429|RateLimit(?:Error)?", msg):
-                        breaker[0] += 1
-                        if breaker[0] == 1 and active_limit[0] > FALLBACK_WORKERS_2:
-                            active_limit[0] = FALLBACK_WORKERS
-                            print(f"  🔻 429 熔断：并发降级 -> {active_limit[0]}")
-                        elif breaker[0] >= 2 and active_limit[0] > FALLBACK_WORKERS_2:
-                            active_limit[0] = FALLBACK_WORKERS_2
-                            print(f"  🔻 429 熔断：并发降级 -> {active_limit[0]}")
-                    else:
-                        breaker[0] = 0  # 连续无 429 复位
+                    before_limit = active_limit[0]
+                    after_limit = apply_429_breaker(msg, breaker, active_limit)
+                    if after_limit != before_limit:
+                        print(f"  🔻 429 熔断：并发降级 -> {after_limit}")
 
                     if next_idx < len(todo):
                         launch(pool, todo[next_idx])
