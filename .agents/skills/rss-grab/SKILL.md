@@ -265,6 +265,29 @@ python3 scripts/lark_sync.py pull --dry-run      # 只预览，不改文件
   写入用同目录临时文件 + `os.replace` 原子替换，读者永远看到完整旧版或完整新版。
 - 状态列出现无法识别的值 → **跳过该期并提示**，不当成失败，也不猜。
 
+## 索引登记与 `--backfill-index`
+
+批量出笔记时（`note_worker.py` 收割、或多进程并行跑）子进程一律传 `--no-index`
+—— 多个进程并发写同一个 `INDEX.md` 会互相覆盖。代价是**跑完索引会缺登记**。
+
+`--backfill-index` 就是补这一步的：
+
+```bash
+python3 scripts/generate_note_v3.py --backfill-index 69fca7701b7bd50295ad9ea8,...
+```
+
+- 只读已存在的笔记文件，把缺失的登记按 guid_hash8 幂等补进 `rss/notes/INDEX.md`（已登记的跳过）
+- **不需要任何凭证**；退出码恒为 0；末行输出 `✅ 补 N 条（跳过 S 条，失败 F 条）`
+- hash8 必须是 8 位小写 hex 且**只接受精确匹配**；交叉校验 `item.guid_hash8`
+  与文件名不符时**一行都不写**
+- 「源」列取 `info["feed"]["title"]`，缺失时回退到笔记所在节目目录名
+- ⚠️ **必须带 `--project-root <项目根>`**：不带时 `find_project_root()` 从
+  `__file__` 反推，而该文件物理上在本仓、别的 checkout 里是软链 —— 不指定
+  会补到**另一个仓**的索引上去
+
+正常流程不需要手动跑它：`note_worker.py` 每轮收割成功后会自动调一次（并显式传
+`--project-root`）。手工调的场景是历史产物索引有缺口、或你手工改过索引。
+
 ## 路径约定
 
 | 用途 | 路径 |

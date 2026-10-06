@@ -66,9 +66,68 @@ LARK_BIN_CANDIDATES = ("lark-cli", os.path.expanduser("~/.local/bin/lark-cli"))
 
 # 表格列序（A..I）。顺序即契约，改动会让旧表读不出列。
 COL_SEQ, COL_DATE, COL_DUR, COL_TITLE = "A", "B", "C", "D"
-COL_SUMMARY, COL_OVERVIEW, COL_LINK = "E", "F", "G"
-COL_STATUS, COL_GUID = "H", "I"
-HEADERS = ["序号", "发布日期", "时长", "标题", "一句话概括", "内容概览", "链接", "状态", "guid"]
+COL_SUMMARY, COL_OVERVIEW, COL_HIGHLIGHT, COL_LINK = "E", "F", "G", "H"
+COL_STATUS, COL_GUID = "I", "J"
+HEADERS = ["序号", "发布日期", "时长", "标题", "一句话概括", "内容概览",
+           "值得关注", "链接", "状态", "guid"]
+
+# ⚠️ 上面这组列字母只是**建表时的默认布局**，不是 pull 的依赖。
+# pull 一律先读表头、按**表头名**定位实际列（见 `locate_columns`），
+# 这样用户在飞书上拖动列序、插列、删列都不会让 pull 读错数据。
+# 曾硬编码「状态=H、guid=I」，用户随手拖一下列顺序，pull 就会把标题当状态
+# 写回 md —— 静默、且方向错得离谱。
+_HEADER_KEY = "状态"
+_GUID_KEY = "guid"
+
+
+def col_letter(idx0: int) -> str:
+    """0 基列号 -> 列字母（0->A, 25->Z, 26->AA）。"""
+    out = ""
+    n = idx0 + 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def locate_columns(token: str, sheet: str) -> dict[str, str]:
+    """读表头行，返回 {表头名: 列字母}。
+
+    读不到表头（空表 / 刚建好的子表只有默认表名）时返回空 dict，
+    调用方据此退回默认列序。
+    """
+    try:
+        raw = run_lark(["sheets", "+cells-get",
+                        "--spreadsheet-token", token,
+                        "--sheet-name", sheet,
+                        "--range", "A1:AZ1"])
+    except SyncError:
+        return {}
+    payload = _loads_or_die(raw)
+    grid = find_grid(payload)
+    if not grid or not grid[0]:
+        return {}
+    out: dict[str, str] = {}
+    for i, cell in enumerate(grid[0]):
+        name = (cell_text(cell) or "").strip()
+        if name and name not in out:      # 同名列取最左边那个
+            out[name] = col_letter(i)
+    return out
+
+
+def resolve_columns(token: str, sheet: str) -> tuple[str, str, dict[str, str]]:
+    """返回 (状态列, guid列, 全部表头映射)。缺列时退回默认并说明。"""
+    cols = locate_columns(token, sheet)
+    if not cols:
+        return COL_STATUS, COL_GUID, cols
+    status = cols.get(_HEADER_KEY, COL_STATUS)
+    guid = cols.get(_GUID_KEY, COL_GUID)
+    missing = [k for k in (_HEADER_KEY, _GUID_KEY) if k not in cols]
+    if missing:
+        print(f"⚠️  {sheet}：表头里找不到 {missing}，退回默认列序"
+              f"（状态={status} guid={guid}）——请检查表头名是否被改过。",
+              file=sys.stderr)
+    return status, guid, cols
 
 STATUS_TO_CHECKBOX = {
     "待确认": "[ ]",
@@ -275,10 +334,16 @@ def run_lark(args: list[str], stdin_data: str | None = None) -> str:
     return proc.stdout
 
 
-def build_csv(items: list[dict]) -> str:
+def build_csv(items: list[dict], with_header: bool = True) -> str:
+    """生成 CSV。
+
+    `with_header=False` 用于**增量推送**：表头已存在，写进去会覆盖用户
+    可能已经改过的表头文字。
+    """
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow(HEADERS)
+    if with_header:
+        w.writerow(HEADERS)
     for it in items:
         w.writerow([
             it["seq"] if it["seq"] is not None else "",
@@ -287,6 +352,7 @@ def build_csv(items: list[dict]) -> str:
             it["title"],
             pick_field(it, "一句话概括"),
             pick_field(it, "内容概览"),
+            pick_field(it, "值得关注"),
             pick_field(it, "链接"),
             CHECKBOX_TO_STATUS.get(it["checkbox"], "待确认"),
             it["guid"],
@@ -294,21 +360,81 @@ def build_csv(items: list[dict]) -> str:
     return buf.getvalue()
 
 
-def do_push(items: list[dict], token: str, sheet: str, dry_run: bool) -> None:
-    payload = build_csv(items)
-    n = len(items)
-    print(f"→ {sheet}：{n} 行（表头 1 + 数据 {n}）")
+def _read_existing(token: str, sheet: str, guid_col: str
+                   ) -> tuple[set[str], int]:
+    """读表里已有的 guid 与表尾行号。
+
+    返回 (已有 guid 集合, 最后非空行号)。表为空时返回 (set(), 0)，
+    调用方据此从第 1 行开始写 —— 也就退化成全量首推。
+    """
+    try:
+        raw = run_lark(["sheets", "+cells-get",
+                        "--spreadsheet-token", token,
+                        "--sheet-name", sheet,
+                        "--range", f"{guid_col}1:{guid_col}5000"])
+    except SyncError:
+        return set(), 0
+    payload = _loads_or_die(raw)
+    grid = find_grid(payload)
+    if not grid:
+        return set(), 0
+    guids: set[str] = set()
+    last = 0
+    for i, row in enumerate(grid, start=1):
+        # ⚠️ 第 1 行是**表头**，它的 guid 列里是字符串 "guid" 而非真 guid。
+        #    不过滤会同时坏两处：① 计数虚高；② 表空时 last_row 至少为 1，
+        #    增量从第 2 行开始写 → **表头永远写不进去**。
+        if i == 1:
+            continue
+        if not row:
+            continue
+        v = cell_text(row[0]).strip()
+        if v and v != _GUID_KEY:      # 再兜一层：表头被挪动过的情况
+            guids.add(v)
+            last = i
+    return guids, last
+
+
+def do_push(items: list[dict], token: str, sheet: str, dry_run: bool,
+            force: bool = False) -> None:
+    """推送。
+
+    **默认增量**：只写表里还没有的 guid，已存在的行一个字都不碰。
+    否则每次全量覆盖都会把用户在飞书上改的状态（确认抓取 / 确认不抓）
+    冲回「待确认」—— 那是用户唯一的审阅成果，覆盖等于销毁。
+
+    `force=True` 才做全量覆盖（建表首推、修表结构时用）。
+    """
+    status_col, guid_col, _cols = resolve_columns(token, sheet)
+
+    to_write, start_row, wrote_header = items, 1, True
+    if not force:
+        existing, last_row = _read_existing(token, sheet, guid_col)
+        if existing:
+            fresh = [it for it in items if it["guid"] not in existing]
+            print(f"→ {sheet}：本地 {len(items)} 条 / 表里已有 {len(existing)} 条 / "
+                  f"新增 {len(fresh)} 条")
+            if not fresh:
+                print("   无新增，跳过（已有行不动，保留你改过的状态）")
+                return
+            to_write, start_row, wrote_header = fresh, last_row + 1, False
+
+    payload = build_csv(to_write, with_header=wrote_header)
+    n = len(to_write)
+    tail = f"，起始行 {start_row}" + ("（FORCE 全量覆盖）" if force and not wrote_header else "")
+    print(f"→ {sheet}：写入 {n} 行{tail}")
 
     if dry_run:
         print("\n--- 将写入的表格（dry-run，未调用飞书） ---")
-        for i, row in enumerate(csv.reader(io.StringIO(payload))):
+        for i2, row in enumerate(csv.reader(io.StringIO(payload))):
             cells = [c[:28] + ("…" if len(c) > 28 else "") for c in row]
-            print(f"{i:>4} | " + " | ".join(cells))
+            print(f"  {i2:>4} | " + " | ".join(cells))
         print("\n--- 将执行的命令 ---")
         print(f"  lark-cli sheets +csv-put --spreadsheet-token <你的 token> "
-              f"--sheet-name {sheet} --csv - --start-cell A1")
+              f"--sheet-name {sheet} --csv - --start-cell A{start_row}")
         print(f"  lark-cli sheets +dropdown-set --spreadsheet-token <你的 token> "
-              f"--sheet-name {sheet} --range {COL_STATUS}2:{COL_STATUS}{n + 1} "
+              f"--sheet-name {sheet} "
+              f"--range {status_col}{start_row}:{status_col}{start_row + n - 1} "
               f"--options {json.dumps(STATUS_OPTIONS, ensure_ascii=False)}")
         return
 
@@ -320,14 +446,14 @@ def do_push(items: list[dict], token: str, sheet: str, dry_run: bool) -> None:
               "--spreadsheet-token", token,
               "--sheet-name", sheet,
               "--csv", "-",
-              "--start-cell", "A1"],
+              "--start-cell", f"A{start_row}"],
              stdin_data=payload)
 
     try:
         run_lark(["sheets", "+dropdown-set",
                   "--spreadsheet-token", token,
                   "--sheet-name", sheet,
-                  "--range", f"{COL_STATUS}2:{COL_STATUS}{n + 1}",
+                  "--range", f"{status_col}{start_row}:{status_col}{start_row + n - 1}",
                   "--options", json.dumps(STATUS_OPTIONS, ensure_ascii=False)])
     except SyncError as exc:
         # 数据已经写进去了，只是下拉没挂上 —— 说清楚，别让人以为全失败了。
@@ -335,7 +461,6 @@ def do_push(items: list[dict], token: str, sheet: str, dry_run: bool) -> None:
         return
 
     print("✅ 推送完成（含状态下拉）")
-
 
 def find_grid(obj, depth: int = 0):
     """在飞书返回的 JSON 里找出二维单元格数组。
@@ -377,11 +502,16 @@ def cell_text(c) -> str:
 def read_statuses(token: str, sheet: str, n_rows: int) -> dict[str, str]:
     """只读状态列 + guid 列，返回 {guid: 状态文字}。
 
-    ⚠️ 行数是 **n_rows + 1**：第 1 行是表头，数据从第 2 行起。
-    少这一行会**静默漏掉最后一期**（读 n 行只覆盖到第 n-1 期），
+    ⚠️ 行列都**按表头名定位**、行数从飞书实际范围取，不写死列号：
+    用户在飞书上拖动列序 / 插列 / 删列都不影响这里。曾经硬编码
+    「状态=H、guid=I」，拖一下列就会把标题当状态写回 md。
+
+    `n_rows` 只作为**下限**（本地比表里多时以本地为准），实际读多少由
+    飞书返回的 `actual_range` 决定 —— 少读一行会**静默漏掉最后一期**，
     而症状只是「少改了一条」，极难察觉。
     """
-    rng = f"{COL_STATUS}1:{COL_GUID}{max(n_rows, 0) + 1}"
+    status_col, guid_col, _cols = resolve_columns(token, sheet)
+    rng = f"{status_col}1:{guid_col}{max(n_rows, 0) + 1}"
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "grid.json"
         run_lark(["sheets", "+cells-get",
@@ -390,24 +520,21 @@ def read_statuses(token: str, sheet: str, n_rows: int) -> dict[str, str]:
                   "--range", rng,
                   "--output-path", str(out)])
         raw = out.read_text(encoding="utf-8")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise SyncError(f"无法解析飞书返回的 JSON：{exc}") from exc
+    payload = _loads_or_die(raw)
 
     grid = find_grid(payload)
     if not grid:
         raise SyncError("飞书返回里找不到表格数据（结构与预期不符），已放弃，md 未改动。")
 
-    # grid 每行从状态列开始：col 偏移 = COL_STATUS - 'A'
-    col_status = ord(COL_STATUS) - ord("A")
-    col_guid = ord(COL_GUID) - ord("A")
+    # grid 每行从 status_col 开始：偏移 = status_col - 'A'
+    off = ord(status_col) - ord("A")
+    span = ord(guid_col) - ord(status_col)
     out_map: dict[str, str] = {}
     for row in grid:
-        if len(row) <= max(col_status, col_guid):
+        if len(row) <= max(off, off + span):
             continue
-        guid = cell_text(row[col_guid])
-        status = cell_text(row[col_status])
+        guid = cell_text(row[off + span]).strip()
+        status = cell_text(row[off]).strip()
         if guid and status:
             out_map[guid] = status
     return out_map
@@ -417,7 +544,21 @@ def read_statuses(token: str, sheet: str, n_rows: int) -> dict[str, str]:
 # pull：把状态列写回 md（原子）
 # ---------------------------------------------------------------------------
 
-def apply_statuses(text: str, wanted: dict[str, str]) -> tuple[str, int, list[str]]:
+def _loads_or_die(raw: str):
+    """解析飞书返回的 JSON；失败时抛 SyncError 并明确说「md 未改动」。
+
+    ⚠️ 放在 `cell_text` 之后：`locate_columns` / `_read_existing` 都要用它。
+    曾一度被一段「do_push 到 find_grid 的整段替换」顺手删掉（它正好夹在
+    两者中间），报 NameError —— 教训：**按行区间替换代码前，先确认区间里
+    没有别的东西**。
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SyncError(f"无法解析飞书返回的 JSON：{exc}；已放弃，md 未改动。") from exc
+
+
+def apply_statuses(text: str, wanted: dict[str, str]) -> tuple[int, int, list[str]]:
     """按 guid 把 checkbox 换掉。**只动条目主行的 checkbox token**。
 
     返回 (新文本, 改动条数, 未匹配说明列表)。
@@ -521,6 +662,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="只处理这一个节目；缺省则处理全部")
         p.add_argument("--dry-run", action="store_true",
                        help="只预览，不连飞书、不改文件")
+        p.add_argument("--force", action="store_true",
+                       help="push 才有效：强制全量覆盖。默认只增量写新条目，"
+                            "已存在的行不动（否则会冲掉你在飞书上改过的状态）")
     args = ap.parse_args(argv)
 
     try:
@@ -529,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
             for path in files:
                 items = parse_items(path.read_text(encoding="utf-8"))
                 token, sheet = lark_config(path.stem)
-                do_push(items, token, sheet, args.dry_run)
+                do_push(items, token, sheet, args.dry_run, force=args.force)
             print("\n提示：表格需事先手工建好空表，并把表头行保留为第一行。")
         else:
             # 配置按节目各自取（sheet 名默认=节目名），失败在 do_pull 之前
