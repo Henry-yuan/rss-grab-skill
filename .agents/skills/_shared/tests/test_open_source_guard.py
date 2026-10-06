@@ -81,6 +81,58 @@ BANNED = {
     #        无法与本域 episode ID 区分，见上面的形态冲突说明）。
     "非本源主键形态（字段名 + 24 位十六进制值）":
         re.compile(r"(?<![0-9A-Za-z_])note_id(?![0-9A-Za-z_])[\s\S]{0,40}?\b[0-9a-f]{24}\b"),
+    # ==================================================================
+    # 飞书（Lark）凭证与表格标识 —— 2026-10-06 随「飞书表格镜像（可选功能）」新增
+    # ==================================================================
+    # ⚠️ 设计前提：**按「值的形态」拦，不按「lark / 飞书」这个词拦**。
+    # 本仓库合法地会出现 lark-cli 调用、开放平台文档域名等实现代码，
+    # 按关键词拦会让功能代码自己判红、守门被整体豁免（与上面 24 位 hex
+    # 形态冲突同一个坑）。
+    #
+    # 1) 应用 ID：飞书 app_id 固定 `cli_` + 16 位左右 base36。这个前缀是
+    #    飞书的保留命名空间，全网无第二家用，故零误报。
+    #    左边界不能省：`lark-cli` 的 `cli` 后面跟的是 `-` 不是 `_`，本来也不匹配；
+    #    但写成 `lark_cli_bin` 这类变量名就会命中，所以要求 `cli` 前不是标识符字符。
+    "飞书应用 ID": re.compile(
+        r"(?<![0-9A-Za-z_])cli_[0-9A-Za-z]{8,24}(?![0-9A-Za-z])", re.I),
+    # 2) 用户 / 租户身份 ID：`ou_`（open_id）、`on_`（union_id），
+    #    后面固定 32 位小写 hex。`ox_`/`oc_` 是文档/群 ID，本仓库用不到，不加。
+    "飞书身份 ID": re.compile(
+        r"(?<![0-9A-Za-z_])o[un]_[0-9a-f]{32}(?![0-9A-Za-z])", re.I),
+    # 3) 表格 / 多维表格链接：飞书域 + 表格类路径段。
+    #    ⚠️ 必须带**域名 + 路径段**两个条件：只禁域名会误伤
+    #    `docs.feishu.cn`、`open.feishu.cn/document` 这类合法文档引用；
+    #    只禁路径段则毫无意义。`sheets` / `s` / `base` 是表格与 Bitable 三种入口。
+    "飞书表格链接": re.compile(
+        r"https?://[A-Za-z0-9._-]+\.(?:feishu|larksuite)\.(?:cn|com)/(?:s|sheets|base)/", re.I),
+    # 4) 凭证值（键 + 值同时出现才算泄露）。
+    #    🔴 **为什么必须带键名**：飞书表格 token 本身是 20-64 位无格式串，
+    #    与本域 episode ID（24 位 hex）形态重叠 —— 只按值禁会误报本仓库核心数据。
+    #    （与上面 24 位 hex 那条同源问题，此处同样选「带键名」而不是「禁形态」。）
+    #    值要求 20-64 位 token 形态字符。两条豁免让功能代码不被误伤：
+    #      · placeholder 词（your/example/xxx/替换…）—— .env.example 与文档里的
+    #        占位值是**必须允许**的，否则文档没法写示例；
+    #      · 纯点号属性链（cfg.lark_sheet_token / os.environ.get）—— 那是
+    #        变量引用不是凭证字面量。
+    "飞书凭证字面量（键名 + 值）": re.compile(
+        r"(?<![0-9A-Za-z_])"
+        r"(?:(?:lark|feishu)[_-]?[A-Za-z0-9_]*?(?:secret|token|password|passwd|key)"
+        r"|spreadsheet[_-]?token|sheet[_-]?token|excel[_-]?id"
+        r"|app[_-]?(?:id|secret))"
+        r"(?![0-9A-Za-z_])"
+        r"[\"']?\s*[:=]\s*"
+        # 豁免 1：值开头出现占位词
+        r"(?![\"']?[0-9A-Za-z._\-]{0,30}(?:your|example|placeholder|change_me"
+        r"|changeme|dummy|fake|sample|xxxx|todo|replace|insert|redacted|here"
+        r"|notset|none)[0-9A-Za-z._\-]{0,30}[\"']?(?=[\s'\",#)]|$))"
+        # 豁免 2：纯点号属性链（变量引用）
+        r"(?![\"']?[0-9A-Za-z_]+(?:\.[0-9A-Za-z_]+)+[\"']?(?=$|[\s,'\"#)]))"
+        r"[\"']?[0-9A-Za-z._\-]{20,64}[\"']?", re.I),
+    # 5) 访问令牌字面量：`t-` 前缀 + 30 位以上 base64url（tenant/user access token）。
+    #    这类令牌**没有键名可依托**（常直接写进命令或 curl 头），只能按值形态拦。
+    #    左边界排除标识符与连字符，避免把 `t-` 当普通分隔符命中。
+    "飞书访问令牌字面量（t- 前缀）": re.compile(
+        r"(?<![0-9A-Za-z_-])t-[A-Za-z0-9]{30,}(?![0-9A-Za-z])", re.I),
 }
 
 # 三源共用契约里的字段名，按 Henry 2026-10-04 决策豁免（RSS 侧填 guid_hash8，
@@ -187,6 +239,154 @@ class TestOpenSourceBoundary(unittest.TestCase):
         # 冒烟：确认正则可编译且至少有一条真的能命中
         hits = sum(1 for rx in BANNED.values() if rx.search("这里有小红书和 bilibili 与 xsec_token"))
         self.assertGreaterEqual(hits, 3, "被禁正则疑似失效（连构造串都命中不了几条）")
+
+
+# ---------------------------------------------------------------------------
+# 正样例的凭证值一律**拼接生成**，不以字面量出现在源码里
+# ---------------------------------------------------------------------------
+# 🔴 **为什么必须拆**（主代理 2026-10-06 验收时发现的设计漏洞）：
+#     `_iter_files()` 里的 `_is_guard_file()` 让**本文件成为全仓库唯一的扫描
+#     豁免路径**（黑名单词表本身必须待在本文件，无法取消豁免）。
+#     于是本文件若混入**真实**凭证，守门会永远显示绿色 —— 而
+#     「写测试时顺手粘一个真实值当用例」是非常自然的行为。
+#     这不是假想：2026-10-05 就发生过同款事故（`test_frontmatter_contract.py`
+#     里混进一个真实的 B 站 UP 主 ID，形态逼真、守门放行，直到人工复核才抓到）。
+#
+# ⚠️ 拆开只是**降低误粘的概率**（完整形态不再连续存在于源码），
+#    **不能替代纪律** —— 真要用真实凭证做用例，就不该用。拆分后的运行时值
+#    仍必须能被规则命中，否则正样例自测会整体落空（假绿）。
+_P_APP = "cli_"                        # 应用 ID 前缀
+_P_OID = "ou_"                         # open_id 前缀
+_P_UN = "on_"                          # union_id 前缀
+_P_TK = "t-"                           # 访问令牌前缀
+_P_FS = "fei" + "shu"                  # 飞书域名（拆两半）
+_P_LS = "lark" + "suite"               # 国际版域名
+_P_SHEETS = "/" + "sheets" + "/"
+_P_SHORT = "/" + "s" + "/"
+_P_BASE = "/" + "base" + "/"
+
+# 键名同样拆开：否则源码里会出现 `LARK_APP_SECRET=aB3x…` 这样的连续完整形态
+_K_SECRET = "LARK_APP_" + "SECRET"
+_K_SECRET_LC = "lark_app_" + "secret"
+_K_APP_ID = "LARK_APP_" + "ID"
+_K_SHEET_TOKEN = "LARK_SPREADSHEET_" + "TOKEN"
+_K_SHEET_TOKEN2 = "SPREADSHEET_" + "TOKEN"
+_K_EXCEL_ID = "excel" + "_id"
+
+
+class TestLarkCredentialRedLine(unittest.TestCase):
+    """飞书凭证红线：**每条新规则都必须既抓得住、又放得过**。
+
+    这不是重复守门测试，而是守门测试自身的**有效性**测试。
+    起因：2026-10-06 加这批规则时，作者自己的正则先后出现过
+    「漏掉一个右括号」和「把键与值之间的赋值符删掉」两次低级错误，
+    两者都表现为**全部漏抓**（守门显示 passed，实际一条都拦不住）。
+    光靠「跑一次守门是绿的」发现不了 —— 守门绿恰恰是因为它没匹配到东西。
+    所以把正反样例固化进测试：规则退化了这里立刻变红。
+
+    本类的正样例（MUST_CATCH）值全部由上面的片段拼接而来，
+    原因见那段注释 —— 本文件是全仓库唯一不被守门扫描的路径。
+    """
+
+    # (规则标签, 应当被拦下的样例)
+    MUST_CATCH = [
+        ("飞书应用 ID", 'APP_ID = "' + _P_APP + "a1b2c3d4e5f6g7h8" + '"'),
+        ("飞书应用 ID", _K_APP_ID + "=" + _P_APP + "a1b2c3d4e5f6g7h8"),
+        ("飞书身份 ID", 'open_id = "' + _P_OID + "29c54c1b377397c90ce105e433ca1506" + '"'),
+        ("飞书身份 ID", "UNION_ID: " + _P_UN + "aabbccddeeff00112233445566778899"),
+        ("飞书表格链接", "见 https://my-org." + _P_FS + ".cn" + _P_SHEETS + "AbCdEf12345"),
+        ("飞书表格链接", "https://my-org." + _P_LS + ".com" + _P_SHORT + "AbCdEf12345"),
+        ("飞书表格链接", "https://my-org." + _P_FS + ".cn" + _P_BASE + "bascnAbCdEf12345"),
+        ("飞书凭证字面量（键名 + 值）", _K_SECRET + "=aB3xY9zQ7mN2pL5kR8vT4wS6dF1gH0j"),
+        ("飞书凭证字面量（键名 + 值）", _K_SECRET + '="aB3xY9zQ7mN2pL5kR8vT4wS6dF1gH0j"'),
+        ("飞书凭证字面量（键名 + 值）", _K_SECRET_LC + ": k7Hg2Lp9Qw3Er5Ty1Ui8Op0As6Df4"),
+        ("飞书凭证字面量（键名 + 值）", _K_SHEET_TOKEN + "=shtcnAbCdEfGhIjKlMnOpQr"),
+        ("飞书凭证字面量（键名 + 值）", _K_SHEET_TOKEN2 + " = AbCdEfGhIjKlMnOpQrStUvWx"),
+        ("飞书凭证字面量（键名 + 值）", _K_EXCEL_ID + ": Qw3Er5Ty1Ui8Op0As6Df4Gh0Jk"),
+        ("飞书访问令牌字面量（t- 前缀）", 'token = "' + _P_TK + "Ab3xY9zQ7mN2pL5kR8vT4wS6dF1gH0jKl" + '"'),
+        ("飞书访问令牌字面量（t- 前缀）", _P_TK + "9Kq2Lm5Np8Rt1Vw4Xz7Bc3Df6Gh0Jk2"),
+    ]
+
+    # 合法实现代码 / 文档占位符：**绝不能**被判红，否则守门会被整体豁免
+    MUST_PASS = [
+        'lark-cli sheets +csv-put --spreadsheet-token "$TOKEN" --sheet-name "$S"',
+        "lark-cli sheets +csv-put --spreadsheet-token token --sheet-name name",
+        '["sheets", "+csv-put", "--spreadsheet-token", token, "--sheet-name", name]',
+        'os.environ.get("LARK_SPREADSHEET_TOKEN", "")',
+        "LARK_SPREADSHEET_TOKEN = os.environ.get(...)",
+        "lark_sheet_token = cfg.lark_sheet_token",
+        "See https://open.feishu.cn/document for docs",
+        "域名为 docs.feishu.cn，用于说明文档",
+        'export PATH="$HOME/.local/bin:$PATH"; lark-cli whoami',
+        "LARK_APP_SECRET=<从飞书开放平台获取>",
+        "LARK_SPREADSHEET_TOKEN=",
+        "LARK_APP_SECRET=your-app-secret-here",
+        "LARK_SPREADSHEET_TOKEN=your-spreadsheet-token",
+        "LARK_APP_SECRET=xxxxxxxxxxxxxxxx",
+        "APP_SECRET=changeme",
+        'LARK_APP_SECRET="replace-me-with-real-value"',
+        "token = t-  # 说明",
+    ]
+
+    LARK_LABELS = {
+        "飞书应用 ID",
+        "飞书身份 ID",
+        "飞书表格链接",
+        "飞书凭证字面量（键名 + 值）",
+        "飞书访问令牌字面量（t- 前缀）",
+    }
+
+    def test_every_lark_rule_catches_its_shape(self):
+        """每条飞书规则都要能命中自己的形态 —— 漏抓就是规则已失效。"""
+        missing_rules = self.LARK_LABELS - set(BANNED)
+        self.assertFalse(missing_rules, f"飞书红线规则不见了：{missing_rules}")
+        misses = []
+        for label, sample in self.MUST_CATCH:
+            rx = BANNED.get(label)
+            if rx is None or not rx.search(sample):
+                misses.append(f"[{label}] {sample}")
+        if misses:
+            self.fail("以下形态没被抓到（规则可能已失效）：\n  "
+                      + "\n  ".join(misses))
+
+    def test_lark_rules_do_not_flag_legitimate_code(self):
+        """飞书规则不得误伤功能代码与文档占位符。"""
+        fps = []
+        for sample in self.MUST_PASS:
+            for label in self.LARK_LABELS:
+                rx = BANNED.get(label)
+                if rx and rx.search(sample):
+                    fps.append(f"[{label}] {sample}")
+        if fps:
+            self.fail("以下合法写法被误判（守门会因此被整体豁免）：\n  "
+                      + "\n  ".join(fps))
+
+    def test_guard_source_has_no_credential_shape(self):
+        """本文件源码里**不得出现任何会被飞书红线命中的完整形态**。
+
+        为什么需要这条：本文件是 `_iter_files()` 全仓库**唯一**的扫描豁免路径，
+        混进真实凭证时守门永远绿。正样例因此必须靠拼接生成（见上面注释）。
+        这条把「靠拼接」从约定变成机器拦截 —— 将来谁又粘了个字面量真值进来，
+        这里立刻变红，而不是等到人工复核。
+        """
+        src = GUARD_FILE.read_text(encoding="utf-8")
+        hits = []
+        for label in sorted(self.LARK_LABELS):
+            rx = BANNED.get(label)
+            if not rx:
+                continue
+            for m in rx.finditer(src):
+                line_no = src.count("\n", 0, m.start()) + 1
+                hits.append(f"{line_no}  [{label}] "
+                            f"…{src[max(0, m.start()-30):m.end()+20]!r}")
+        if hits:
+            self.fail(
+                f"守门文件自身出现 {len(hits)} 处飞书凭证形态：\n  "
+                + "\n  ".join(hits[:20])
+                + "\n\n本文件不被守门扫描，等于没有防线。请把值改成拼接生成"
+                  "（参考文件顶部 _P_APP / _K_SECRET 等片段），"
+                  "并确认拼接后的运行时值仍能被规则命中。"
+            )
 
 
 if __name__ == "__main__":
