@@ -37,8 +37,11 @@ from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# scripts → rss-grab → skills → _shared
-sys.path.insert(0, str(SCRIPT_DIR.parent / "_shared"))
+# scripts -> rss-grab -> skills -> _shared（两级 parent，不是一级：少一级会指向
+# 不存在的 rss-grab/_shared，import 在干净进程里直接 ModuleNotFoundError，
+# 而 launchd 恰恰是干净环境）。改完用
+# `python3 -c "import sys;sys.path.insert(0,'<scripts>');import fetch_rss_feed"` 验证。
+sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
 import note_worker  # noqa: E402
 sys.path.insert(0, str(SCRIPT_DIR))
 import parse_rss
