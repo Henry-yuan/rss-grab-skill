@@ -376,7 +376,15 @@ def update_summary(state_path: Path, guid: str, new_summary: str) -> bool:
     state = load_state(state_path)
 
     target = None
-    for zone in ("pending", "confirmed"):
+    # ⚠️ done（已转化）区**也要搜**。摘要更新是幂等的字段替换，与条目处在
+    # 待办还是终态无关 —— 已转化的期数同样可能需要重跑摘要（内容描述变更、
+    # 换 prompt 重跑等）。此前只搜 pending/confirmed，已转化的期数会**静默**
+    # 返回 False，调用方看不出「找不到」和「已转化」的差别
+    # （2026-10-06 试点重跑 20 期，有 3 期因此静默失败）。
+    #
+    # 对比 mark_done：它**不**该搜 done —— 那是从待办推进到终态的操作，
+    # 从终态再取是语义错误。两者搜索范围不同是有意为之，不是漏改。
+    for zone in ("pending", "confirmed", "done"):
         for item in state[zone]:
             if item.get("guid") == guid:
                 target = item

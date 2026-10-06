@@ -246,6 +246,50 @@ def test_update_summary(tmp_path):
     print("✅ test_update_summary")
 
 
+def test_update_summary_done_zone(tmp_path):
+    """已转化区的期数也能重跑摘要（2026-10-06 修：此前只搜 pending/confirmed）。
+
+    回归形状：试点重跑 20 期时，落在已转化区的 3 期**静默返回 False** ——
+    调用方分不清「找不到该期」和「该期已转化」，而 `--retry-summary` 同样中招。
+    """
+    state_path = tmp_path / "test.md"
+    state = sm._empty_state()
+    state["frontmatter"] = {"source": "测试", "feed_url": "https://x", "subscribed_at": "2026-08-11"}
+    state["done"] = [{
+        "checkbox": "[done]",
+        "seq": 7,
+        "title": "已转化那期",
+        "guid": "g-done",
+        "note_path": "notes/x.md",
+        "fields": {"一句话概括": "旧概括", "内容概览": "旧概览"},
+    }]
+    sm.save_state(state_path, state)
+
+    ok = sm.update_summary(state_path, "g-done", "一句话概括：新概括\n内容概览：新概览\n值得关注：⏱02:00 重点")
+    assert ok is True, "已转化区的期数应能重跑摘要"
+
+    loaded = sm.load_state(state_path)
+    # 仍在 done 区、仍是 [done]、note_path 没被改 —— 只该换 fields
+    assert len(loaded["done"]) == 1 and not loaded["pending"] and not loaded["confirmed"]
+    item = loaded["done"][0]
+    assert item["checkbox"] == "[done]"
+    assert item["note_path"] == "notes/x.md"
+    assert item["fields"]["一句话概括"] == "新概括"
+    assert item["fields"]["值得关注"].startswith("⏱02:00")
+    print("✅ test_update_summary_done_zone")
+
+
+def test_update_summary_not_found_still_false(tmp_path):
+    """真的找不到该期时仍返回 False —— 不能因为加了 done 区就变成永真。"""
+    state_path = tmp_path / "test.md"
+    state = sm._empty_state()
+    state["frontmatter"] = {"source": "测试", "feed_url": "https://x", "subscribed_at": "2026-08-11"}
+    state["pending"] = [{"checkbox": "[ ]", "seq": 1, "title": "第一期", "guid": "g1"}]
+    sm.save_state(state_path, state)
+    assert sm.update_summary(state_path, "不存在", "一句话概括：x") is False
+    print("✅ test_update_summary_not_found_still_false")
+
+
 def test_yaml_frontmatter_broken(tmp_path):
     """frontmatter 解析失败不崩，返回空 frontmatter + 正文。"""
     state_path = tmp_path / "test.md"
@@ -465,6 +509,8 @@ if __name__ == "__main__":
         ("test_mark_done", test_mark_done),
         ("test_mark_done_not_found", test_mark_done_not_found),
         ("test_update_summary", test_update_summary),
+        ("test_update_summary_done_zone", test_update_summary_done_zone),
+        ("test_update_summary_not_found_still_false", test_update_summary_not_found_still_false),
         ("test_yaml_frontmatter_broken", test_yaml_frontmatter_broken),
         ("test_add_remove_subscription", test_add_remove_subscription),
         ("test_render_multi_line_field", test_render_multi_line_field),
