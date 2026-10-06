@@ -24,6 +24,11 @@ LOG_FILE="$LOG_DIR/fetch-updates-$(date +%Y%m%d).log"
 # Must be 3.12 (the system /usr/bin/python3 is 3.9.6 and lacks deps).
 PY="/usr/local/bin/python3"
 
+# launchd gives a minimal PATH that does NOT include the pip user-install dir
+# where yt-dlp lives. Without this, the audio download step fails with
+# FileNotFoundError on every nightly run (it is not on Homebrew's PATH either).
+export PATH="$HOME/Library/Python/3.12/bin:$PATH"
+
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 # (comment translated to ASCII; see git history for the Chinese original)
