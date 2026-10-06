@@ -19,10 +19,12 @@
     python3 scripts/generate_note_v3.py --transcript <path> --info <info.json> \\
         --output <note.md> [--work-root <dir>] [--no-typos]
     python3 scripts/generate_note_v3.py <guid_hash8>       # 自动定位
+    python3 scripts/generate_note_v3.py --backfill-index <hash8,...>   # 只补 INDEX 登记
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -51,6 +53,141 @@ def locate(guid_hash8: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path | 
         raise SystemExit(f"❌ 找不到 info.json: {i}")
     n = next(iter(sorted(root.glob(f"rss/notes/**/*-{guid_hash8}.md"))), None)
     return t, i, n
+
+
+# ── 索引补登记（--backfill-index）───────────────────────────────
+# 存在的理由：批量生成时用 --no-index 绕开「多进程并发写同一个 INDEX.md」的
+# 互相覆盖，代价是跑完索引缺一堆登记，得人工补。这个入口只做这一件事：
+# 读**已存在**的笔记 + info.json → 把缺登记的行补进 INDEX.md。
+# 不调 LLM、不跑 ASR、不下载、不改正文、不建无用的空 INDEX。
+BACKFILL_HASH_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _project_root(explicit: str | None = None) -> pathlib.Path:
+    """项目根：显式参数 > 环境变量 > 本仓 checkout 路径（find_project_root 的口径）。"""
+    if explicit:
+        return pathlib.Path(explicit)
+    from paths import find_project_root
+    return find_project_root()
+
+
+@contextlib.contextmanager
+def _project_root_env(root: pathlib.Path):
+    """把项目根同步给「按环境变量定位」的代码，写完立刻还原。
+
+    索引写入函数内部就是按环境变量（或本仓路径）查抓取时间的：显式给了项目根却
+    不同步，日期列会取到另一份数据的抓取时间（取不到则退化为当前时间）。
+    写完必须还原 —— 留着不动等于给整个进程留了个隐式全局副作用。
+    """
+    prev = os.environ.get("CODEX_PROJECT_ROOT")
+    os.environ["CODEX_PROJECT_ROOT"] = str(root)
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("CODEX_PROJECT_ROOT", None)
+        else:
+            os.environ["CODEX_PROJECT_ROOT"] = prev
+
+
+def find_note_by_hash8(notes_dir: pathlib.Path, hash8: str) -> pathlib.Path | None:
+    """按 hash8 精确找已有笔记：文件名必须以 `-<hash8>.md` 结尾。
+
+    只接受精确后缀匹配，找不到就返回 None。**不允许**退化成「取目录里第一个
+    .md」——那会把 A 期的笔记登记到 B 期名下（期号与链接对不上，事后也分不出
+    是哪一期登记错了）。
+    """
+    hits = sorted(p for p in notes_dir.rglob(f"*-{hash8}.md") if p.is_file())
+    return hits[0] if hits else None
+
+
+def find_info_by_hash8(raw_dir: pathlib.Path, hash8: str) -> dict | None:
+    """按 hash8 找 info.json，并核对内容里的期号与文件名一致。"""
+    for p in sorted(raw_dir.glob(f"*-{hash8}.info.json")):
+        try:
+            info = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        # 文件名对而内容里的期号不符，说明这两个文件不是同一期，
+        # 登记出去等于把 A 期的信息写到 B 期行上。
+        if (info.get("item") or {}).get("guid_hash8") == hash8:
+            return info
+    return None
+
+
+def backfill_index(ids: list[str], project_root: str | None = None) -> dict:
+    """只补 INDEX 登记。返回 {"added": [...], "skipped": [...], "failed": [(id, 原因)]}。"""
+    root = _project_root(project_root)
+    notes_dir = root / "rss" / "notes"
+    raw_dir = root / "rss" / "raw"
+    index_path = notes_dir / "INDEX.md"          # 全局单文件，不随节目目录变
+    uniq = list(dict.fromkeys(i.strip() for i in ids if i and i.strip()))
+    print(f"[backfill-index] RSS | 项目根 {root} | 请求 {len(ids)} 个期号"
+          f"（去重后 {len(uniq)}）", flush=True)
+
+    added: list[str] = []
+    skipped: list[str] = []
+    failed: list[tuple[str, str]] = []
+    pending: list[tuple[str, pathlib.Path, dict, str]] = []
+    existing = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+
+    for hash8 in uniq:
+        if not BACKFILL_HASH_RE.match(hash8):
+            failed.append((hash8, "格式不符（应为 8 位小写十六进制期号）"))
+            print(f"  ⚠️ 格式不符，跳过：{hash8}", flush=True)
+            continue
+        if f"| {hash8} |" in existing:
+            skipped.append(hash8)
+            print(f"  ⏭️ 已登记，跳过：{hash8}", flush=True)
+            continue
+        note = find_note_by_hash8(notes_dir, hash8)
+        if note is None:
+            failed.append((hash8, f"找不到笔记 {notes_dir}/**/*-{hash8}.md"))
+            print(f"  ⚠️ 找不到笔记，跳过：{hash8}", flush=True)
+            continue
+        info = find_info_by_hash8(raw_dir, hash8)
+        if info is None:
+            failed.append((hash8, f"找不到 info.json（raw/*-{hash8}.info.json）"))
+            print(f"  ⚠️ 找不到 info.json，跳过：{hash8}", flush=True)
+            continue
+        # 节目名：info 里的节目标题优先；取不到就用笔记所在的节目目录名 ——
+        # 生成时目录名本身就来自同一个字段，两者同源。
+        source_name = ((info.get("feed") or {}).get("title") or "").strip() \
+            or note.parent.name
+        pending.append((hash8, note, info, source_name))
+
+    if pending:
+        try:
+            from append_index import register_rss_index
+        except Exception as e:  # noqa: BLE001
+            # 导入失败不能静默：整批都登记不上却报「补 0 条」，
+            # 调用方会以为「本来就没什么可补」。
+            for hash8, _, _, _ in pending:
+                failed.append((hash8, f"索引写入模块导入失败：{type(e).__name__}: {e}"))
+            pending = []
+        for hash8, note, info, source_name in pending:
+            try:
+                with _project_root_env(root):
+                    res = register_rss_index(info, note, source_name=source_name,
+                                             index_path=index_path)
+            except Exception as e:  # noqa: BLE001
+                failed.append((hash8, f"索引写入失败：{type(e).__name__}: {e}"))
+                print(f"  ⚠️ 写入失败：{hash8} {type(e).__name__}: {e}", flush=True)
+                continue
+            after = index_path.read_text(encoding="utf-8") \
+                if index_path.exists() else ""
+            # 数「补了几条」以**写完后的实际内容**为准，不以写入函数返回什么为准。
+            if f"| {hash8} |" in after:
+                added.append(hash8)
+                print(f"  ✅ 已补登记：{hash8} → {note.name}（{source_name}，"
+                      f"写入返回 {res}）", flush=True)
+            else:
+                failed.append((hash8, f"写入后 INDEX 里仍查不到该期号（返回 {res}）"))
+                print(f"  ⚠️ 写入后仍查不到登记行：{hash8}", flush=True)
+
+    print(f"✅ 补 {len(added)} 条（跳过 {len(skipped)} 条，失败 {len(failed)} 条）",
+          flush=True)
+    return {"added": added, "skipped": skipped, "failed": failed}
 
 
 def _write_atomic(path: pathlib.Path, text: str) -> None:
@@ -116,7 +253,22 @@ def main() -> int:
                          "避免污染生产索引；正式切换时再统一重建）")
     ap.add_argument("--force", action="store_true",
                     help="目标笔记已存在也重新生成（默认跳过，防止白烧 LLM 调用）")
+    ap.add_argument("--backfill-index", metavar="IDS",
+                    help="只补 INDEX 登记，不生成任何内容：传逗号分隔期号，"
+                         "读已存在的笔记把缺的登记补进 INDEX.md。"
+                         "不调 LLM / 不跑 ASR / 不下载 / 不改正文；已登记的自动跳过")
+    ap.add_argument("--project-root", default=None,
+                    help="项目根目录（默认按 find_project_root 定位；"
+                         "补登记时可显式指定，指向真正要改 INDEX 的那份数据）")
     a = ap.parse_args()
+
+    # 补登记分支排在定位/闸门之前：它只读本地文件，一个外部依赖都不需要。
+    if a.backfill_index is not None:
+        ids = [s.strip() for s in a.backfill_index.split(",") if s.strip()]
+        if not ids:
+            ap.error("--backfill-index 至少要一个期号")
+        backfill_index(ids, project_root=a.project_root)
+        return 0
 
     if a.transcript and a.info:
         t, i = a.transcript, a.info

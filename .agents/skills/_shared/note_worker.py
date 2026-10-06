@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import threading
@@ -38,6 +39,9 @@ MAX_CONCURRENCY_CEILING = 10
 
 _SOURCES = ("rss",)
 
+# 各源的笔记生成入口（与 _note_cmd 同一批文件）。rss-only 裁剪版只留 rss。
+_SKILL_DIR = {"rss": "rss-grab"}
+_ENTRY_SCRIPT = {"rss": "generate_note_v3.py"}
 
 def queue_file(source: str) -> pathlib.Path:
     return QUEUE_DIR / f"{source}.jsonl"
@@ -129,6 +133,43 @@ def _one(source: str, item_id: str, timeout: int = 3600) -> tuple[str, bool, str
     return item_id, True, "ok"
 
 
+def _backfill_index(source: str, ids: list[str]) -> tuple[bool, str]:
+    """收割成功后补 INDEX 登记。
+
+    为什么需要这一步：子进程一律传 `--no-index`（并发写同一个索引会互相覆盖），
+    代价就是跑完索引缺登记。没有这一步的话每批跑完都得人工补 —— 已经因此手工
+    补过两次（21 篇、30 篇），同一个洞踩两次就该治。
+
+    各源入口自治（各自有 `--backfill-index`），worker 只负责调度，不碰各源的
+    索引格式与 id 匹配细节。
+    """
+    if not ids:
+        return True, "无成功条目，跳过"
+    entry = _ENTRY_SCRIPT.get(source)
+    skill = _SKILL_DIR.get(source)
+    if not entry or not skill:
+        return False, f"未知源 {source}，无补登记入口"
+    s = PROJECT_ROOT / ".agents" / "skills" / skill / "scripts" / entry
+    if not s.exists():
+        return False, f"入口不存在：{s.name}"
+    cmd = [sys.executable, str(s), "--backfill-index", ",".join(ids)]
+    # rss 入口的 find_project_root() 从 __file__ 反推，而该文件物理上在
+    # opensource 仓（主项目里是软链），不显式指定就会补到**另一个仓**的索引。
+    if source == "rss":
+        cmd += ["--project-root", str(PROJECT_ROOT)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                           cwd=str(PROJECT_ROOT))
+    except subprocess.TimeoutExpired:
+        return False, "补登记超时（不影响已生成的笔记）"
+    if r.returncode != 0:
+        return False, f"补登记退出码 {r.returncode}（不影响已生成的笔记）"
+    for line in (r.stdout or "").splitlines():
+        if "补" in line and "条" in line:
+            return True, line.strip()
+    return True, "已执行"
+
+
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser(description="收割「原料→笔记」队列")
@@ -176,6 +217,10 @@ def main() -> int:
         total_ok += len(done_ok)
         if done_ok:
             write_queue(a.source, [i for i in read_queue(a.source) if i not in set(done_ok)])
+            # 补 INDEX 登记（单进程，此刻无并发冲突）。失败只提示，不影响退出码 ——
+            # 笔记已经生成并落盘，索引可以事后补。
+            bf_ok, bf_msg = _backfill_index(a.source, done_ok)
+            print(f"  📇 索引：{bf_msg}" if bf_ok else f"  ⚠️  索引：{bf_msg}")
         if not a.follow:
             break
 
