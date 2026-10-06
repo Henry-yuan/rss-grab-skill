@@ -643,6 +643,11 @@ def _append_pending_item(state_path: Path, state: dict, item: dict, summary: str
     fields.setdefault("发布日期", format_pub_date(item.get("pub_date", "")))
     fields.setdefault("时长", item.get("duration", ""))
     fields.setdefault("链接", item.get("link", ""))
+    # 2026-10-06：记录「这一期是哪天被我看到的」。
+    # 与「发布日期」是两件事 —— 一期 2024 年的节目可能今天才被拉回来，
+    # 按发布日期排序会把它当成老内容埋掉，导致回看时「不知道哪些是新的」。
+    # 历史条目不回填：它们的真实拉取时刻已不可考，如实留空。
+    fields.setdefault("拉取时间", datetime.now().strftime("%Y-%m-%d %H:%M"))
 
     seq = len(state["pending"]) + len(state["confirmed"]) + len(state["done"]) + 1
     # 无 guid 时持久化去重 key（link 降级），供 collect_known_guids 去重

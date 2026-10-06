@@ -67,9 +67,12 @@ LARK_BIN_CANDIDATES = ("lark-cli", os.path.expanduser("~/.local/bin/lark-cli"))
 # 表格列序（A..I）。顺序即契约，改动会让旧表读不出列。
 COL_SEQ, COL_DATE, COL_DUR, COL_TITLE = "A", "B", "C", "D"
 COL_SUMMARY, COL_OVERVIEW, COL_HIGHLIGHT, COL_LINK = "E", "F", "G", "H"
-COL_STATUS, COL_GUID = "I", "J"
+COL_FETCHED, COL_STATUS, COL_GUID = "I", "J", "K"
+# 「拉取时间」= 这一期是哪天被我看到的（与「发布日期」不同：2024 年的节目可能
+# 今天才被拉回来）。按它排序才能分清「近期新增」和「三个月前的存量」。
+# 历史 580 条没有这个值（真实拉取时刻不可考），留空即可，筛选时「空」也算一类。
 HEADERS = ["序号", "发布日期", "时长", "标题", "一句话概括", "内容概览",
-           "值得关注", "链接", "状态", "guid"]
+           "值得关注", "链接", "拉取时间", "状态", "guid"]
 
 # ⚠️ 上面这组列字母只是**建表时的默认布局**，不是 pull 的依赖。
 # pull 一律先读表头、按**表头名**定位实际列（见 `locate_columns`），
@@ -354,6 +357,7 @@ def build_csv(items: list[dict], with_header: bool = True) -> str:
             pick_field(it, "内容概览"),
             pick_field(it, "值得关注"),
             pick_field(it, "链接"),
+            pick_field(it, "拉取时间"),
             CHECKBOX_TO_STATUS.get(it["checkbox"], "待确认"),
             it["guid"],
         ])

@@ -220,6 +220,38 @@ def test_mark_done_abs_path_relativized(tmp_path):
     print("✅ test_mark_done_abs_path_relativized")
 
 
+def test_fetched_at_optional_roundtrip(tmp_path):
+    """「拉取时间」是可选字段：有值才渲染、读得回来；存量条目保持留空。
+
+    为什么需要它：节目**发布日期**早 ≠ 当时就看到。一期 2024 年的节目可能
+    今天才被拉回来，按发布日期排序会把它当老内容埋掉，回看时「不知道哪些
+    是新的」。而历史 580 条的真实拉取时刻已不可考，如实留空不回填假时间。
+    """
+    state_path = tmp_path / "t.md"
+    state = sm._empty_state()
+    state["frontmatter"] = {"source": "T", "feed_url": "https://x",
+                            "subscribed_at": "2026-10-06", "last_fetched": ""}
+    base = {"发布日期": "2024-03-01", "时长": "40:00", "链接": "https://x/1",
+            "一句话概括": "g", "内容概览": "o", "值得关注": "⏱01:00 x"}
+    state["pending"].append({"checkbox": "[ ]", "seq": 1, "title": "新拉的",
+                            "guid": "g-new", "note_path": "",
+                            "fields": {**base, "拉取时间": "2026-10-06 20:40"}})
+    state["pending"].append({"checkbox": "[ ]", "seq": 2, "title": "旧的",
+                            "guid": "g-old", "note_path": "", "fields": dict(base)})
+    sm.save_state(state_path, state)
+
+    text = state_path.read_text(encoding="utf-8")
+    assert text.count("拉取时间") == 1, "只有有值的条目才渲染该字段（存量条目不该平白多出空行）"
+
+    back = sm.load_state(state_path)
+    assert back["pending"][0]["fields"]["拉取时间"] == "2026-10-06 20:40"
+    assert not back["pending"][1]["fields"].get("拉取时间"), "存量条目应留空，不回填假时间"
+    # 往返不能丢其他字段
+    assert back["pending"][0]["fields"]["值得关注"] == "⏱01:00 x"
+    assert back["pending"][1]["fields"]["一句话概括"] == "g"
+    print("✅ test_fetched_at_optional_roundtrip")
+
+
 def test_update_summary(tmp_path):
     """单期摘要替换：三段写入 fields。"""
     state_path = tmp_path / "test.md"
@@ -508,6 +540,7 @@ if __name__ == "__main__":
         ("test_load_save_roundtrip", test_load_save_roundtrip),
         ("test_mark_done", test_mark_done),
         ("test_mark_done_not_found", test_mark_done_not_found),
+        ("test_fetched_at_optional_roundtrip", test_fetched_at_optional_roundtrip),
         ("test_update_summary", test_update_summary),
         ("test_update_summary_done_zone", test_update_summary_done_zone),
         ("test_update_summary_not_found_still_false", test_update_summary_not_found_still_false),
