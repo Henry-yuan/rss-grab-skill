@@ -155,8 +155,40 @@ python3 scripts/generate_note_for_confirmed.py --all --dry-run  # 只列不调 L
   | `[~]` | 确认不抓 | ❌ 跳过 |
   | `[done]` | 已转化 | ❌ 跳过 |
 
-- LLM 环节默认 5 并发，`--max-parallel N` 可调
-- 幂等：底层 `generate_note_v3.py` 自带防重闸门，重复调用不重复烧额度、不重复追加 INDEX
+### 三步链路（音频 → 转写 → 笔记）
+
+> 2026-10-06 补。此前本脚本只调笔记那一步，而笔记靠转写稿定位源文、
+> 缺源文直接退出 —— 订阅模式下音频和 ASR 两步并不在链路里，
+> 勾了 `[x]` 却没有单独跑过阶段 2 的期数会整批失败。
+
+`generate_note_v3.py` 的源文是 `rss/transcripts/*-<guid_hash8>.transcript.md`。
+本脚本据此把三步串起来，**每步各自判重**：
+
+| 步骤 | 做什么 | 「已做过」的判据 | 复用 |
+|---|---|---|---|
+| 1 音频 | 音频没落盘就下载 | `local.audio_path` 指向的文件存在**且非零字节** | `fetch_rss_feed.download_audio` |
+| 2 转写 | ASR 转写 | `rss/transcripts/*-<hash8>.transcript.md` 存在 | `asr_podcast.transcribe_one` |
+| 3 笔记 | v3 四步管线出笔记 | `generate_note_v3.py` 自带防重闸门 | 子进程 |
+
+- 重跑不会重复下载、不会重复烧 ASR、不会重复消耗 LLM 额度。
+- 转写这步**调函数而不是起子进程**：`asr_podcast.main()` 无论成败都返回 `None`、
+  退出码恒为 0，拿退出码判成败会把转写失败读成成功。函数版直接给原因码。
+- 时长校验（ASR 时长 vs 音频真实时长）与转写内容可信度校验都在
+  `transcribe_one` 内部，本脚本不重复实现。
+- 「退出 0」一律不当作成功：下载后验文件真的落盘且非零字节，
+  转写后验转写稿真的存在。
+
+### 输出与退出码
+
+- 每期一行日志，失败时标出**卡在哪一步**（`音频` / `转写` / `笔记`），
+  收尾再给一行失败分布（例：`失败分布：转写 2 期`）。
+- 汇总四项：`确认抓取 N 期 ｜ ✅ 完成 ｜ ❌ 失败 ｜ ⏭️ 跳过`。
+- 退出码：有失败 → 1；否则 0。（定时任务据此判断本轮是否健康。）
+
+⚠️ `--max-parallel`（默认 5）**同时**作用在下载和 ASR 上。
+mlx-whisper 大模型并发 5 路可能吃满内存；episode 多时建议
+`NOTE_MAX_PARALLEL=2 python3 scripts/generate_note_for_confirmed.py --all` 跑。
+
 - 建议先跑 `--dry-run` 确认清单再实跑
 
 ## 路径约定
