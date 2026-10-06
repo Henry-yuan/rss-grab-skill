@@ -288,12 +288,15 @@ class TestLarkCredentialRedLine(unittest.TestCase):
     原因见那段注释 —— 本文件是全仓库唯一不被守门扫描的路径。
     """
 
+# ⚠️ 本文件里的样例值一律是**人工合成的模式值**（0-f 循环 / AbCdEf 之类），
+#    刻意不使用任何真实环境里出现过的值 —— 本文件是守门唯一不扫描的路径，
+#    真实身份/凭证一旦粘在这里就永远抓不到（2026-10-05 已有同款事故）。
     # (规则标签, 应当被拦下的样例)
     MUST_CATCH = [
         ("飞书应用 ID", 'APP_ID = "' + _P_APP + "a1b2c3d4e5f6g7h8" + '"'),
         ("飞书应用 ID", _K_APP_ID + "=" + _P_APP + "a1b2c3d4e5f6g7h8"),
-        ("飞书身份 ID", 'open_id = "' + _P_OID + "29c54c1b377397c90ce105e433ca1506" + '"'),
-        ("飞书身份 ID", "UNION_ID: " + _P_UN + "aabbccddeeff00112233445566778899"),
+        ("飞书身份 ID", 'open_id = "' + _P_OID + "0123456789abcdef0123456789abcdef" + '"'),
+        ("飞书身份 ID", "UNION_ID: " + _P_UN + "0123456789abcdef0123456789abcdef"),
         ("飞书表格链接", "见 https://my-org." + _P_FS + ".cn" + _P_SHEETS + "AbCdEf12345"),
         ("飞书表格链接", "https://my-org." + _P_LS + ".com" + _P_SHORT + "AbCdEf12345"),
         ("飞书表格链接", "https://my-org." + _P_FS + ".cn" + _P_BASE + "bascnAbCdEf12345"),
