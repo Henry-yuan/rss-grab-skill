@@ -510,9 +510,23 @@ def read_statuses(token: str, sheet: str, n_rows: int) -> dict[str, str]:
     飞书返回的 `actual_range` 决定 —— 少读一行会**静默漏掉最后一期**，
     而症状只是「少改了一条」，极难察觉。
     """
-    status_col, guid_col, _cols = resolve_columns(token, sheet)
-    rng = f"{status_col}1:{guid_col}{max(n_rows, 0) + 1}"
-    with tempfile.TemporaryDirectory() as td:
+    status_col, guid_col, cols = resolve_columns(token, sheet)
+    # ⚠️ 必须从 **A 列**读起，按「绝对列号」索引（row[off] / row[off+span]）。
+    #    此前只请求 `状态列:guid列` 两列，却用从 A 算起的绝对 offset 去索引
+    #    —— 每行只有 2 个元素，row[8]/row[9] 必然越界，于是每行都被
+    #    len(row) <= max(off, off+span) 跳过，**pull 永远返回空**
+    #    （这个 bug 从项目第一天就在，子代理只验证过「失败时不改 md」那条路径）。
+    #    代价是多读几列，换来的是**用户随便拖列序都不会读错**。
+    last_col = cols.get(_GUID_KEY, guid_col)
+    if cols:
+        last_col = max(cols.values(), key=lambda c: (len(c), c))
+    rng = f"A1:{last_col}{max(n_rows, 0) + 1}"
+    # ⚠️ 临时文件必须落在 **/tmp**，不能用 tempfile.TemporaryDirectory()：
+    #    macOS 上它建在 /var/folders/... ，而 lark-cli 的 --output-path 只允许
+    #    「当前工作目录 / /tmp / ~/files」三个根，/var/folders 会被判为
+    #    "unsafe output path" 直接拒绝 —— 表现为 **pull 在 macOS 上 100% 失败**。
+    #    （2026-10-06 首次真跑 pull 时暴露；此前只验证过「失败时不改 md」那条路径。）
+    with tempfile.TemporaryDirectory(dir="/tmp") as td:
         out = Path(td) / "grid.json"
         run_lark(["sheets", "+cells-get",
                   "--spreadsheet-token", token,
@@ -649,6 +663,31 @@ def do_pull(files: list[Path], token_for, dry_run: bool) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def do_sync(files: list[Path], token_for, dry_run: bool) -> None:
+    """**先 pull 再全量 push** —— 重跑摘要后的正确姿势。
+
+    顺序不能反：
+      · 先 force push 的话，用户在飞书上勾过的状态会被全量覆盖重置；
+      · 先 pull 的话，状态回到 md，随后 push 带着「飞书上的状态 + 新的摘要」
+        一起写回，两头都保住。
+
+    pull 与 push 各自独立、幂等；中途失败可以直接重跑本命令。
+    """
+    print("=" * 60)
+    print("第 1/2 步：pull（把飞书上改过的状态写回 md，保护你的勾选）")
+    print("=" * 60)
+    do_pull(files, token_for, dry_run)
+    print()
+    print("=" * 60)
+    print("第 2/2 步：全量 push（带新摘要；状态沿用第 1 步拉回来的）")
+    print("=" * 60)
+    for path in files:
+        items = parse_items(path.read_text(encoding="utf-8"))
+        token, sheet = token_for(path.stem)
+        do_push(items, token, sheet, dry_run, force=True)
+    print("\n✅ sync 完成：状态与摘要都已同步到飞书")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="订阅清单 <-> 飞书表格（可选镜像）。",
@@ -656,20 +695,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, help_text in (("push", "md -> 飞书表格"),
-                            ("pull", "飞书表格状态 -> md（只改 checkbox）")):
+                            ("pull", "飞书表格状态 -> md（只改 checkbox）"),
+                            ("sync", "重跑摘要后的正确姿势：先 pull 保状态，再全量 push")):
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--节目名", dest="show", default=None,
                        help="只处理这一个节目；缺省则处理全部")
         p.add_argument("--dry-run", action="store_true",
                        help="只预览，不连飞书、不改文件")
         p.add_argument("--force", action="store_true",
-                       help="push 才有效：强制全量覆盖。默认只增量写新条目，"
+                       help="push 才有效（sync 内部已含全量）：强制全量覆盖。默认只增量写新条目，"
                             "已存在的行不动（否则会冲掉你在飞书上改过的状态）")
     args = ap.parse_args(argv)
 
     try:
         files = state_files(args.show)
-        if args.cmd == "push":
+        if args.cmd == "sync":
+            do_sync(files, lark_config, args.dry_run)
+        elif args.cmd == "push":
             for path in files:
                 items = parse_items(path.read_text(encoding="utf-8"))
                 token, sheet = lark_config(path.stem)
