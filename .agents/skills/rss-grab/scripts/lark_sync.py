@@ -674,18 +674,36 @@ def do_sync(files: list[Path], token_for, dry_run: bool) -> None:
     pull 与 push 各自独立、幂等；中途失败可以直接重跑本命令。
     """
     print("=" * 60)
-    print("第 1/2 步：pull（把飞书上改过的状态写回 md，保护你的勾选）")
+    print("第 1/3 步：pull（把飞书上改过的状态写回 md，保护你的勾选）")
     print("=" * 60)
     do_pull(files, token_for, dry_run)
     print()
     print("=" * 60)
-    print("第 2/2 步：全量 push（带新摘要；状态沿用第 1 步拉回来的）")
+    print("第 2/3 步：全量 push（带新摘要；状态沿用第 1 步拉回来的）")
     print("=" * 60)
     for path in files:
         items = parse_items(path.read_text(encoding="utf-8"))
         token, sheet = token_for(path.stem)
         do_push(items, token, sheet, dry_run, force=True)
-    print("\n✅ sync 完成：状态与摘要都已同步到飞书")
+    # 第 3 步：按 checkbox 重新归区，消掉「区位置」与「符号」不一致的状态。
+    #   为什么要这步：pull 只换 checkbox、不动条目位置（有意为之，避免重排），
+    #   于是「在飞书勾成 [x] 的条目」会留在「待确认」区、只多了个 [x]，
+    #   而阶段 3 的 pick_confirmed 只扫「确认」区 —— 这类条目会被漏掉。
+    #   fetch_rss_feed.py --sync-pick 早就实现了「按 checkbox 归区」，
+    #   这里只是把它接进 sync 的收尾，不新增任何逻辑。
+    print("\n" + "=" * 60)
+    print("第 3/3 步：按 checkbox 重新归区（保证「区」与「符号」一致）")
+    print("=" * 60)
+    import subprocess
+    for path in files:
+        r = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "fetch_rss_feed.py"),
+             "--sync-pick", str(path)],
+            capture_output=True, text=True, cwd=str(PROJECT_ROOT))
+        tail = [x for x in (r.stdout or "").splitlines() if x.strip().startswith("✅")]
+        print(f"  {path.name}：{tail[-1] if tail else (r.stderr or '').strip()[:80]}")
+
+    print("\n✅ sync 完成：状态已归区、摘要已同步到飞书")
 
 
 def main(argv: list[str] | None = None) -> int:
