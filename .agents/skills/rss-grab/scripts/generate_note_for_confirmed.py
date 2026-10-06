@@ -56,6 +56,7 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -74,6 +75,13 @@ DONE = sm.CHECKBOX_DONE         # "[done]"
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent.parent
 RAW_DIR = PROJECT_ROOT / "rss" / "raw"
 TRANSCRIPTS_DIR = PROJECT_ROOT / "rss" / "transcripts"
+
+# 本地步骤（音频下载 + ASR 转写）必须**全局串行**，与 AGENTS.md 的约定一致：
+# 「本地一律串行（ASR/转码/下载），LLM 环节才允许并发」。
+# 此前 --max-parallel 同时作用在 ASR 上，5 路 mlx-whisper 会把大模型各装一份
+# 进内存，OOM 风险实在；且 Apple Silicon 的 GPU 本就被单个 ASR 占满，并发并不
+# 更快。用 RLock 而非 Lock：转写内部若回调到下载路径也不会自锁。
+_LOCAL_LOCK = threading.RLock()
 
 MAX_PARALLEL = int(
     __import__("os").environ.get("NOTE_MAX_PARALLEL", "5"))
@@ -199,7 +207,8 @@ def ensure_audio(info: dict) -> tuple[bool, str]:
         return True, f"音频已就位（{audio.name}）"
     audio.parent.mkdir(parents=True, exist_ok=True)
     try:
-        ok, err = _download(url, audio)
+        with _LOCAL_LOCK:
+            ok, err = _download(url, audio)
     except Exception as e:
         return False, f"下载调用异常：{type(e).__name__}: {e}"[:200]
     if not ok:
@@ -216,7 +225,8 @@ def ensure_transcript(hash8: str, info_path: Path) -> tuple[bool, str]:
     """步骤 2：调转写。时长校验、内容可信度校验都在 asr_podcast 内部。"""
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        ok, msg = _transcribe(info_path, TRANSCRIPTS_DIR)
+        with _LOCAL_LOCK:
+            ok, msg = _transcribe(info_path, TRANSCRIPTS_DIR)
     except Exception as e:
         return False, f"转写调用异常：{type(e).__name__}: {e}"[:200]
     if not ok:
