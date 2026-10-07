@@ -404,6 +404,37 @@ def _transcript_exists(hash8: str) -> bool:
     return transcript_exists(TRANSCRIPTS_DIR, hash8)
 
 
+def _cleanup_audio(audio_path: Path | None) -> tuple[int, str]:
+    """转写落盘后删掉这一期的音频。返回 (删除数, 说明)。
+
+    🔴 **定时任务这条路以前从不删音频**（2026-10-08 发现）。
+    `fetch_rss_feed.py` 有 `cleanup_audio_files()`，但只挂在手动 CLI 的
+    `--cleanup-audio` 上；阶段 3 这条路径压根没调用过它。
+    实测 2026-10-07 一晚就在 `/tmp/rss-grab-audio` 堆了 **2.0GB / 49 个文件**
+    （其中 43 个是当夜的），按这个速度一周十几 GB。
+
+    删掉是安全的：转写稿 `rss/transcripts/*-<hash8>.transcript.md` 已经落盘，
+    而音频的源站地址在 `rss/raw/*.info.json` 的 enclosure 里（入 git），
+    真要重来可以重下 —— 这本来就是「音频是临时原料」的设计前提
+    （见 SKILL.md「音频存 /tmp，转写后可选清理」）。
+
+    只删**本脚本自己下载的那一个文件**（白名单），不扫目录、
+    不按 glob 删，绝不碰别的会话或手动放进去的东西。
+    """
+    if audio_path is None:
+        return 0, ""
+    try:
+        from fetch_rss_feed import cleanup_audio_files
+        n = cleanup_audio_files([audio_path])
+    except Exception as e:                      # noqa: BLE001
+        # 清理失败绝不能连累笔记产出：音频只是临时原料，留在 /tmp 里
+        # 是空间问题，转写稿没落盘才是真问题。
+        return 0, f"音频清理失败（不影响笔记）：{type(e).__name__}: {e}"[:150]
+    if n:
+        return n, f"已清理音频（{audio_path.name}）"
+    return 0, ""
+
+
 def ensure_audio(info: dict) -> tuple[bool, str]:
     """步骤 1：保证音频已落盘。已存在且非零字节则跳过下载。"""
     url = enclosure_url(info)
@@ -466,17 +497,36 @@ def generate_note(hash8: str) -> tuple[bool, str]:
 
 
 def run_one(hash8: str, dry_run: bool, guid: str = "",
-            feed_url: str = "") -> tuple[bool, str, str]:
+            feed_url: str = "", keep_audio: bool = False) -> tuple[bool, str, str]:
     """跑完一期的完整链路。返回 (是否成功, 卡在哪一步, 日志行)。
 
     `stage` 取值：`完成` / `补拉` / `音频` / `转写` / `笔记` / `预演`，
     失败时一眼能看出断在哪一步，不用翻子进程原始输出。
+
+    `keep_audio=True` 时不删音频（排障用；定时任务默认删，
+    否则每晚净增约 1.8GB，见 `_cleanup_audio`）。
     """
     if dry_run:
         return True, "预演", f"{hash8} [dry-run] 将依次补齐 音频 → 转写 → 笔记"
     steps: list[str] = []
     if _transcript_exists(hash8):
         steps.append("转写稿已存在")
+        # 上一轮下载了音频但没走到转写（或转写后没删）→ 这次是残留。
+        # 转写稿已在盘上，音频已经没有用途了，顺手收掉。
+        if not keep_audio:
+            info_path = find_info_json(hash8)
+            leftover = None
+            if info_path is not None:
+                try:
+                    leftover = audio_path_of(json.loads(
+                        info_path.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    leftover = None
+            n, why = _cleanup_audio(leftover)
+            # ⚠️ 按 `why` 非空判断，不按 `n`：**清理失败时 n=0 但 why 有内容**，
+            # 只看 n 会把「清理失败」这句话一起吞掉，磁盘问题就此静默。
+            if why:
+                steps.append(why)
     else:
         info_path = find_info_json(hash8)
         if info_path is None:
@@ -497,6 +547,10 @@ def run_one(hash8: str, dry_run: bool, guid: str = "",
         if not ok:
             return False, "转写", f"{hash8} {msg}"
         steps.append(msg)
+        if not keep_audio:
+            n, why = _cleanup_audio(audio_path_of(info))
+            if why:
+                steps.append(why)
     ok, msg = generate_note(hash8)
     if not ok:
         return False, "笔记", f"{hash8} {msg}"
@@ -504,7 +558,8 @@ def run_one(hash8: str, dry_run: bool, guid: str = "",
     return True, "完成", f"{hash8} " + " ｜ ".join(steps)
 
 
-def process_state_file(state_path: Path, dry_run: bool) -> dict:
+def process_state_file(state_path: Path, dry_run: bool,
+                         keep_audio: bool = False) -> dict:
     state = sm.load_state(state_path)
     items = pick_confirmed(state)
     print(f"\n=== {state_path.name} ===")
@@ -544,7 +599,7 @@ def process_state_file(state_path: Path, dry_run: bool) -> dict:
     by_stage: dict[str, int] = {}
     feed_url = str((state.get("frontmatter") or {}).get("feed_url") or "")
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
-        futs = {ex.submit(run_one, h, dry_run, g, feed_url): (h, title)
+        futs = {ex.submit(run_one, h, dry_run, g, feed_url, keep_audio): (h, title)
                 for h, title, g in todo}
         results = []
         for fu, (h, title) in futs.items():
@@ -590,6 +645,8 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="遍历订阅表全部源")
     ap.add_argument("--dry-run", action="store_true",
                     help="只列出将要处理的条目，不真的调 LLM")
+    ap.add_argument("--keep-audio", action="store_true",
+                    help="转写后保留 /tmp 下的音频（默认删除；排障或想重听时用）")
     ap.add_argument("--max-parallel", type=int, default=MAX_PARALLEL)
     a = ap.parse_args()
     MAX_PARALLEL = a.max_parallel
@@ -612,7 +669,7 @@ def main() -> int:
         if not f.exists():
             print(f"⚠️ 状态文件不存在：{f}")
             continue
-        r = process_state_file(f, a.dry_run)
+        r = process_state_file(f, a.dry_run, a.keep_audio)
         for k in total:
             total[k] += r[k]
 
@@ -621,6 +678,8 @@ def main() -> int:
           f"｜ ❌ 失败 {total['fail']} ｜ 🏷️ 已转化 {total['marked']}"
           f" ｜ ⏭️ 跳过 {total['skip']}")
     print("注：每期按 音频 → 转写 → 笔记 依次补齐；已有产物自动跳过对应步骤")
+    print("注：转写落盘后自动清理该期音频（enclosure URL 存在 info.json，需要时可重下）"
+          if not a.keep_audio else "注：--keep-audio：保留音频，不清理")
     print("注：已转化区不会被重复处理（防重闸门 + 已转化判定）")
     return 0 if total["fail"] == 0 else 1
 

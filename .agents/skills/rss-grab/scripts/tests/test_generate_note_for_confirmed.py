@@ -656,6 +656,105 @@ def test_mark_done_false_when_hash8_absent_everywhere(tmp_path, monkeypatch):
     assert g.mark_done(p, HASH, "rss/notes/x.md") is False
 
 
+# ── 音频清理（2026-10-08 加）──
+# 定时任务这条路径以前从不删音频：一晚堆 2.0GB / 43 个文件。
+
+def test_audio_is_deleted_after_transcribe(roots, calls, monkeypatch):
+    """转写落盘后音频必须被删 —— 这是「音频是临时原料」这条契约的兑现。"""
+    raw, _ = roots
+    info = write_info(raw)
+    ok, stage, msg = g.run_one(HASH, dry_run=False)
+    assert ok is True, msg
+    assert "已清理音频" in msg
+    assert not pathlib.Path(info["local"]["audio_path"]).exists(), "音频没被删掉"
+
+
+def test_keep_audio_leaves_the_file(roots, calls, monkeypatch):
+    """--keep-audio 时一个字节都不能删（排障 / 想重听时用）。"""
+    raw, _ = roots
+    write_info(raw)
+    ok, _stage, msg = g.run_one(HASH, dry_run=False, keep_audio=True)
+    assert ok is True, msg
+    assert "已清理音频" not in msg
+    p = pathlib.Path(json.loads(
+        (raw / f"标题-{HASH}.info.json").read_text(encoding="utf-8")
+    )["local"]["audio_path"])
+    assert p.is_file() and p.stat().st_size > 0
+
+
+def test_leftover_audio_cleaned_when_transcript_already_exists(roots, calls):
+    """转写稿已在但音频是上一轮残留 → 这次顺手收掉。"""
+    raw, tr = roots
+    info = write_info(raw)
+    pathlib.Path(info["local"]["audio_path"]).parent.mkdir(parents=True)
+    pathlib.Path(info["local"]["audio_path"]).write_bytes(b"x" * 4096)
+    tr.mkdir(parents=True, exist_ok=True)
+    (tr / f"标题-{HASH}.transcript.md").write_text("x", encoding="utf-8")
+    ok, _stage, msg = g.run_one(HASH, dry_run=False)
+    assert ok is True, msg
+    assert "已清理音频" in msg
+    assert not pathlib.Path(info["local"]["audio_path"]).exists()
+
+
+def test_keep_audio_skips_leftover_cleanup_too(roots, calls):
+    """--keep-audio 同样不删残留（否则「保留」名不副实）。"""
+    raw, tr = roots
+    info = write_info(raw)
+    pathlib.Path(info["local"]["audio_path"]).parent.mkdir(parents=True)
+    pathlib.Path(info["local"]["audio_path"]).write_bytes(b"x" * 4096)
+    tr.mkdir(parents=True, exist_ok=True)
+    (tr / f"标题-{HASH}.transcript.md").write_text("x", encoding="utf-8")
+    g.run_one(HASH, dry_run=False, keep_audio=True)
+    assert pathlib.Path(info["local"]["audio_path"]).is_file()
+
+
+def test_cleanup_failure_does_not_fail_the_run(roots, calls, monkeypatch):
+    """清理失败绝不能连累笔记产出 —— 音频只是临时原料，转写稿才是产物。"""
+    raw, _ = roots
+    write_info(raw)
+
+    def boom(path):
+        raise OSError("磁盘只读")
+
+    import fetch_rss_feed
+    monkeypatch.setattr(fetch_rss_feed, "cleanup_audio_files", boom)
+    ok, stage, msg = g.run_one(HASH, dry_run=False)
+    assert ok is True, f"清理失败把整期拖挂了：{msg}"
+    assert stage == "完成"
+    assert "清理失败" in msg            # 但必须如实报出来，不能闷掉
+
+
+def test_cleanup_only_touches_this_episode(roots, calls):
+    """只删自己这一期的音频，别的会话留在同目录的文件不能碰。"""
+    raw, _ = roots
+    info = write_info(raw)
+    stranger = pathlib.Path(info["local"]["audio_path"]).parent / "别人的.m4a"
+    stranger.parent.mkdir(parents=True, exist_ok=True)
+    stranger.write_bytes(b"x" * 128)
+    g.run_one(HASH, dry_run=False)
+    assert stranger.is_file(), "清理误伤了同目录下的其他文件"
+
+
+def test_cleanup_delegates_to_fetch_rss_feed(monkeypatch):
+    """_cleanup_audio 必须走 fetch_rss_feed.cleanup_audio_files（白名单删除）。"""
+    import fetch_rss_feed
+    seen = {}
+
+    def fake(paths):
+        seen["paths"] = [str(p) for p in paths]
+        return len(paths)
+
+    monkeypatch.setattr(fetch_rss_feed, "cleanup_audio_files", fake)
+    n, msg = g._cleanup_audio(pathlib.Path("/tmp/rss-grab-audio/a.m4a"))
+    assert n == 1 and "已清理音频" in msg
+    assert seen["paths"] == ["/tmp/rss-grab-audio/a.m4a"]
+
+
+def test_cleanup_is_a_noop_without_path():
+    """audio_path 为空（info.json 没写）→ 什么都不做，也不报错。"""
+    assert g._cleanup_audio(None) == (0, "")
+
+
 # ── 接线校验：接缝确实指向已有实现，不是另写一套 ──
 
 def test_download_seam_delegates_to_fetch_rss_feed(monkeypatch):
@@ -708,7 +807,7 @@ def test_process_state_file_counts_failures_by_stage(tmp_path, monkeypatch, caps
     monkeypatch.setattr(g, "already_done", lambda s, h: False)
     monkeypatch.setattr(g, "sm", type("S", (), {"load_state": staticmethod(lambda p: {})}))
 
-    def fake_run_one(hash8, dry_run, guid="", feed_url=""):
+    def fake_run_one(hash8, dry_run, guid="", feed_url="", keep_audio=False):
         if hash8 == "aaa":
             return True, "完成", f"{hash8} ok"
         return False, "音频", f"{hash8} yt-dlp 下载失败：HTTP Error 500"
@@ -729,7 +828,7 @@ def test_process_state_file_counts_skip_separately(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "already_done", lambda s, h: h == "aaa")
     monkeypatch.setattr(g, "sm", type("S", (), {"load_state": staticmethod(lambda p: {})}))
 
-    def fake_run_one(hash8, dry_run, guid="", feed_url=""):
+    def fake_run_one(hash8, dry_run, guid="", feed_url="", keep_audio=False):
         return True, "完成", f"{hash8} ok"
 
     monkeypatch.setattr(g, "run_one", fake_run_one)
