@@ -592,6 +592,70 @@ def test_ensure_info_json_picks_the_right_episode(roots, fake_feed):
     assert "别的期数" not in path.name      # 文件名用的是目标那期的标题
 
 
+# ── 标 done：与子进程的既有标记并存 ──
+#
+# 真实故障（2026-10-07 真跑一轮才暴露）：`generate_note_v3.py` 内部
+# 自带 `mark_subscribe_done`，跑完就把条目移进「已转化」区。外层
+# `mark_done` 只扫 confirmed/pending → 找不到 → 返回 False → 汇总报
+# 「本轮标 done：0 期」，**而状态文件其实是对的**。日志说谎。
+
+def _state_with_done_zone(tmp_path, hash8=HASH):
+    """造一份状态文件：条目已在「已转化」区、checkbox 已是 [done]
+    —— 也就是子进程先标好的真实状态。"""
+    p = tmp_path / "节目.md"
+    p.write_text("", encoding="utf-8")
+    state = {
+        "frontmatter": {"source": "节目"},
+        "pending": [],
+        "confirmed": [],
+        "done": [{"title": "标题", "checkbox": "[done]", "guid": "g-1",
+                  "fields": {"guid_hash8": hash8}}],
+    }
+    return p, state
+
+
+def test_mark_done_reports_success_when_already_done_by_subprocess(tmp_path,
+                                                                 monkeypatch):
+    """条目已被子进程标好并移进已转化区 → 仍算「达成」，计数不该是 0。"""
+    p, state = _state_with_done_zone(tmp_path)
+    saved = []
+    monkeypatch.setattr(g, "find_hash8", lambda it: it["fields"]["guid_hash8"])
+    monkeypatch.setattr(g.sm, "load_state", lambda path: state)
+    monkeypatch.setattr(g.sm, "save_state",
+                        lambda path, s: saved.append(1))
+    assert g.mark_done(p, HASH, "rss/notes/x.md") is True
+    # 已经达成就别把状态文件白重写一遍（重写会走一遍渲染，多余且有格式风险）
+    assert saved == []
+
+
+def test_mark_done_writes_when_item_still_pending(tmp_path, monkeypatch):
+    """条目还在确认区、checkbox 不是 [done] → 正常写入并落盘（兜底路径）。"""
+    p, state = _state_with_done_zone(tmp_path)
+    state["done"] = []
+    state["confirmed"] = [{"title": "标题", "checkbox": "[x]", "guid": "g-1",
+                           "fields": {"guid_hash8": HASH}}]
+    saved = []
+    monkeypatch.setattr(g, "find_hash8", lambda it: it["fields"]["guid_hash8"])
+    monkeypatch.setattr(g.sm, "load_state", lambda path: state)
+    monkeypatch.setattr(g.sm, "save_state",
+                        lambda path, s: saved.append(1))
+    assert g.mark_done(p, HASH, "rss/notes/x.md") is True
+    assert saved == [1]
+    assert state["confirmed"][0]["checkbox"] == "[done]"
+    # 🔴 链接必须挂 note_path —— 渲染器只认它，写进 fields 会被静默丢掉
+    assert state["confirmed"][0]["note_path"] == "rss/notes/x.md"
+
+
+def test_mark_done_false_when_hash8_absent_everywhere(tmp_path, monkeypatch):
+    """三区都找不到这一期 → False（真没匹配上，不谎报成功）。"""
+    p, state = _state_with_done_zone(tmp_path, hash8="otherhash")
+    monkeypatch.setattr(g, "find_hash8", lambda it: it["fields"]["guid_hash8"])
+    monkeypatch.setattr(g.sm, "load_state", lambda path: state)
+    monkeypatch.setattr(g.sm, "save_state",
+                        lambda *a: pytest.fail("没匹配上就不该写盘"))
+    assert g.mark_done(p, HASH, "rss/notes/x.md") is False
+
+
 # ── 接线校验：接缝确实指向已有实现，不是另写一套 ──
 
 def test_download_seam_delegates_to_fetch_rss_feed(monkeypatch):

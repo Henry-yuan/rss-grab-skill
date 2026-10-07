@@ -223,12 +223,25 @@ def should_mark_done(hash8: str) -> tuple[bool, str]:
 
 
 def mark_done(state_path: Path, hash8: str, note_rel: str) -> bool:
-    """把这一期在 md 里从 `[x]` 改成 `[done]`，并挂上笔记链接。
+    """确保这一期在 md 里处于 `[done]`，并挂上笔记链接。返回目标状态是否达成。
 
     只在 `should_mark_done` 通过后调用。**不改分区** —— 归区由
     `fetch_rss_feed.py --sync-pick` 统一做（别处已有实现，不重复造）。
     走 sm.load_state/save_state，与 --sync-pick 同一套读写约定
     （临时文件 + replace 原子替换）。
+
+    🔴 **必须连「已转化」区一起找，且已达成时不要重写文件。**
+    真实跑一轮才暴露的问题：这一期**通常已经被子进程标好了** ——
+    `generate_note_v3.py` 内部有自己的 `mark_subscribe_done`，跑完就把条目
+    移进「已转化」区（它会打一行 `订阅状态=已标记 <文件名>`）。
+    而本函数原来只扫 `confirmed` / `pending` 两个区，于是：
+      ① 条目已不在这两个区 → 找不到 → 返回 False → 汇总报「本轮标 done：0 期」，
+         而实际状态文件是对的 —— **日志在说谎**，看日志的人会以为标记功能坏了；
+      ② 更实质的是，「先验证产物够格、再标 done」这道保险被打散了：
+         子进程已经标完了，外层这道复核来得太晚，挡不住任何东西。
+    改成三区都扫 + 幂等之后，本函数退化为「兜底 + 复核」：
+    子进程没标（`--no-index`、状态文件找不到等）时由它补上，
+    已经标好了就只确认、不重复写盘。
     """
     try:
         state = sm.load_state(state_path)
@@ -236,13 +249,14 @@ def mark_done(state_path: Path, hash8: str, note_rel: str) -> bool:
         print(f"  ⚠️  {hash8} 读状态文件失败，未标 done：{e}"[:200])
         return False
     hit = False
-    for zone in ("confirmed", "pending"):
+    changed = False
+    for zone in ("confirmed", "pending", "done"):
         for item in state.get(zone, []):
             if find_hash8(item) != hash8:
                 continue
-            if item.get("checkbox") == "[done]":
-                hit = True
-                continue
+            hit = True
+            if item.get("checkbox") == DONE:
+                continue          # 已是目标状态，不重复写
             item["checkbox"] = DONE
             # 🔴 笔记链接要写进 **item["note_path"]**，不是 fields["笔记"]。
             # 渲染器 `_render_item` 是从 note_path 出「- 笔记：…」这一行的；
@@ -253,9 +267,11 @@ def mark_done(state_path: Path, hash8: str, note_rel: str) -> bool:
             item["note_path"] = note_rel
             fields = item.setdefault("fields", {})
             fields["笔记"] = note_rel
-            hit = True
+            changed = True
     if not hit:
         return False
+    if not changed:
+        return True               # 已达成，别把状态文件白重写一遍
     try:
         sm.save_state(state_path, state)
     except Exception as e:
@@ -557,12 +573,12 @@ def process_state_file(state_path: Path, dry_run: bool) -> dict:
                 SCRIPT_DIR.parent.parent.parent.parent).as_posix()
             if mark_done(state_path, h, rel):
                 marked += 1
-                print(f"  🏷️  {h} 产物达标（{why}）→ 标 [done]")
+                print(f"  🏷️  {h} 产物达标（{why}）→ 已转化")
 
     if by_stage:
         detail = "、".join(f"{k} {v} 期" for k, v in sorted(by_stage.items()))
         print(f"  ⚠️  失败分布：{detail}")
-    print(f"  🏷️  本轮标 done：{marked} 期")
+    print(f"  🏷️  本轮确认已转化：{marked} 期")
     return {"picked": len(items), "ok": ok, "fail": fail, "marked": marked,
             "skip": len(items) - len(todo)}
 
@@ -602,7 +618,7 @@ def main() -> int:
 
     print(f"\n{'='*56}")
     print(f"确认抓取 {total['picked']} 期 ｜ ✅ 完成 {total['ok']} "
-          f"｜ ❌ 失败 {total['fail']} ｜ 🏷️ 标 done {total['marked']}"
+          f"｜ ❌ 失败 {total['fail']} ｜ 🏷️ 已转化 {total['marked']}"
           f" ｜ ⏭️ 跳过 {total['skip']}")
     print("注：每期按 音频 → 转写 → 笔记 依次补齐；已有产物自动跳过对应步骤")
     print("注：已转化区不会被重复处理（防重闸门 + 已转化判定）")
