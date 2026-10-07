@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]      # .agents/skills/_shared/tests/ → 仓库根
@@ -162,7 +163,52 @@ def _is_guard_file(path: pathlib.Path) -> bool:
     return path.resolve() == GUARD_FILE.resolve()
 
 
+# ── 扫描范围：只看 git 真正可能提交进公开仓库的文件 ──
+# 🔴 **2026-10-08 修一个把守门变成噪声的真问题。**
+# 原实现用 `REPO_ROOT.rglob("*")` 扫全盘，**不认 .gitignore**。于是
+# `scripts/typos/*.typos.json`（v3 错字纠正的运行产物）里的纠错理由一旦
+# 提到「小红书」「B 站」就被判红 —— 而那些文件被 `.gitignore` 忽略，
+# **永远不可能进公开仓库**。一次夜间流水线就在仓里落下 32 个这种文件，
+# 守门从此长期红着，每次提交都被卡住。
+#
+# 「开源边界」要拦的是**会泄露的东西**，不是**磁盘上存在的东西**。
+# `git ls-files --cached --others --exclude-standard` 给出的正是
+# 「已跟踪 + 未跟踪但未被忽略」= `git add .` 会带进去的集合。
+#
+# ⚠️ 缩小扫描范围是这个测试最危险的改动（守门文件自己的注释写过
+# 「扫描范围缺后缀是最隐蔽的一类漏洞」）。所以：
+#   ① git 不可用 / 返回非 0 → **退回 rglob 全盘扫描**（宁可误报不可漏报）；
+#   ② `_test_gitignored_file_is_skipped_but_tracked_one_is_not` 锁住这个行为：
+#      被忽略的含禁词文件**不报**，未被忽略的含禁词文件**照报**。
+#   ③ 改完必须跑突变验证：把 gitignore 判定改回「全盘」，测试必须变红。
+_GIT_CACHE: dict = {}          # {"value": set|None}；dict 而非 list 是为了能区分「没算过」
+
+
+def _reset_git_cache() -> None:
+    _GIT_CACHE.clear()
+
+
+def _git_visible_files() -> set[pathlib.Path] | None:
+    """git 眼中会被提交的绝对路径集合；拿不到返回 None（调用方退回全盘）。"""
+    if "value" in _GIT_CACHE:
+        return _GIT_CACHE["value"]
+    value: set[pathlib.Path] | None = None
+    try:
+        r = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=REPO_ROOT, capture_output=True, timeout=120,
+        )
+        if r.returncode == 0:
+            rel = [p for p in r.stdout.decode("utf-8", "replace").split("\0") if p]
+            value = {(REPO_ROOT / p).resolve() for p in rel}
+    except (OSError, subprocess.SubprocessError):
+        value = None
+    _GIT_CACHE["value"] = value
+    return value
+
+
 def _iter_files():
+    visible = _git_visible_files()
     for p in REPO_ROOT.rglob("*"):
         if not p.is_file() or p.suffix not in SCAN_SUFFIXES:
             continue
@@ -171,6 +217,8 @@ def _iter_files():
         if any(part in {".git", "__pycache__", ".pytest_cache", "output", "scan_work"}
                for part in p.parts):
             continue
+        if visible is not None and p.resolve() not in visible:
+            continue          # 被 gitignore：不可能进公开仓库，不算泄露
         yield p
 
 
@@ -390,6 +438,68 @@ class TestLarkCredentialRedLine(unittest.TestCase):
                   "（参考文件顶部 _P_APP / _K_SECRET 等片段），"
                   "并确认拼接后的运行时值仍能被规则命中。"
             )
+
+
+class TestScanScope(unittest.TestCase):
+    """锁住「扫描范围 = git 真正会提交的集合」这个行为。
+
+    🔴 缩小扫描范围是本文件最危险的改动（见 `_iter_files` 上方注释）。
+    下面三条合起来才完整：**该跳过的要跳过、不该跳过的绝不能放过、
+    判据拿不到时必须退回保守行为**。只测第一条会留下「范围悄悄缩成漏报」的洞。
+    """
+
+    def setUp(self):
+        _reset_git_cache()
+        self.addCleanup(_reset_git_cache)
+
+    def test_gitignored_file_with_banned_word_is_skipped(self):
+        """被 .gitignore 忽略的含禁词文件不进扫描范围（它不会进公开仓库）。"""
+        visible = _git_visible_files()
+        if visible is None:
+            self.skipTest("git 不可用，本用例无意义")
+        ignored = [p for p in REPO_ROOT.rglob("*.typos.json")]
+        if not ignored:
+            self.skipTest("当前没有 typos 运行产物可验")
+        for p in ignored[:3]:
+            self.assertNotIn(p.resolve(), visible,
+                             f"{p.name} 被 gitignore，却出现在可见集合里")
+
+    def test_non_ignored_file_with_banned_word_is_still_caught(self):
+        """未被忽略的含禁词文件**必须**仍然被报出来 —— 防「范围缩小成漏报」。"""
+        self.assertIsNotNone(_git_visible_files())
+        probe = REPO_ROOT / "guard_probe_tmp.md"
+        probe.write_text("这里提到 小红书 与 B 站\n", encoding="utf-8")
+        try:
+            _reset_git_cache()          # 文件状态变了，缓存必须重算
+            self.assertIn(probe.resolve(), _git_visible_files(),
+                          "探针未被忽略却不在可见集合，gitignore 判定有问题")
+            scanned = [p.resolve() for p in _iter_files()]
+            self.assertIn(probe.resolve(), scanned,
+                          "未被忽略的含禁词文件竟没被扫描 —— 守门范围缩得太狠")
+        finally:
+            probe.unlink(missing_ok=True)
+            _reset_git_cache()
+
+    def test_falls_back_to_full_scan_when_git_unavailable(self):
+        """git 判据拿不到时必须**退回全盘扫描**（宁可误报不可漏报）。"""
+        real = subprocess.run
+
+        def boom(*a, **kw):
+            raise OSError("git 不可用（模拟）")
+
+        subprocess.run = boom                     # type: ignore[assignment]
+        try:
+            _reset_git_cache()
+            self.assertIsNone(_git_visible_files(), "git 失败时应返回 None 触发降级")
+            scanned = [p.resolve() for p in _iter_files()]
+            # 降级后必须能看到被 gitignore 的那批文件 —— 这正是降级的意义
+            typos = list(REPO_ROOT.rglob("*.typos.json"))
+            if typos:
+                self.assertIn(typos[0].resolve(), scanned,
+                              "降级路径没有扫到被忽略的文件，等于没有降级")
+        finally:
+            subprocess.run = real                # type: ignore[assignment]
+            _reset_git_cache()
 
 
 if __name__ == "__main__":
