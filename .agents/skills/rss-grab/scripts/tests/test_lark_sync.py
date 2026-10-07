@@ -620,3 +620,82 @@ def test_error_message_masks_base_token(monkeypatch):
                     "--base-token", "SUPERSECRETBASEVALUE"])
     assert "SUPERSECRETBASEVALUE" not in str(e.value)
     assert "***" in str(e.value)
+
+# ---------------------------------------------------------------------------
+# [done] 保护：飞书的旧值不得把已完成的一期打回流水线
+# ---------------------------------------------------------------------------
+
+def _md_with(cb: str, guid: str = "guid-1") -> str:
+    return (f"- {cb} 某期标题 <!-- guid:{guid} -->\n"
+            f"    - guid_hash8：5cd30ce6\n")
+
+
+def test_done_item_is_not_overwritten_by_stale_feishu_status():
+    """🔴 md 里已 [done]，飞书还是旧的「确认抓取」→ **不覆盖**。
+
+    真实故障（2026-10-07）：阶段 4 的 push-status 没跑成（或被人误改）时，
+    飞书留着「确认抓取」，下一次 pull 把它灌回 md，已完成的一期被重新
+    推回流水线 —— 白跑一遍下载与 ASR，最后又被笔记防重闸门挡下。
+    """
+    text = _md_with("[done]")
+    out, changed, hits, notes = L.apply_statuses(text, {"guid-1": "确认抓取"})
+    assert "[done]" in out, "已完成的一期被打回 [x] 了"
+    assert changed == 0
+    assert hits == 1                       # 匹配到了，只是被保护
+    assert notes and "已是已转化" in notes[0]
+
+
+def test_done_is_still_writable_from_feishu_when_it_agrees():
+    """飞书也是「已转化」→ 无需改动（幂等，不算 changed 也不该报保护）。"""
+    text = _md_with("[done]")
+    out, changed, hits, notes = L.apply_statuses(text, {"guid-1": "已转化"})
+    assert changed == 0
+    assert notes == [], "两边一致时不该报保护"
+
+
+def test_protection_does_not_block_other_statuses():
+    """保护只针对 [done]；其余三种状态照常互转，别把同步整体锁死。"""
+    text = _md_with("[x]")
+    out, changed, _hits, notes = L.apply_statuses(text, {"guid-1": "确认不抓"})
+    assert "[~]" in out and changed == 1 and notes == []
+
+
+def test_non_done_item_can_still_be_pulled_back():
+    """非 done 的条目被飞书改状态（如用户把确认抓取改回待确认）必须生效。"""
+    text = _md_with("[x]")
+    out, changed, _hits, _notes = L.apply_statuses(text, {"guid-1": "待确认"})
+    assert "[ ]" in out and changed == 1
+
+
+def test_protection_is_reported_not_silent():
+    """⚠️ 被保护的条目必须出现在 notes 里 —— 静默跳过会让人以为同步没匹配上。"""
+    text = _md_with("[done]")
+    _out, _changed, _hits, notes = L.apply_statuses(text, {"guid-1": "确认抓取"})
+    assert notes, "保护发生了却没有任何提示"
+    joined = " ".join(notes)
+    assert "guid-1" in joined
+    assert "push-status" in joined        # 告诉用户下一步该做什么
+
+
+def test_done_checkbox_constant_matches_status_table():
+    """DONE_CHECKBOX 的值必须与状态表一致。"""
+    assert L.DONE_CHECKBOX == L.STATUS_TO_CHECKBOX["已转化"]
+    assert L.CHECKBOX_TO_STATUS[L.DONE_CHECKBOX] == "已转化"
+
+
+def test_done_checkbox_is_derived_not_hardcoded():
+    """⚠️ 必须**由映射派生**，不能写死字面量。
+
+    只断言「值相等」是抓不住的：把常量改成 `DONE_CHECKBOX = "[done]"`
+    之后所有值断言照样通过（变异验证实测：4/5 变红，唯独这条绿的）。
+    真正的风险是**漂移** —— 以后有人把映射里的 `[done]` 改掉，
+    写死的常量会静默失配，done 保护随之无声失效。
+    所以这里断言的是「赋值表达式引用了映射」，不是「值相等」。
+    """
+    import inspect
+    src = inspect.getsource(L)
+    line = next((l for l in src.splitlines()
+                 if l.startswith("DONE_CHECKBOX")), "")
+    assert line, "找不到 DONE_CHECKBOX 的定义"
+    assert "STATUS_TO_CHECKBOX" in line, (
+        f"DONE_CHECKBOX 必须由 STATUS_TO_CHECKBOX 派生，实际写的是：{line!r}")

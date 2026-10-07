@@ -494,6 +494,10 @@ def item_to_fields(item: dict, show: str,
 # 在飞书上刚点的「确认抓取」用 md 里的旧值冲回去 —— 也就是当初把 md
 # 覆盖回飞书的那个 bug，只是方向反了。
 SYSTEM_WRITABLE_STATUS = "已转化"
+# [done] 在 md 里的 checkbox 形态。**从映射派生**，不另写一份字面量：
+# 改了上面那张表却忘了这里，保护逻辑就会跟着错（与 lark_sync 里
+# 「计数与文本必须同一次遍历产出」同源的漂移风险）。
+DONE_CHECKBOX = STATUS_TO_CHECKBOX[SYSTEM_WRITABLE_STATUS]
 
 
 def _differs(want: dict, have: dict) -> bool:
@@ -776,6 +780,19 @@ def apply_statuses(text: str,
     （一个数改了几处、一个造新文本），两份行变换逻辑各写一遍，
     迟早会漂移 —— 于是「说改了 3 条、实际写进去 2 条」这种不一致
     只有跑完几十期之后才暴露，且无法复现。
+
+    🔴 **不覆盖 md 里已是 `[done]` 的条目**（2026-10-08 加）。
+    `[done]` 是**程序判定的**：只有在笔记产物落盘且达标之后才写的，
+    不是用户随手能表达的状态。所以飞书上那条如果是「确认抓取」「待确认」
+    之类的**旧值**（回写没跑到、或被人误改），把它灌回 md 会把已完成的一期
+    重新推回流水线 —— 白跑一遍下载/ASR，还会因为笔记已存在而被防重闸门挡下，
+    看起来「处理了」实则什么都没变。
+
+    这与 `push` 侧的方向性是对称的：`SYSTEM_WRITABLE_STATUS` 保证**只有**
+    「已转化」会被程序写进飞书，反过来 pull 就不该用飞书的值去撤销它。
+
+    ⚠️ **被保护的条目要写进 notes 报出来**，不静默跳过 —— 否则你只会看到
+    「更新 0 条」，完全看不出是保护生效了还是同步压根没匹配上。
     """
     changed = 0
     hits = 0
@@ -792,9 +809,14 @@ def apply_statuses(text: str,
                 if status:
                     hits += 1
                     new_cb = STATUS_TO_CHECKBOX.get(status)
+                    cur_cb = "[" + m.group(2) + "]"
                     if new_cb is None:
                         notes.append(f"未知状态「{status}」-> {guid}（跳过）")
-                    elif new_cb != "[" + m.group(2) + "]":
+                    elif cur_cb == DONE_CHECKBOX and new_cb != DONE_CHECKBOX:
+                        notes.append(
+                            f"{guid} 已是已转化，飞书上仍是「{status}」"
+                            f"（不覆盖；要改请先跑 push-status）")
+                    elif new_cb != cur_cb:
                         # 唯一一处改写：前缀原样、checkbox 换掉、其余逐字保留
                         line = f"{m.group(1)}{new_cb}{m.group(3)}{m.group(4)}"
                         changed += 1
