@@ -21,6 +21,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+import derive_rss_id
+
 # ---------------------------------------------------------------------------
 # 路径常量
 # ---------------------------------------------------------------------------
@@ -765,6 +767,22 @@ def _render_item(item: dict) -> str:
     lines = [f"- {checkbox} {seq_str}{title}{guid_str}"]
 
     fields = item.get("fields", {})
+    # 「guid_hash8」= 派生主键（sha256(guid) 前 8 位），**落盘**而不是每次现算。
+    #
+    # 为什么要存：阶段 3（generate_note_for_confirmed.find_hash8）拿它去定位
+    # info.json / 音频 / 转写稿 / 笔记。原来它只在「rss/raw/*.info.json 里
+    # 已经存在这一期」时才找得到 —— 而 raw/ 里只有 52 条，md 里 580 条。
+    # 于是其余 528 条一旦被勾成 [x]，阶段 3 会**静默跳过**（秒返回、退出码 0、
+    # 日志一行「找不到 guid_hash8，跳过」），看着绿、实际什么都不干。
+    #
+    # 存成**独立字段行**而不是塞进 `<!-- guid:xxx -->` 注释：注释格式是跨脚本
+    # 契约（lark_sync 的 GUID_RE 整段匹配到 ` -->`），往里加第二个键会把
+    # guid 本身读成 "xxx hash8:yyy"。独立字段走 FIELD_RE，解析侧动态、无副作用。
+    hash8 = fields.get("guid_hash8") or (
+        derive_rss_id.guid_to_hash8(guid) if guid else "")
+    if hash8:
+        lines.append(f"    - guid_hash8：{hash8}")
+
     # 「拉取时间」是 2026-10-06 加的可选字段：只有**新拉取**的期数才有值
     # （历史 580 条的真实拉取时刻已不可考，如实留空而不是回填一个假时间）。
     # 它的用途是让人能区分「这期是哪天被我看到的」——节目发布日期早不代表

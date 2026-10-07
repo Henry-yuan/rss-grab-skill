@@ -242,12 +242,33 @@ python3 -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/
 
 ## Roadmap
 
-- [ ] **跨平台 ASR**：Windows / Linux / Intel Mac 支持（faster-whisper / whisper.cpp，不再绑 Apple Silicon）
-- [ ] **桌面 GUI**：基于 Tauri 包装 CLI，降低非技术用户门槛
-- [ ] **更多 LLM 适配**：OpenAI / DeepSeek / Gemini / 本地 Ollama 一键切换（当前需手动配 base_url）
-- [ ] **知识库联动**：Obsidian / Notion / Logseq 笔记自动同步
-- [ ] **英文播客 prompt 模板**：v3 输出结构目前偏中文访谈场景，补英文场景 2-3 套 `USER_TPL` 变体
-- [ ] **GitHub Actions CI**：单测自动跑，发布 release tag
+- [ ] **补建 `rss/raw/*.info.json`**（2026-10-06 定位）：阶段 3 靠 info.json 里的
+      enclosure URL 下载音频，而它只在新拉取时生成。**手工加进状态文件、或早于
+      该机制存在的条目没有它**，于是被勾成 `[x]` 后必然卡在「找不到 info.json」。
+      实测 580 条里只有 52 条有。修法二选一：① `fetch_rss_feed.py --pick-subscribe`
+      先跑一遍补建（它会顺带下音频，与阶段 3 的 `ensure_audio` 重复）② 让
+      `generate_note_for_confirmed.ensure_audio` 在缺 info.json 时回 feed 现场取。
+- [ ] **`scripts/.env` 的飞书凭证键名**：已弃用普通表格，需从 `LARK_SPREADSHEET_TOKEN`
+      / `LARK_SHEET_NAME` 换成 `LARK_BASE_TOKEN` / `LARK_TABLE_ID`（见 SKILL.md）。
+      未换之前 22:30 链路的 stage 2 / stage 4 会各自失败一次（非阻塞，不影响采集）。
+
+### 2026-10-06 夜间定时链路（已上线，22:30 触发）
+
+| 阶段 | 做什么 | 失败是否阻塞 |
+|---|---|---|
+| 1 | `fetch_rss_feed.py --fetch-updates` 拉增量 + AI 摘要 | — |
+| 2 | `lark_sync.py sync`：飞书状态 → md、镜像列对齐、归区 | **否** |
+| 3 | `generate_note_for_confirmed.py --all`：按 `[x]` 抓取转笔记 | — |
+| 4 | `lark_sync.py push-status`：把程序判定的「已转化」回写飞书 | **否** |
+
+- **状态机按「转换」划分归属，不是按字段**（Henry 2026-10-06）：
+  `待确认→确认抓取` / `待确认→确认不抓` 由**用户**在飞书发起，只往 md 走；
+  `确认抓取→已转化` 由**程序**在产物验证通过后发起，只往飞书走。
+  同一个转换只有一个方向，两边永不互相覆盖。
+- **标 done 的判据是「笔记文件已落盘且 ≥1000 字节」，不是「生成脚本退出码为 0」。**
+  生成失败一律保持 `[x]`，当晚不标 done、次晚自动重试。
+- 阶段 2/4 缺 lark-cli、缺凭证、飞书 API 报错，一律记 WARN 后继续 ——
+  飞书是可选视图，采集主链路不能被它拖停。
 
 ## Acknowledgments
 

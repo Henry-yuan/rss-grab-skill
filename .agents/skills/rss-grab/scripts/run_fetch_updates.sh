@@ -99,12 +99,33 @@ else
   log "=== stage 1 FAILED (exit $code), see log above ==="
 fi
 
+# ---- Stage 2: pull Feishu state back into md (optional, NEVER blocking) ----
+# Why here and not after stage 3: stage 3 picks items by scanning the
+# "confirmed" section of the state file. Without this step a checkbox set
+# in Feishu never reaches md, so stage 3 cannot see it at all.
+#
+# FAILURE IS NEVER FATAL. Feishu is an optional view; the collection
+# pipeline must keep working with no lark-cli, no credentials, or a dead
+# API. A broken Feishu degrades to "states stay as they were", never to
+# "nothing gets collected".
+if [ -f "$SCRIPTS/lark_sync.py" ]; then
+  log "=== stage 2: pull Feishu state into md (optional) ==="
+  "$PY" "$SCRIPTS/lark_sync.py" sync >> "$LOG_FILE" 2>&1
+  sync_code=$?
+  if [ "$sync_code" -eq 0 ]; then
+    log "=== stage 2 done (Feishu in sync) ==="
+  else
+    log "WARN: stage 2 returned $sync_code (Feishu unavailable or not configured); continuing anyway"
+  fi
+else
+  log "WARN: lark_sync.py not found under $SCRIPTS; stage 2 skipped (this is fine)"
+fi
+
 # ---- Stage 3: generate notes for items the user marked [x] (T3.3) ----
 # Runs even when stage 1 failed: its input is the state file, not the feed.
 # Only [x] items are processed, so unconfirmed episodes cost nothing.
-# NOTE: keep every comment in this file ASCII-only. Under launchd's UTF-8
-# locale bash splices the following $VAR into what it thinks is a comment
-# and aborts with "unbound variable" (cost us 3 months of silent exit 127).
+# Successful items are flipped to [done] ONLY after the note artifact is
+# verified on disk; a failed generation stays [x] and is retried next night.
 if [ -f "$SCRIPTS/generate_note_for_confirmed.py" ]; then
   log "=== stage 3: notes for confirmed ([x]) items ==="
   "$PY" "$SCRIPTS/generate_note_for_confirmed.py" --all >> "$LOG_FILE" 2>&1
@@ -116,6 +137,22 @@ if [ -f "$SCRIPTS/generate_note_for_confirmed.py" ]; then
   fi
 else
   log "WARN: generate_note_for_confirmed.py not found under $SCRIPTS; stage 3 skipped"
+fi
+
+# ---- Stage 4: push the system-decided [done] states back to Feishu ----
+# Only "converted" is ever written; the other three statuses belong to the
+# user and flow md-ward via stage 2. Also non-fatal.
+if [ -f "$SCRIPTS/lark_sync.py" ]; then
+  log "=== stage 4: push converted ([done]) states to Feishu (optional) ==="
+  "$PY" "$SCRIPTS/lark_sync.py" push-status >> "$LOG_FILE" 2>&1
+  push_code=$?
+  if [ "$push_code" -eq 0 ]; then
+    log "=== stage 4 done ==="
+  else
+    log "WARN: stage 4 returned $push_code (Feishu unavailable); continuing anyway"
+  fi
+else
+  log "WARN: lark_sync.py not found under $SCRIPTS; stage 4 skipped (this is fine)"
 fi
 
 exit $code

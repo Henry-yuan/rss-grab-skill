@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-"""订阅清单 -> 飞书表格的**可选**双向镜像（push / pull）。
+"""订阅清单 -> 飞书多维表格（base / 记录 API）的**可选**双向镜像（push / pull）。
 
 设计前提：**飞书是可选增强，不是依赖。**
     git clone 本仓库的人不装飞书、不配凭证，本脚本根本不会被调用，
     采集链路（fetch_rss_feed.py / run_fetch_updates.sh）行为与本文件无关。
     定时任务 22:30 跑的 run_fetch_updates.sh 只读 md，**完全不碰飞书**。
 
+表结构：一张表
+----------------
+    三个节目**混在同一张表**里，靠「节目」单选字段区分 —— 不是每个节目一张表。
+    这样才能做跨节目的筛选/排序/看板（「近期新增」= 所有节目里最近拉到的）。
+
 字段级分工（结构上消灭冲突：每个字段只归一边管）
 --------------------------------------------------
-    | 字段                                        | 归谁管   | push | pull |
-    |---------------------------------------------|----------|------|------|
-    | 序号/日期/时长/标题/一句话概括/内容概览/链接 | 只读镜像 | 推送 | 不碰  |
-    | 状态（待确认/确认抓取/确认不抓/已转化）      | 飞书可写 | 推送 | 回写 |
-    | guid                                        | 关联键   | 推送 | 只读  |
+    | 字段                                          | 归谁管   | push | pull |
+    |----------------------------------------------|----------|------|------|
+    | 标题/发布日期/一句话概括/内容概览/值得关注/链接 | 只读镜像 | 推送 | 不碰  |
+    | 拉取时间 / 节目 / guid                        | 只读镜像 | 推送 | 只读  |
+    | 状态（待确认/确认抓取/确认不抓/已转化）        | 飞书可写 | 只在**新建**时给初值 | 回写 |
 
-    「pull 绝不写坏非状态列」不是靠自觉，而是靠两层结构性保证：
-      1. pull 只向飞书请求 H/I 两列（状态 + guid），**从不读取**其余列，
-         所以那些列的数据根本不进本进程的内存；
-      2. 回写时只替换条目主行上的 checkbox token，其余字节逐字保留。
+    「状态列归飞书所有」靠结构保证，不靠自觉：
+      1. push 更新已有记录时，**载荷里根本没有状态这个键**——不是「算了不改」，
+         是构造更新载荷时就不放它，改也改不掉；
+      2. 状态只在**新建记录**时写入，取 md 里那条的 checkbox 当初值
+         （新记录还没有人工审阅结果，md 是此刻唯一有依据的那边）。
 
-状态映射（md checkbox <-> 表格状态下拉）
-----------------------------------------
+    「pull 绝不写坏非状态列」同样靠结构：
+      1. pull 只投影 状态 + guid 两列，其余列**不读**——数据不进内存；
+      2. 回写只替换条目主行上的 checkbox token，前缀与后半行逐字保留。
+
+状态映射（md checkbox <-> 单选字段「状态」）
+------------------------------------------
     [ ]    <-> 待确认      [x]    <-> 确认抓取
     [~]    <-> 确认不抓    [done] <-> 已转化
 
@@ -30,12 +40,13 @@
 
 用法
 ----
-    python3 lark_sync.py push [--节目名 X] [--dry-run]
-    python3 lark_sync.py pull [--节目名 X] [--dry-run]
+    python3 lark_sync.py push  [--节目名 X] [--dry-run] [--force]
+    python3 lark_sync.py pull  [--dry-run]
+    python3 lark_sync.py sync  [--dry-run]     # = pull -> push(全量) -> --sync-pick 归区
 
 凭证（**只**从环境变量或 scripts/.env 读，绝不硬编码、绝不写进被跟踪的文件）
-    LARK_SPREADSHEET_TOKEN   表格 token（必填）
-    LARK_SHEET_NAME         子表名（可选，默认取节目名）
+    LARK_BASE_TOKEN    多维表格 token（必填）
+    LARK_TABLE_ID      数据表 table_id（必填，形如 tblXXXX）
     飞书应用自身的鉴权由 lark-cli 自己管理，本脚本不碰 app_id / app_secret。
 
 降级行为
@@ -46,14 +57,14 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import io
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -64,73 +75,29 @@ SUBSCRIBE_DIR = PROJECT_ROOT / "rss" / "订阅"
 # 必须显式补 PATH（与本机其他脚本的同一约定）。
 LARK_BIN_CANDIDATES = ("lark-cli", os.path.expanduser("~/.local/bin/lark-cli"))
 
-# 表格列序（A..I）。顺序即契约，改动会让旧表读不出列。
-COL_SEQ, COL_DATE, COL_DUR, COL_TITLE = "A", "B", "C", "D"
-COL_SUMMARY, COL_OVERVIEW, COL_HIGHLIGHT, COL_LINK = "E", "F", "G", "H"
-COL_FETCHED, COL_STATUS, COL_GUID = "I", "J", "K"
-# 「拉取时间」= 这一期是哪天被我看到的（与「发布日期」不同：2024 年的节目可能
-# 今天才被拉回来）。按它排序才能分清「近期新增」和「三个月前的存量」。
-# 历史 580 条没有这个值（真实拉取时刻不可考），留空即可，筛选时「空」也算一类。
-HEADERS = ["序号", "发布日期", "时长", "标题", "一句话概括", "内容概览",
-           "值得关注", "链接", "拉取时间", "状态", "guid"]
 
-# ⚠️ 上面这组列字母只是**建表时的默认布局**，不是 pull 的依赖。
-# pull 一律先读表头、按**表头名**定位实际列（见 `locate_columns`），
-# 这样用户在飞书上拖动列序、插列、删列都不会让 pull 读错数据。
-# 曾硬编码「状态=H、guid=I」，用户随手拖一下列顺序，pull 就会把标题当状态
-# 写回 md —— 静默、且方向错得离谱。
-_HEADER_KEY = "状态"
-_GUID_KEY = "guid"
+# ---------------------------------------------------------------------------
+# 字段契约
+# ---------------------------------------------------------------------------
+# 全部按**字段名**寻址，不按列序、不按下标。多维表格的列序是用户可以在界面上
+# 拖的，任何「按第 N 列读」的做法都会在用户拖一下之后读错数据。
+COL_STATUS = "状态"      # select，归飞书管
+COL_GUID = "guid"        # text，关联键
+COL_SHOW = "节目"        # select，一张表里区分节目
 
+# 只读镜像列：push 可写、pull 绝不回写。
+MIRROR_TEXT = ("标题", "一句话概括", "内容概览", "值得关注", "链接")
+MIRROR_DATE = ("发布日期", "拉取时间")
+# 顺序即 pull/push 的投影顺序（ndjson 每行是按字段名给的 dict，顺序不影响语义）。
+MIRROR_COLUMNS = ("标题", "发布日期", "值得关注", "链接", "一句话概括",
+                  "内容概览", COL_SHOW, "拉取时间")
+PUSH_COLUMNS = (COL_GUID,) + MIRROR_COLUMNS
 
-def col_letter(idx0: int) -> str:
-    """0 基列号 -> 列字母（0->A, 25->Z, 26->AA）。"""
-    out = ""
-    n = idx0 + 1
-    while n:
-        n, r = divmod(n - 1, 26)
-        out = chr(65 + r) + out
-    return out
-
-
-def locate_columns(token: str, sheet: str) -> dict[str, str]:
-    """读表头行，返回 {表头名: 列字母}。
-
-    读不到表头（空表 / 刚建好的子表只有默认表名）时返回空 dict，
-    调用方据此退回默认列序。
-    """
-    try:
-        raw = run_lark(["sheets", "+cells-get",
-                        "--spreadsheet-token", token,
-                        "--sheet-name", sheet,
-                        "--range", "A1:AZ1"])
-    except SyncError:
-        return {}
-    payload = _loads_or_die(raw)
-    grid = find_grid(payload)
-    if not grid or not grid[0]:
-        return {}
-    out: dict[str, str] = {}
-    for i, cell in enumerate(grid[0]):
-        name = (cell_text(cell) or "").strip()
-        if name and name not in out:      # 同名列取最左边那个
-            out[name] = col_letter(i)
-    return out
-
-
-def resolve_columns(token: str, sheet: str) -> tuple[str, str, dict[str, str]]:
-    """返回 (状态列, guid列, 全部表头映射)。缺列时退回默认并说明。"""
-    cols = locate_columns(token, sheet)
-    if not cols:
-        return COL_STATUS, COL_GUID, cols
-    status = cols.get(_HEADER_KEY, COL_STATUS)
-    guid = cols.get(_GUID_KEY, COL_GUID)
-    missing = [k for k in (_HEADER_KEY, _GUID_KEY) if k not in cols]
-    if missing:
-        print(f"⚠️  {sheet}：表头里找不到 {missing}，退回默认列序"
-              f"（状态={status} guid={guid}）——请检查表头名是否被改过。",
-              file=sys.stderr)
-    return status, guid, cols
+# 一次批量写最多 200 条（飞书侧上限）。
+BATCH_MAX_RECORDS = 200
+# 另外按**字节**兜一刀：内容概览动辄几 KB，200 条能到几百 KB，
+# 走 @file 传参就不会撞命令行长度上限，但单请求体仍该有上限。
+BATCH_MAX_BYTES = 400_000
 
 STATUS_TO_CHECKBOX = {
     "待确认": "[ ]",
@@ -146,9 +113,37 @@ ITEM_RE = re.compile(r"^(-\s*)\[( |x|~|done)\](\s*)(.*)$")
 GUID_RE = re.compile(r"<!--\s*guid:(.*?)\s*-->")
 FIELD_RE = re.compile(r"^\s*-\s*([^：:]+)[：:]\s*(.*)$")
 
+# md 里的日期是**本地墙钟**（「2026-05-05 21:00」），没有时区。
+# 写进 datetime 字段要的是「时刻」，所以必须先按业务时区解释再换算成毫秒。
+# 不做这一步的话，naive 时间会被当成 UTC，差 8 小时。
+try:                                              # pragma: no cover - 环境分支
+    from zoneinfo import ZoneInfo
+    _SHANGHAI = ZoneInfo("Asia/Shanghai")
+except Exception:                                 # pragma: no cover - 缺 tzdata 时兜底
+    _SHANGHAI = timezone(timedelta(hours=8))
+
+_MD_DT_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})"
+                       r"(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$")
+
+# 凭证值只用于**打码**，避免报错信息把 base token 写进终端回滚/日志。
+_SECRETS: list[str] = []
+
+
+def _redact(text: str) -> str:
+    for s in _SECRETS:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
 
 class SyncError(RuntimeError):
     """面向用户的失败。调用方捕获后打印并非零退出，不打栈。"""
+
+
+@dataclass(frozen=True)
+class LarkCfg:
+    base_token: str
+    table_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +171,7 @@ def parse_items(text: str) -> list[dict]:
                 items.append(cur)
             head = m.group(4)
             gm = GUID_RE.search(head)
-            # guid 注释要从标题里摘掉：表格的 guid 本来就是独立一列，
+            # guid 注释要从标题里摘掉：多维表格的 guid 本来就是独立字段，
             # 留在标题里会出现 `标题 <!-- guid:xxx -->` 这种脏数据。
             title = GUID_RE.sub("", head).strip()
             cur = {
@@ -280,20 +275,24 @@ def load_dotenv() -> None:
         os.environ.setdefault(k.strip(), v)
 
 
-def lark_config(stem: str) -> tuple[str, str]:
-    """返回 (spreadsheet_token, sheet_name)。缺配置 -> SyncError（不是栈）。"""
+def lark_config() -> LarkCfg:
+    """返回 (base_token, table_id)。缺配置 -> SyncError（不是栈）。"""
     load_dotenv()
-    token = os.environ.get("LARK_SPREADSHEET_TOKEN", "").strip()
-    if not token:
+    base = os.environ.get("LARK_BASE_TOKEN", "").strip()
+    table = os.environ.get("LARK_TABLE_ID", "").strip()
+    missing = [k for k, v in (("LARK_BASE_TOKEN", base),
+                              ("LARK_TABLE_ID", table)) if not v]
+    if missing:
         raise SyncError(
-            "未配置 LARK_SPREADSHEET_TOKEN。\n"
-            f"  做法：编辑 {SCRIPT_DIR / '.env'}，填入表格 token；\n"
-            "  或：export LARK_SPREADSHEET_TOKEN=... \n"
-            "  提示：token 是表格链接里 base 与表格标识之间那串字符。\n"
+            f"未配置 {'、'.join(missing)}。\n"
+            f"  做法：编辑 {SCRIPT_DIR / '.env'}，填这两个值；\n"
+            "  或：export LARK_BASE_TOKEN=... && export LARK_TABLE_ID=...\n"
+            "  取值：base_token 是表格链接里 /base/ 后面那串字符；\n"
+            "        table_id 形如 tblXXXX（多维表格里任一数据表的标识）。\n"
             "  这是**可选**功能，不配也不影响采集主链路。"
         )
-    sheet = os.environ.get("LARK_SHEET_NAME", "").strip() or stem
-    return token, sheet
+    _SECRETS[:] = [base]
+    return LarkCfg(base_token=base, table_id=table)
 
 
 def find_lark() -> str:
@@ -319,269 +318,467 @@ def run_lark(args: list[str], stdin_data: str | None = None) -> str:
     try:
         proc = subprocess.run(
             [exe] + args, capture_output=True, text=True,
-            input=stdin_data, env=env, timeout=180,
+            input=stdin_data, env=env, timeout=300,
         )
     except FileNotFoundError as exc:
         raise SyncError(f"无法执行 lark-cli：{exc}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise SyncError(f"lark-cli 超时（180s）：{' '.join(args[:4])} …") from exc
+        raise SyncError(
+            f"lark-cli 超时（300s）：{_redact(' '.join(args[:5]))} …") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise SyncError(
             "lark-cli 调用失败（非零退出）。\n"
-            f"  命令：lark-cli {' '.join(args)}\n"
+            f"  命令：lark-cli {_redact(' '.join(args))}\n"
             f"  退出码：{proc.returncode}\n"
-            f"  摘要：{detail[:600] or '（无输出）'}\n"
-            "  常见原因：未登录/授权过期、表格 token 或子表名不对、权限不足。"
+            f"  摘要：{_redact(detail)[:600] or '（无输出）'}\n"
+            "  常见原因：未登录/授权过期、base_token 或 table_id 不对、权限不足。"
         )
     return proc.stdout
 
 
-def build_csv(items: list[dict], with_header: bool = True) -> str:
-    """生成 CSV。
-
-    `with_header=False` 用于**增量推送**：表头已存在，写进去会覆盖用户
-    可能已经改过的表头文字。
-    """
-    buf = io.StringIO()
-    w = csv.writer(buf, lineterminator="\n")
-    if with_header:
-        w.writerow(HEADERS)
-    for it in items:
-        w.writerow([
-            it["seq"] if it["seq"] is not None else "",
-            pick_field(it, "发布日期"),
-            pick_field(it, "时长"),
-            it["title"],
-            pick_field(it, "一句话概括"),
-            pick_field(it, "内容概览"),
-            pick_field(it, "值得关注"),
-            pick_field(it, "链接"),
-            pick_field(it, "拉取时间"),
-            CHECKBOX_TO_STATUS.get(it["checkbox"], "待确认"),
-            it["guid"],
-        ])
-    return buf.getvalue()
-
-
-def _read_existing(token: str, sheet: str, guid_col: str
-                   ) -> tuple[set[str], int]:
-    """读表里已有的 guid 与表尾行号。
-
-    返回 (已有 guid 集合, 最后非空行号)。表为空时返回 (set(), 0)，
-    调用方据此从第 1 行开始写 —— 也就退化成全量首推。
-    """
-    try:
-        raw = run_lark(["sheets", "+cells-get",
-                        "--spreadsheet-token", token,
-                        "--sheet-name", sheet,
-                        "--range", f"{guid_col}1:{guid_col}5000"])
-    except SyncError:
-        return set(), 0
-    payload = _loads_or_die(raw)
-    grid = find_grid(payload)
-    if not grid:
-        return set(), 0
-    guids: set[str] = set()
-    last = 0
-    for i, row in enumerate(grid, start=1):
-        # ⚠️ 第 1 行是**表头**，它的 guid 列里是字符串 "guid" 而非真 guid。
-        #    不过滤会同时坏两处：① 计数虚高；② 表空时 last_row 至少为 1，
-        #    增量从第 2 行开始写 → **表头永远写不进去**。
-        if i == 1:
-            continue
-        if not row:
-            continue
-        v = cell_text(row[0]).strip()
-        if v and v != _GUID_KEY:      # 再兜一层：表头被挪动过的情况
-            guids.add(v)
-            last = i
-    return guids, last
-
-
-def do_push(items: list[dict], token: str, sheet: str, dry_run: bool,
-            force: bool = False) -> None:
-    """推送。
-
-    **默认增量**：只写表里还没有的 guid，已存在的行一个字都不碰。
-    否则每次全量覆盖都会把用户在飞书上改的状态（确认抓取 / 确认不抓）
-    冲回「待确认」—— 那是用户唯一的审阅成果，覆盖等于销毁。
-
-    `force=True` 才做全量覆盖（建表首推、修表结构时用）。
-    """
-    status_col, guid_col, _cols = resolve_columns(token, sheet)
-
-    to_write, start_row, wrote_header = items, 1, True
-    if not force:
-        existing, last_row = _read_existing(token, sheet, guid_col)
-        if existing:
-            fresh = [it for it in items if it["guid"] not in existing]
-            print(f"→ {sheet}：本地 {len(items)} 条 / 表里已有 {len(existing)} 条 / "
-                  f"新增 {len(fresh)} 条")
-            if not fresh:
-                print("   无新增，跳过（已有行不动，保留你改过的状态）")
-                return
-            to_write, start_row, wrote_header = fresh, last_row + 1, False
-
-    payload = build_csv(to_write, with_header=wrote_header)
-    n = len(to_write)
-    tail = f"，起始行 {start_row}" + ("（FORCE 全量覆盖）" if force and not wrote_header else "")
-    print(f"→ {sheet}：写入 {n} 行{tail}")
-
-    if dry_run:
-        print("\n--- 将写入的表格（dry-run，未调用飞书） ---")
-        for i2, row in enumerate(csv.reader(io.StringIO(payload))):
-            cells = [c[:28] + ("…" if len(c) > 28 else "") for c in row]
-            print(f"  {i2:>4} | " + " | ".join(cells))
-        print("\n--- 将执行的命令 ---")
-        print(f"  lark-cli sheets +csv-put --spreadsheet-token <你的 token> "
-              f"--sheet-name {sheet} --csv - --start-cell A{start_row}")
-        print(f"  lark-cli sheets +dropdown-set --spreadsheet-token <你的 token> "
-              f"--sheet-name {sheet} "
-              f"--range {status_col}{start_row}:{status_col}{start_row + n - 1} "
-              f"--options {json.dumps(STATUS_OPTIONS, ensure_ascii=False)}")
-        return
-
-    # CSV 走 **stdin**（`--csv -`），不用 `@file`：
-    #   `@file` 只接受「当前目录下的相对路径」，传绝对路径会被 lark-cli 拒
-    #   （实测报 invalid file path）；写临时文件到 CWD 又会污染用户目录。
-    #   stdin 无此限制，且 451 行长文本也不会撞命令行长度上限。
-    run_lark(["sheets", "+csv-put",
-              "--spreadsheet-token", token,
-              "--sheet-name", sheet,
-              "--csv", "-",
-              "--start-cell", f"A{start_row}"],
-             stdin_data=payload)
-
-    try:
-        run_lark(["sheets", "+dropdown-set",
-                  "--spreadsheet-token", token,
-                  "--sheet-name", sheet,
-                  "--range", f"{status_col}{start_row}:{status_col}{start_row + n - 1}",
-                  "--options", json.dumps(STATUS_OPTIONS, ensure_ascii=False)])
-    except SyncError as exc:
-        # 数据已经写进去了，只是下拉没挂上 —— 说清楚，别让人以为全失败了。
-        print(f"⚠️  数据已推送，但状态下拉未挂上：{exc}", file=sys.stderr)
-        return
-
-    print("✅ 推送完成（含状态下拉）")
-
-def find_grid(obj, depth: int = 0):
-    """在飞书返回的 JSON 里找出二维单元格数组。
-
-    不同接口版本会把值放在 value / text / 字符串里，包法也不一样。
-    这里做**结构化搜索**而不是认死某条路径：只要找到一个 list-of-list 就用。
-    """
-    if depth > 12:
-        return None
-    if isinstance(obj, list):
-        if obj and all(isinstance(r, list) for r in obj):
-            return obj
-        for r in obj:
-            got = find_grid(r, depth + 1)
-            if got:
-                return got
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            got = find_grid(v, depth + 1)
-            if got:
-                return got
-    return None
-
-
-def cell_text(c) -> str:
-    if c is None:
-        return ""
-    if isinstance(c, str):
-        return c.strip()
-    if isinstance(c, (int, float)):
-        return str(c)
-    if isinstance(c, dict):
-        for k in ("value", "text", "formattedValue", "v"):
-            if k in c:
-                return cell_text(c[k])
-    return ""
-
-
-def read_statuses(token: str, sheet: str, n_rows: int) -> dict[str, str]:
-    """只读状态列 + guid 列，返回 {guid: 状态文字}。
-
-    ⚠️ 行列都**按表头名定位**、行数从飞书实际范围取，不写死列号：
-    用户在飞书上拖动列序 / 插列 / 删列都不影响这里。曾经硬编码
-    「状态=H、guid=I」，拖一下列就会把标题当状态写回 md。
-
-    `n_rows` 只作为**下限**（本地比表里多时以本地为准），实际读多少由
-    飞书返回的 `actual_range` 决定 —— 少读一行会**静默漏掉最后一期**，
-    而症状只是「少改了一条」，极难察觉。
-    """
-    status_col, guid_col, cols = resolve_columns(token, sheet)
-    # ⚠️ 必须从 **A 列**读起，按「绝对列号」索引（row[off] / row[off+span]）。
-    #    此前只请求 `状态列:guid列` 两列，却用从 A 算起的绝对 offset 去索引
-    #    —— 每行只有 2 个元素，row[8]/row[9] 必然越界，于是每行都被
-    #    len(row) <= max(off, off+span) 跳过，**pull 永远返回空**
-    #    （这个 bug 从项目第一天就在，子代理只验证过「失败时不改 md」那条路径）。
-    #    代价是多读几列，换来的是**用户随便拖列序都不会读错**。
-    last_col = cols.get(_GUID_KEY, guid_col)
-    if cols:
-        last_col = max(cols.values(), key=lambda c: (len(c), c))
-    rng = f"A1:{last_col}{max(n_rows, 0) + 1}"
-    # ⚠️ 临时文件必须落在 **/tmp**，不能用 tempfile.TemporaryDirectory()：
-    #    macOS 上它建在 /var/folders/... ，而 lark-cli 的 --output-path 只允许
-    #    「当前工作目录 / /tmp / ~/files」三个根，/var/folders 会被判为
-    #    "unsafe output path" 直接拒绝 —— 表现为 **pull 在 macOS 上 100% 失败**。
-    #    （2026-10-06 首次真跑 pull 时暴露；此前只验证过「失败时不改 md」那条路径。）
-    with tempfile.TemporaryDirectory(dir="/tmp") as td:
-        out = Path(td) / "grid.json"
-        run_lark(["sheets", "+cells-get",
-                  "--spreadsheet-token", token,
-                  "--sheet-name", sheet,
-                  "--range", rng,
-                  "--output-path", str(out)])
-        raw = out.read_text(encoding="utf-8")
-    payload = _loads_or_die(raw)
-
-    grid = find_grid(payload)
-    if not grid:
-        raise SyncError("飞书返回里找不到表格数据（结构与预期不符），已放弃，md 未改动。")
-
-    # grid 每行从 status_col 开始：偏移 = status_col - 'A'
-    off = ord(status_col) - ord("A")
-    span = ord(guid_col) - ord(status_col)
-    out_map: dict[str, str] = {}
-    for row in grid:
-        if len(row) <= max(off, off + span):
-            continue
-        guid = cell_text(row[off + span]).strip()
-        status = cell_text(row[off]).strip()
-        if guid and status:
-            out_map[guid] = status
-    return out_map
-
-
-# ---------------------------------------------------------------------------
-# pull：把状态列写回 md（原子）
-# ---------------------------------------------------------------------------
-
 def _loads_or_die(raw: str):
-    """解析飞书返回的 JSON；失败时抛 SyncError 并明确说「md 未改动」。
-
-    ⚠️ 放在 `cell_text` 之后：`locate_columns` / `_read_existing` 都要用它。
-    曾一度被一段「do_push 到 find_grid 的整段替换」顺手删掉（它正好夹在
-    两者中间），报 NameError —— 教训：**按行区间替换代码前，先确认区间里
-    没有别的东西**。
-    """
+    """解析飞书返回的 JSON；失败时抛 SyncError 并明确说「md 未改动」。"""
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise SyncError(f"无法解析飞书返回的 JSON：{exc}；已放弃，md 未改动。") from exc
 
 
-def apply_statuses(text: str, wanted: dict[str, str]) -> tuple[int, int, list[str]]:
+def read_records(cfg: LarkCfg, columns: tuple[str, ...]) -> list[dict]:
+    """读表，返回每条一个 dict（按**字段名**取，另带 record_id）。
+
+    用 `--format ndjson` 而不是默认的 markdown / json 矩阵：
+      · ndjson 自动分页（580 条要 3 页），不用自己算 offset；
+      · 每行是 `{"guid": ..., "标题": ..., "record_id": "recXXX"}`，
+        **字段名直接是键** —— 于是「不要假设列序」是结构上成立的，
+        不是靠约定；json 矩阵给的只是二维数组，列名要从别处猜。
+
+    临时文件必须落在 /tmp：lark-cli 的 --output 只允许
+    「当前工作目录 / /tmp / ~/files」三个根，macOS 的 tempfile 默认目录
+    /var/folders 会被判 unsafe output path 直接拒。
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="lark-sync-") as td:
+        out = Path(td) / "records.ndjson"
+        args = ["base", "+record-list",
+                "--base-token", cfg.base_token,
+                "--table-id", cfg.table_id]
+        for col in columns:
+            args += ["--field-id", col]
+        args += ["--format", "ndjson", "--output", str(out), "--limit", "2000"]
+        manifest = _loads_or_die(run_lark(args))
+        if manifest.get("has_more"):
+            raise SyncError(
+                f"表内记录超过单次读取上限（已读到 {manifest.get('records_count')} 条"
+                " 仍有更多），为避免只比对一半而**放弃**，md 未改动。")
+        if not out.exists():
+            raise SyncError(
+                "lark-cli 说成功但没产出记录文件，已放弃，md 未改动。")
+        text = out.read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# 取值转换：md <-> 多维表格单元格
+# ---------------------------------------------------------------------------
+
+def md_datetime_to_ms(value: str) -> int | None:
+    """md 里的「YYYY-MM-DD HH:MM」-> 毫秒时间戳；空/认不出 -> None。
+
+    None 的含义是**不要写这个字段**，不是「清空」。datetime 字段传 null 是
+    清空语义，而 md 里没有这个日期时我们并不知道该不该清（如实留空的存量
+    条目不该被抹成今天），所以宁可不写。
+    """
+    m = _MD_DT_RE.match((value or "").strip())
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    hh = int(m.group(4) or 0)
+    mm = int(m.group(5) or 0)
+    ss = int(m.group(6) or 0)
+    try:
+        dt = datetime(y, mo, d, hh, mm, ss, tzinfo=_SHANGHAI)
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def cell_to_ms(value) -> int | None:
+    """把读回来的 datetime 单元格归一成毫秒，便于和 md 侧比对。
+
+    读回来是 ISO 串（带时区），写进去是毫秒整数 —— 不归一就没法判断
+    「到底有没有变」，于是每次 push 都会把全表重写一遍。
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(datetime.fromisoformat(str(value)).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def cell_text(value) -> str:
+    """文本单元格归一成 str（空值统一成 ""，这样 None 与 "" 不会假报差异）。"""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return cell_text(value[0]) if value else ""
+    return str(value)
+
+
+def render_text(value: str) -> str:
+    """md 的多行字段 -> 单元格文本：还原 md 里的 `- ` 项目符号。
+
+    `parse_items` 解析子字段行时会剥掉 `- `（`sub = line.strip().lstrip("- ")`），
+    那是**解析期的归一**，不是「md 里本来就没符号」。多维表格的单元格是
+    多行文本，直接塞归一后的值会把原来的列表结构拍平成一堵字墙。
+
+    单行值**不加符号也不加前导换行** —— 与既有表里的写法一致
+    （实测 580 条 × 标题/链接/一句话概括/内容概览/值得关注，
+    按此规则渲染与表里已有内容逐字相同）。
+    """
+    if not value or "\n" not in value:
+        return value
+    return "\n- " + "\n- ".join(value.split("\n"))
+
+
+def item_to_fields(item: dict, show: str,
+                   with_status: bool = False) -> dict:
+    """md 条目 -> 多维表格字段字典（**只含只读镜像列**，状态另议）。
+
+    `with_status` 的含义随场景不同，这是**状态机归属**的核心：
+
+    | 场景 | with_status | 效果 |
+    |---|---|---|
+    | 新建记录（飞书上还没有这条） | True | 写入 md 的状态当**初值** |
+    | 更新已有记录 | False | 载荷里**没有状态键**，改不掉 |
+
+    另一个场景：程序判定了 `[x] -> [done]`（产物验证通过，见
+    generate_note_for_confirmed.should_mark_done）。那时 md 里已经是
+    `[done]`，要把它送回飞书 —— 走 `push_system_status()`，
+    **不是**这里的 with_status。后者只在「这条记录刚建、还没人审过」时用。
+    """
+    out: dict = {
+        "标题": render_text(item["title"]),
+        "一句话概括": render_text(pick_field(item, "一句话概括")),
+        "内容概览": render_text(pick_field(item, "内容概览")),
+        "值得关注": render_text(pick_field(item, "值得关注")),
+        "链接": render_text(pick_field(item, "链接")),
+        # 单选字段的值必须是**单元素数组**，传裸字符串会被拒。
+        COL_SHOW: [show],
+        COL_GUID: item["guid"],
+    }
+    for col in MIRROR_DATE:
+        ms = md_datetime_to_ms(pick_field(item, col))
+        if ms is not None:
+            out[col] = ms
+    if with_status:
+        out[COL_STATUS] = [CHECKBOX_TO_STATUS.get(item["checkbox"], "待确认")]
+    return out
+
+
+# 系统可以写回飞书的状态值 —— **只有这一个**。
+#
+# 状态机的归属按「转换」划分，不是按「字段」划分（Henry 2026-10-06 纠正）：
+#
+#   待确认 -> 确认抓取   用户在飞书上点    数据只往 md 走
+#   待确认 -> 确认不抓   用户在飞书上点    数据只往 md 走
+#   确认抓取 -> 已转化   程序判定产物达标  数据只往飞书走
+#
+# 「同一个转换只有一个方向」—— 所以 push 永远不需要碰用户那三个值，
+# 用户也永远不需要碰「已转化」。两边不会互相覆盖。
+#
+# ⚠️ 为什么不能图省事写成「状态照着 md 推」：那等于允许 push 把用户
+# 在飞书上刚点的「确认抓取」用 md 里的旧值冲回去 —— 也就是当初把 md
+# 覆盖回飞书的那个 bug，只是方向反了。
+SYSTEM_WRITABLE_STATUS = "已转化"
+
+
+def _differs(want: dict, have: dict) -> bool:
+    """want 里有而远端不一致的键，任一即算「要更新」。
+
+    只看 **want 里有的键**：want 里没有的键表示「这次不碰」，不是「删掉」。
+    """
+    for key, val in want.items():
+        if key in MIRROR_DATE:
+            if cell_to_ms(val) != cell_to_ms(have.get(key)):
+                return True
+        elif key == COL_SHOW or key == COL_STATUS:
+            if cell_text(val) != cell_text(have.get(key)):
+                return True
+        else:
+            if cell_text(val) != cell_text(have.get(key)):
+                return True
+    return False
+
+
+def batched_create(items: list[dict]) -> list[list[dict]]:
+    """按「条数 200 + 字节 400K」双上限切批。
+
+    只按条数切会出事：内容概览单条能到几 KB，200 条就是几百 KB 的请求体。
+    """
+    out: list[list[dict]] = []
+    cur: list[dict] = []
+    size = 0
+    for it in items:
+        n = len(json.dumps(it, ensure_ascii=False).encode("utf-8"))
+        if cur and (len(cur) >= BATCH_MAX_RECORDS
+                    or size + n > BATCH_MAX_BYTES):
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(it)
+        size += n
+    if cur:
+        out.append(cur)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# push：md -> 多维表格
+# ---------------------------------------------------------------------------
+
+def do_push(show: str, items: list[dict], cfg: LarkCfg | None,
+            dry_run: bool, force: bool = False) -> dict:
+    """推送。
+
+    **默认增量**：新建表里没有的 guid；已存在且镜像列有出入的才更新。
+    `--force` 跳过逐条比对，把所有已存在记录的镜像列全部重写一遍。
+
+    两种模式**都不碰「状态」列**（状态归飞书管）。sync = 先 pull 再 push，
+    所以「你在飞书上勾的状态」不会被这一步冲回待确认 —— 更准确地说，
+    是 push 根本没往那个字段写东西。
+
+    ⚠️ dry-run 必须在**任何飞书调用之前**返回：比对远端差异本身就要读表，
+    一旦在 dry-run 里读表，「dry-run 不连飞书」这条承诺就是假的
+    （而且用户往往正是靠 dry-run 在没配凭证的机器上预览）。
+    """
+    if dry_run:
+        _print_dry_run(show, items, force)
+        return {"created": 0, "updated": 0}
+
+    remote = read_records(cfg, PUSH_COLUMNS)
+    by_guid: dict[str, dict] = {}
+    dup = 0
+    for rec in remote:
+        guid = cell_text(rec.get(COL_GUID))
+        if not guid:
+            continue
+        if guid in by_guid:
+            dup += 1          # 同一条在表里出现多次：只认第一条，别重复写
+            continue
+        by_guid[guid] = rec
+
+    to_create: list[dict] = []
+    to_update: list[tuple[str, dict]] = []
+    no_guid = 0
+    for it in items:
+        guid = it["guid"]
+        if not guid:
+            no_guid += 1
+            continue
+        want = item_to_fields(it, show, with_status=False)
+        cur = by_guid.get(guid)
+        if cur is None:
+            # 新记录才给状态初值：此刻还没有人工审阅结果，md 是唯一有依据的一边。
+            to_create.append(item_to_fields(it, show, with_status=True))
+        elif force or _differs(want, cur):
+            to_update.append((cell_text(cur.get("record_id")), want))
+
+    print(f"→ {show}：本地 {len(items)} 条 / 表里已有 {len(by_guid)} 条 / "
+          f"新建 {len(to_create)} 条 / 更新 {len(to_update)} 条"
+          + ("（FORCE：镜像列全量重写）" if force else ""))
+    if no_guid:
+        print(f"   ⚠️  {no_guid} 条没有 guid 注释，已跳过"
+              f"（多维表格靠 guid 关联，缺了就对不上）", file=sys.stderr)
+    if dup:
+        print(f"   ⚠️  表里有 {dup} 条 guid 重复，只按第一条处理", file=sys.stderr)
+
+    if not to_create and not to_update:
+        print("   无新增、无镜像列变化，已跳过（不会动你改过的状态）")
+        return {"created": 0, "updated": 0}
+
+    _ensure_show_option(cfg, show)
+
+    created = 0
+    for chunk in batched_create(to_create):
+        _post_payload(cfg, "+record-batch-create", {"create_records": chunk})
+        created += len(chunk)
+        print(f"   新建 {len(chunk)} 条")
+
+    updated = 0
+    for start in range(0, len(to_update), BATCH_MAX_RECORDS):
+        window = to_update[start:start + BATCH_MAX_RECORDS]
+        payload = {"update_records": {rid: fields for rid, fields in window}}
+        _post_payload(cfg, "+record-batch-update", payload)
+        updated += len(window)
+        print(f"   更新 {len(window)} 条")
+
+    print(f"✅ {show}：新建 {created} 条 / 更新 {updated} 条（状态列未被写入）")
+    return {"created": created, "updated": updated}
+
+
+def _print_dry_run(show: str, items: list[dict], force: bool) -> None:
+    """只凭本地 md 打印将要推送的形态，**不连飞书**。
+
+    因此它无法告诉你「远端有没有这条」—— 这是「不连飞书」的必然代价，
+    得说清楚，不能让人以为看到的就是最终结果。
+    """
+    ready = [it for it in items if it["guid"]]
+    print(f"→ {show}：本地 {len(items)} 条（有 guid {len(ready)} 条）"
+          f"｜{'FORCE 模式' if force else '增量模式'}")
+    if len(ready) != len(items):
+        print(f"   ⚠️  {len(items) - len(ready)} 条没有 guid 注释，"
+              f"实跑时会跳过", file=sys.stderr)
+    print("--- 将推送的记录（dry-run，未连接飞书，因此不知道远端是否已有） ---")
+    for it in ready[:10]:
+        st = CHECKBOX_TO_STATUS.get(it["checkbox"], "待确认")
+        print(f"  · 标题：{it['title'][:40]}"
+              f" ｜ 状态初值：{st}"
+              f" ｜ 节目：{show}"
+              f" ｜ 发布日期：{pick_field(it, '发布日期') or '（空，不写该字段）'}")
+    if len(ready) > 10:
+        print(f"  …（另有 {len(ready) - 10} 条）")
+    print("--- 将执行的命令（形态如下，base_token 用占位符） ---")
+    print("  lark-cli base +record-list --base-token <BASE_TOKEN> "
+          "--table-id <TABLE_ID> --field-id <每列一个> "
+          "--format ndjson --output <临时文件> --limit 2000")
+    print("  lark-cli base +record-batch-create --base-token <BASE_TOKEN> "
+          "--table-id <TABLE_ID> --json @<临时文件>")
+    print("  lark-cli base +record-batch-update --base-token <BASE_TOKEN> "
+          "--table-id <TABLE_ID> --json @<临时文件>")
+    print("  注：更新载荷里**没有「状态」这个键**，状态列不会被写。")
+
+
+_SHOW_OPTIONS_CACHE: dict[str, set[str]] = {}
+
+
+def _ensure_show_option(cfg: LarkCfg, show: str) -> None:
+    """新建前确认「节目」单选里有这个选项，否则 API 会报错且信息不直观。
+
+    只在真的要建记录时才查（纯更新不查），读一次缓存在进程内。
+    """
+    key = cfg.table_id
+    if key not in _SHOW_OPTIONS_CACHE:
+        payload = _loads_or_die(run_lark(
+            ["base", "+field-list", "--base-token", cfg.base_token,
+             "--table-id", cfg.table_id, "--format", "json"]))
+        fields = payload.get("data", {}).get("fields", [])
+        opts: set[str] = set()
+        for f in fields:
+            if f.get("name") == COL_SHOW:
+                opts = {o.get("name", "") for o in (f.get("options") or [])}
+        _SHOW_OPTIONS_CACHE[key] = opts
+    if show not in _SHOW_OPTIONS_CACHE[key]:
+        raise SyncError(
+            f"「节目」单选字段里没有选项「{show}」，新建记录会被飞书拒绝。\n"
+            f"  现有选项：{'、'.join(sorted(_SHOW_OPTIONS_CACHE[key])) or '（无）'}\n"
+            f"  做法：在多维表格里手动加一个名为「{show}」的选项。"
+        )
+
+
+def _post_payload(cfg: LarkCfg, command: str, payload: dict) -> None:
+    """把批量载荷写进 /tmp 临时文件，再用 `@file` 传给 --json。
+
+    不用命令行直接传：一期内容概览就能到几 KB，几百条拼起来会撞
+    命令行长度上限（macOS ARG_MAX 约 1MB），症状是莫名其妙的 E2BIG。
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="lark-sync-") as td:
+        f = Path(td) / "payload.json"
+        f.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        run_lark(["base", command,
+                  "--base-token", cfg.base_token,
+                  "--table-id", cfg.table_id,
+                  "--json", f"@{f}"])
+
+
+def push_system_status(files: list[Path], cfg: LarkCfg,
+                       dry_run: bool = False) -> int:
+    """把**程序判定的 `[done]`** 回写到飞书。只写「已转化」，其余一律不碰。
+
+    为什么需要它：用户勾的三个状态由 pull 从飞书带回 md，本来就同步好了；
+    但「这条已经转成笔记了」是**程序**判定的（产物验证通过才标），
+    发生在本地，必须由这里送回飞书，否则飞书上永远停在「确认抓取」。
+
+    🔴 硬约束：只允许写 `已转化`。md 里是「待确认 / 确认抓取 / 确认不抓」
+    的条目**一个都不写** —— 那些是用户的领域，由 pull 单向同步。
+    任何绕过这条的改动都会导致「用户刚点的确认抓取被本地旧值冲掉」。
+
+    返回实际写了的条数。
+    """
+    remote = read_records(cfg, (COL_GUID, COL_STATUS))
+    by_guid: dict[str, dict] = {}
+    for rec in remote:
+        guid = cell_text(rec.get(COL_GUID))
+        if guid:
+            by_guid[guid] = rec
+
+    updates: list[tuple[str, dict]] = []
+    for path in files:
+        for it in parse_items(path.read_text(encoding="utf-8")):
+            if CHECKBOX_TO_STATUS.get(it["checkbox"]) != SYSTEM_WRITABLE_STATUS:
+                continue                      # 非系统状态：跳过，不写
+            guid = it["guid"]
+            rec = by_guid.get(guid)
+            if not rec:
+                continue                      # 飞书上还没有这条，交给普通 push 建
+            rid = cell_text(rec.get("record_id"))
+            if not rid:
+                continue
+            if cell_text(rec.get(COL_STATUS)) == SYSTEM_WRITABLE_STATUS:
+                continue                      # 已经是「已转化」，不必重写
+            updates.append((rid, {COL_STATUS: [SYSTEM_WRITABLE_STATUS]}))
+
+    if not updates:
+        print(f"→ 状态回写：无需更新（飞书上已是「{SYSTEM_WRITABLE_STATUS}」，"
+              f"或其他状态由 pull 单向同步）")
+        return 0
+    print(f"→ 状态回写：{len(updates)} 条标记为「{SYSTEM_WRITABLE_STATUS}」")
+    if dry_run:
+        for rid, f in updates[:5]:
+            print(f"   [dry-run] {rid} -> {cell_text(f[COL_STATUS])}")
+        return 0
+    _post_payload(cfg, "+record-batch-update", {"update_records": dict(updates)})
+    print(f"✅ 已回写 {len(updates)} 条「{SYSTEM_WRITABLE_STATUS}」")
+    return len(updates)
+
+
+# ---------------------------------------------------------------------------
+# pull：把状态列写回 md（原子）
+# ---------------------------------------------------------------------------
+
+def read_statuses(cfg: LarkCfg) -> dict[str, str]:
+    """只投影 状态 + guid 两列，返回 {guid: 状态文字}。
+
+    ⚠️ 投影是这条命令的**结构性保证**：其余列根本不进内存，也就无从回写。
+    一张表里混着三个节目，所以只读一次全表，各节目 md 共用这份结果。
+    """
+    out: dict[str, str] = {}
+    for rec in read_records(cfg, (COL_GUID, COL_STATUS)):
+        guid = cell_text(rec.get(COL_GUID))
+        status = cell_text(rec.get(COL_STATUS))
+        if guid and status:
+            out[guid] = status
+    return out
+
+
+def apply_statuses(text: str,
+                   wanted: dict[str, str]) -> tuple[str, int, int, list[str]]:
     """按 guid 把 checkbox 换掉。**只动条目主行的 checkbox token**。
 
-    返回 (新文本, 改动条数, 未匹配说明列表)。
+    返回 (新文本, 改动条数, 命中条数, 未匹配说明列表)。
+
+    飞书上不认识的 guid 一条都不写：回写完全由 wanted 驱动，
+    不在 wanted 里的条目，主行逐字保留。
+
+    ⚠️ 计数与新文本**必须由同一次遍历产出**：曾经把这两件事拆成两个函数
+    （一个数改了几处、一个造新文本），两份行变换逻辑各写一遍，
+    迟早会漂移 —— 于是「说改了 3 条、实际写进去 2 条」这种不一致
+    只有跑完几十期之后才暴露，且无法复现。
     """
     changed = 0
+    hits = 0
     notes: list[str] = []
     out_lines: list[str] = []
 
@@ -593,6 +790,7 @@ def apply_statuses(text: str, wanted: dict[str, str]) -> tuple[int, int, list[st
                 guid = gm.group(1).strip()
                 status = wanted.get(guid, "")
                 if status:
+                    hits += 1
                     new_cb = STATUS_TO_CHECKBOX.get(status)
                     if new_cb is None:
                         notes.append(f"未知状态「{status}」-> {guid}（跳过）")
@@ -601,7 +799,7 @@ def apply_statuses(text: str, wanted: dict[str, str]) -> tuple[int, int, list[st
                         line = f"{m.group(1)}{new_cb}{m.group(3)}{m.group(4)}"
                         changed += 1
         out_lines.append(line)
-    return "\n".join(out_lines), changed, notes
+    return "\n".join(out_lines), changed, hits, notes
 
 
 def atomic_write(path: Path, new_text: str) -> None:
@@ -619,76 +817,94 @@ def atomic_write(path: Path, new_text: str) -> None:
         raise
 
 
-def do_pull(files: list[Path], token_for, dry_run: bool) -> None:
+def do_pull(files: list[Path], cfg: LarkCfg | None, dry_run: bool) -> None:
+    """把飞书上的状态写回 md。**只改 checkbox**，其余字节逐字保留。"""
+    if dry_run:
+        for path in files:
+            items = parse_items(path.read_text(encoding="utf-8"))
+            todo = sum(1 for i in items if i["checkbox"] != "[done]")
+            print(f"=== {path.name}（dry-run，未连飞书、未改 md）===")
+            print(f"  {len(items)} 条，其中待审（[ ]/[x]/[~]）{todo} 条")
+        print("\n（dry-run：未连接飞书，未改动任何文件）")
+        return
+
+    statuses = read_statuses(cfg)          # 一次读全表；失败在此抛，md 一个字节都没动
+    print(f"→ 飞书读到 {len(statuses)} 条 guid+状态")
+
+    # 「飞书上有、本地没有」要拿**全部节目**的 guid 并集来算。
+    # 拿单个文件的 guid 去减，别的节目的条目会被整片报成「本地没有」——
+    # 三个节目共用一张表时，这个数字会大到吓人（实测 515/447/198），
+    # 而它其实一条都不缺，只是住在另一个 md 里。
+    all_local: set[str] = set()
+    parsed: dict[Path, list[dict]] = {}
+    for path in files:
+        parsed[path] = parse_items(path.read_text(encoding="utf-8"))
+        all_local |= {i["guid"] for i in parsed[path] if i["guid"]}
+    orphan = set(statuses) - all_local
+    if orphan:
+        print(f"   飞书上有 {len(orphan)} 条 guid 在任何本地 md 里都找不到"
+              f"（已忽略，不新建）")
+
     total_changed = 0
     for path in files:
         original = path.read_text(encoding="utf-8")
-        items = parse_items(original)
-        token, sheet = token_for(path.stem)
 
-        if dry_run:
-            print(f"\n=== {path.name}（dry-run，未改 md）===")
-            print(f"  {len(items)} 条，其中待审（[ ]/[x]/[~]）"
-                  f"{sum(1 for i in items if i['checkbox'] != '[done]')} 条")
-            print(f"  将读取列：{COL_STATUS}(状态) + {COL_GUID}(guid)，其余列不读不写")
-            continue
-
-        statuses = read_statuses(token, sheet, len(items))
-        if not statuses:
-            print(f"⚠️  {path.name}：表格里没读到任何 guid+状态，跳过")
-            continue
-
-        new_text, changed, notes = apply_statuses(original, statuses)
+        new_text, changed, hits, notes = apply_statuses(original, statuses)
         for n in notes:
             print(f"  {path.name}: {n}", file=sys.stderr)
 
         if changed == 0:
-            print(f"✅ {path.name}：无变化（{len(statuses)} 个 guid 已对齐）")
-            continue
-        if new_text == original:
-            print(f"✅ {path.name}：无变化")
+            print(f"✅ {path.name}：无变化（{hits} 条已对齐）")
             continue
 
         atomic_write(path, new_text)
         total_changed += changed
         print(f"✅ {path.name}：更新 {changed} 条状态")
-
         print("   接着跑一次归区：")
         print(f"     python3 {SCRIPT_DIR / 'fetch_rss_feed.py'} "
               f"--sync-pick {path}")
 
-    if dry_run:
-        print("\n（dry-run：未连接飞书，未改动任何文件）")
-    else:
-        print(f"\n完成：共更新 {total_changed} 条状态")
+    print(f"\n完成：共更新 {total_changed} 条状态")
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# sync：pull -> push(全量) -> --sync-pick 归区
 # ---------------------------------------------------------------------------
 
-def do_sync(files: list[Path], token_for, dry_run: bool) -> None:
-    """**先 pull 再全量 push** —— 重跑摘要后的正确姿势。
+def do_sync(files: list[Path], cfg: LarkCfg | None, dry_run: bool) -> None:
+    """重跑摘要后的正确姿势。
 
-    顺序不能反：
-      · 先 force push 的话，用户在飞书上勾过的状态会被全量覆盖重置；
-      · 先 pull 的话，状态回到 md，随后 push 带着「飞书上的状态 + 新的摘要」
-        一起写回，两头都保住。
-
-    pull 与 push 各自独立、幂等；中途失败可以直接重跑本命令。
+    顺序不能反：先 pull 把状态收回 md，再 push 把新摘要带上去。
+    （push 本身不写状态列，所以这里即使顺序反了也不会冲掉状态，
+    但先 pull 仍是对的 —— 它保证「飞书上的最新状态」进入本次推送的上下文。）
     """
     print("=" * 60)
-    print("第 1/3 步：pull（把飞书上改过的状态写回 md，保护你的勾选）")
+    print("第 1/4 步：pull（把飞书上改过的状态写回 md）")
     print("=" * 60)
-    do_pull(files, token_for, dry_run)
+    do_pull(files, cfg, dry_run)
+
     print()
     print("=" * 60)
-    print("第 2/3 步：全量 push（带新摘要；状态沿用第 1 步拉回来的）")
+    print("第 2/4 步：push（镜像列增量对齐）")
     print("=" * 60)
-    for path in files:
-        items = parse_items(path.read_text(encoding="utf-8"))
-        token, sheet = token_for(path.stem)
-        do_push(items, token, sheet, dry_run, force=True)
+    if dry_run:
+        for path in files:
+            items = parse_items(path.read_text(encoding="utf-8"))
+            print(f"\n=== {path.name}（dry-run）===")
+            print(f"  本地 {len(items)} 条；将比对的镜像字段：{'、'.join(PUSH_COLUMNS)}")
+        print("\n--- 将执行的命令 ---")
+        print("  lark-cli base +record-batch-create / +record-batch-update "
+              "… --json @<临时文件>")
+        print("  lark-cli python3 scripts/fetch_rss_feed.py --sync-pick <md>")
+    else:
+        for path in files:
+            items = parse_items(path.read_text(encoding="utf-8"))
+            # 增量（force=False）：只写「镜像列确实有出入」的条目。
+            # 原为 force=True（全量重写全表），终态虽相同但每次 sync 要
+            # 重写 580 条；而且 sync 要进 22:30 定时链路，全量等于每晚一次
+            # 无谓的批量写。Henry 2026-10-06 确认为增量。
+            do_push(path.stem, items, cfg, False, force=False)
+
     # 第 3 步：按 checkbox 重新归区，消掉「区位置」与「符号」不一致的状态。
     #   为什么要这步：pull 只换 checkbox、不动条目位置（有意为之，避免重排），
     #   于是「在飞书勾成 [x] 的条目」会留在「待确认」区、只多了个 [x]，
@@ -696,53 +912,77 @@ def do_sync(files: list[Path], token_for, dry_run: bool) -> None:
     #   fetch_rss_feed.py --sync-pick 早就实现了「按 checkbox 归区」，
     #   这里只是把它接进 sync 的收尾，不新增任何逻辑。
     print("\n" + "=" * 60)
-    print("第 3/3 步：按 checkbox 重新归区（保证「区」与「符号」一致）")
+    print("第 3/4 步：按 checkbox 重新归区（保证「区」与「符号」一致）")
     print("=" * 60)
-    import subprocess
+    if dry_run:
+        for path in files:
+            print(f"  {path.name}：将跑 fetch_rss_feed.py --sync-pick（dry-run 未执行）")
+        print("  lark_sync.py lark-cli … 状态回写（dry-run 未执行）")
+        print("\n（dry-run：未连接飞书，未改动任何文件）")
+        return
     for path in files:
         r = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve().parent / "fetch_rss_feed.py"),
+            [sys.executable, str(SCRIPT_DIR / "fetch_rss_feed.py"),
              "--sync-pick", str(path)],
             capture_output=True, text=True, cwd=str(PROJECT_ROOT))
         tail = [x for x in (r.stdout or "").splitlines() if x.strip().startswith("✅")]
         print(f"  {path.name}：{tail[-1] if tail else (r.stderr or '').strip()[:80]}")
 
-    print("\n✅ sync 完成：状态已归区、摘要已同步到飞书")
+    # 第 4 步：把**程序判定的** `[done]` 回写飞书（只写「已转化」）。
+    #   归区之后 md 里 [done] 才是权威位置，这时回写才不会把
+    #   「还在确认区、符号已变」的中间态推上去。
+    print()
+    print("=" * 60)
+    print("第 4/4 步：状态回写（只把程序判定的「已转化」推给飞书）")
+    print("=" * 60)
+    push_system_status(files, cfg)
 
+    print("\n✅ sync 完成：状态已归区、镜像列已对齐、「已转化」已回写")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="订阅清单 <-> 飞书表格（可选镜像）。",
+        description="订阅清单 <-> 飞书多维表格（可选镜像）。",
         epilog="不配凭证 / 不装 lark-cli 都不影响采集主链路。",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, help_text in (("push", "md -> 飞书表格"),
-                            ("pull", "飞书表格状态 -> md（只改 checkbox）"),
-                            ("sync", "重跑摘要后的正确姿势：先 pull 保状态，再全量 push")):
+    for name, help_text in (("push", "md -> 飞书多维表格（新建缺失 + 对齐镜像列）"),
+                            ("pull", "飞书状态 -> md（只改 checkbox）"),
+                            ("sync", "先 pull 保状态，再对齐镜像列，最后归区"),
+                            ("push-status", "把程序判定的「已转化」回写飞书"
+                                            "（22:30 链路 stage 4 专用；"
+                                            "用户那三个状态一律不碰）")):
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--节目名", dest="show", default=None,
                        help="只处理这一个节目；缺省则处理全部")
         p.add_argument("--dry-run", action="store_true",
                        help="只预览，不连飞书、不改文件")
         p.add_argument("--force", action="store_true",
-                       help="push 才有效（sync 内部已含全量）：强制全量覆盖。默认只增量写新条目，"
-                            "已存在的行不动（否则会冲掉你在飞书上改过的状态）")
+                       help="push 才有效：跳过逐条比对，把已存在记录的镜像列全部重写。"
+                            "默认只更新「镜像列有出入」的条目（状态列任何情况下都不写）")
     args = ap.parse_args(argv)
 
     try:
         files = state_files(args.show)
+        # dry-run 连配置都不读：它不连飞书，也就不该因为没配凭证而失败。
+        cfg = None if args.dry_run else lark_config()
         if args.cmd == "sync":
-            do_sync(files, lark_config, args.dry_run)
+            do_sync(files, cfg, args.dry_run)
+        elif args.cmd == "push-status":
+            push_system_status(files, cfg, args.dry_run)
         elif args.cmd == "push":
             for path in files:
                 items = parse_items(path.read_text(encoding="utf-8"))
-                token, sheet = lark_config(path.stem)
-                do_push(items, token, sheet, args.dry_run, force=args.force)
-            print("\n提示：表格需事先手工建好空表，并把表头行保留为第一行。")
+                do_push(path.stem, items, cfg, args.dry_run, force=args.force)
+            if not args.dry_run:
+                print("\n提示：多维表格里「状态」「节目」必须是单选字段、"
+                      "「发布日期」「拉取时间」必须是日期字段，否则写入会被拒。")
         else:
-            # 配置按节目各自取（sheet 名默认=节目名），失败在 do_pull 之前
-            # 就抛出 -> md 一个字节都不会动。
-            do_pull(files, lark_config, args.dry_run)
+            do_pull(files, cfg, args.dry_run)
         return 0
     except SyncError as exc:
         print(f"\n❌ {exc}", file=sys.stderr)
