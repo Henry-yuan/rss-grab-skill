@@ -128,8 +128,22 @@ fi
 # verified on disk; a failed generation stays [x] and is retried next night.
 if [ -f "$SCRIPTS/generate_note_for_confirmed.py" ]; then
   log "=== stage 3: notes for confirmed ([x]) items ==="
-  "$PY" "$SCRIPTS/generate_note_for_confirmed.py" --all >> "$LOG_FILE" 2>&1
-  note_code=$?
+  # Filter out one line of macOS allocator noise. Stage 3 forks a chain of
+  # Python subprocesses (v3 pipeline + mlx); each emits
+  #   Python(<pid>) MallocStackLogging: can't turn off malloc stack logging
+  #   because it was not enabled.
+  # It is harmless (the allocator refused to change a state it was not in),
+  # but it arrives once per note subprocess -- 38 lines in the 2026-10-07 run --
+  # and it drowns out the real summary lines at the end of the log, which is
+  # exactly where you look when a run fails.
+  # awk (not grep) because grep exits 1 when it filters everything, and
+  # `set -o pipefail` would then turn a successful stage into a reported
+  # failure. The stage's own exit code is read from PIPESTATUS[0], so the
+  # filter cannot affect it either way.
+  "$PY" "$SCRIPTS/generate_note_for_confirmed.py" --all 2>&1 \
+    | awk '!/MallocStackLogging: can.t turn off malloc stack logging/' \
+    >> "$LOG_FILE"
+  note_code=${PIPESTATUS[0]}
   if [ "$note_code" -eq 0 ]; then
     log "=== stage 3 done (nothing to do, or all notes ok) ==="
   else
