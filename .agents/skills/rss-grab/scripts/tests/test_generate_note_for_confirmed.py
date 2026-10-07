@@ -60,6 +60,43 @@ def calls(monkeypatch):
     return log
 
 
+@pytest.fixture
+def fake_feed(monkeypatch):
+    """造一份 feed，替掉网络与解析（**不打真实网络**）。
+
+    顺带把 `_FEED_CACHE` 清空 —— 那是模块级全局，不清会串到别的用例，
+    表现为「这个用例里没调 fetch_xml，上一个用例调过」。
+    """
+    import fetch_rss_feed
+    import parse_rss
+
+    guid = "guid-补拉用例-0001"
+    feed = {
+        "title": "节目",
+        "items": [{
+            "title": "第 100 期 标题",
+            "guid": guid,
+            "pub_date": "Mon, 06 Jul 2026 00:00:00 +0800",
+            "duration": "01:02:03",
+            "duration_seconds": 3723,
+            "enclosure": {"url": "http://feed/x.m4a", "type": "audio/mp4",
+                          "length": "1"},
+            "link": "http://feed/e/1",
+        }],
+    }
+    calls = {"fetch_xml": 0}
+
+    def fake_fetch_xml(url):
+        calls["fetch_xml"] += 1
+        return b"<rss/>"
+
+    monkeypatch.setattr(g, "_FEED_CACHE", {})
+    monkeypatch.setattr(fetch_rss_feed, "fetch_xml", fake_fetch_xml)
+    monkeypatch.setattr(parse_rss, "parse_text", lambda b: feed)
+    feed["_fetch_calls"] = calls
+    return feed
+
+
 def write_info(raw, *, hash8=HASH, url="http://feed/audio.m4a",
                enc_type="audio/mp4", audio="auto"):
     """造一份 info.json。`audio` 传 None 表示 local.audio_path 为空；
@@ -364,13 +401,65 @@ def test_run_one_reports_note_stage(roots, calls, monkeypatch):
     assert "源文缺失" in msg
 
 
-def test_run_one_fails_at_audio_when_info_json_missing(roots, calls):
-    """没有 info.json 就没音频地址 → 归到「音频」步，不调用任何接缝。"""
-    ok, stage, msg = g.run_one("deadbeef", dry_run=False)
+def test_run_one_fails_at_fetch_stage_when_info_json_missing_and_guid_unknown(
+        roots, calls):
+    """没有 info.json、条目里又没有 guid → 归到「补拉」步，且不调用任何接缝。
+
+    ⚠️ 这条曾经是「归到音频步」的失败。它在真实数据上是**主要分支**：
+    580 期里 528 期从没下过音频，而订阅状态文件确实带 guid，
+    所以真正的问题不是「信息不够」，而是「没去 feed 取」——
+    判据因此从「能不能找到 info.json」改成「能不能补出来」。
+    """
+    ok, stage, msg = g.run_one("deadbeef", dry_run=False, guid="", feed_url="")
     assert ok is False
-    assert stage == "音频"
-    assert "info.json" in msg
+    assert stage == "补拉"
+    assert "guid" in msg
     assert calls == []
+
+
+def test_run_one_fails_at_fetch_stage_without_feed_url(roots, calls):
+    """没有 feed_url 就无从补拉 → 说清缺的是什么，不猜。"""
+    ok, stage, msg = g.run_one("deadbeef", dry_run=False, guid="g-1", feed_url="")
+    assert ok is False
+    assert stage == "补拉"
+    assert "feed_url" in msg
+    assert calls == []
+
+
+def test_run_one_fails_at_fetch_stage_when_feed_lost_the_episode(roots, calls,
+                                                                fake_feed):
+    """feed 里已没有这一期（源站过保留期）→ 归到「补拉」并如实说明。"""
+    ok, stage, msg = g.run_one("deadbeef", dry_run=False,
+                               guid="不在-feed-里的-guid", feed_url="http://f")
+    assert ok is False
+    assert stage == "补拉"
+    assert "没有这一期" in msg
+    assert calls == []
+
+
+def test_run_one_backfills_info_json_then_runs_full_chain(roots, calls, fake_feed,
+                                                          tmp_path):
+    """🔴 端到端复现真实故障：info.json 缺失时从 feed 补出来，三步全部跑完。
+
+    没有这条，阶段 3 在 528/580 期上永远只会打「找不到 info.json」然后退出。
+
+    hash8 由 guid 现算（`derive_rss_id.guid_to_hash8` 就是生产用的那条路径），
+    不硬编码 —— 硬编码就得找一个「哈希前 8 位正好等于某串」的 guid，
+    那是 32 位，撞不出来，只能靠把实现改成能撞出来，那是自欺。
+    """
+    guid = fake_feed["items"][0]["guid"]
+    h = g.derive_rss_id.guid_to_hash8(guid)
+    import fetch_rss_feed
+    monkey = fetch_rss_feed.TMP_AUDIO_DIR
+    fetch_rss_feed.TMP_AUDIO_DIR = tmp_path / "audio"   # 别往真 /tmp 写
+    try:
+        ok, stage, msg = g.run_one(h, dry_run=False, guid=guid, feed_url="http://f")
+    finally:
+        fetch_rss_feed.TMP_AUDIO_DIR = monkey
+    assert ok is True, msg
+    assert stage == "完成"
+    assert g.find_info_json(h) is not None             # info.json 真的补出来了
+    assert [c[0] for c in calls] == ["download", "transcribe", "note"]
 
 
 def test_run_one_fails_on_malformed_info_json(roots, calls):
@@ -389,6 +478,118 @@ def test_dry_run_touches_nothing(roots, calls):
     assert ok is True
     assert stage == "预演"
     assert calls == []
+
+
+# ── 步骤 0：从 feed 补拉 info.json ──
+
+def test_ensure_info_json_backfills_from_feed(roots, fake_feed):
+    """feed 里有这一期 → 落一份 info.json，命名与阶段 1 完全一致。"""
+    guid = fake_feed["items"][0]["guid"]
+    h = g.derive_rss_id.guid_to_hash8(guid)
+    path, msg = g.ensure_info_json(h, guid, "http://f")
+    assert path is not None, msg
+    assert path.name == f"第-100-期-标题-{h}.info.json"
+    info = json.loads(path.read_text(encoding="utf-8"))
+    # 音频落盘路径必须在 /tmp 音频目录（不进项目），且带同一个 hash8
+    assert info["local"]["audio_path"].startswith("/tmp/rss-grab-audio/")
+    assert info["local"]["audio_path"].endswith(f"-{h}.m4a")
+    assert info["item"]["guid_hash8"] == h
+    assert info["item"]["guid"] == guid
+    assert info["item"]["enclosure"]["url"] == "http://feed/x.m4a"
+
+
+def test_ensure_info_json_ext_follows_enclosure_type(roots, fake_feed):
+    """enclosure type 决定扩展名（m4a/mp3/…），别一律写 m4a。"""
+    guid = fake_feed["items"][0]["guid"]
+    h = g.derive_rss_id.guid_to_hash8(guid)
+    fake_feed["items"][0]["enclosure"] = {"url": "http://feed/x.mp3",
+                                          "type": "audio/mpeg"}
+    path, _ = g.ensure_info_json(h, guid, "http://f")
+    info = json.loads(path.read_text(encoding="utf-8"))
+    assert info["local"]["audio_path"].endswith(f"-{h}.mp3")
+
+
+def test_ensure_info_json_is_idempotent(roots, fake_feed):
+    """已有 info.json → 直接返回，不重新打 feed（幂等 + 网络礼仪）。"""
+    guid = fake_feed["items"][0]["guid"]
+    h = g.derive_rss_id.guid_to_hash8(guid)
+    first, _ = g.ensure_info_json(h, guid, "http://f")
+    before = fake_feed["_fetch_calls"]["fetch_xml"]
+    second, msg = g.ensure_info_json(h, guid, "http://f")
+    assert second == first
+    assert "已存在" in msg
+    assert fake_feed["_fetch_calls"]["fetch_xml"] == before
+
+
+def test_ensure_info_json_fetches_feed_only_once_per_run(roots, fake_feed):
+    """多期同一个源只拉一次 feed —— 勾 78 期不该打 78 次源站。"""
+    guid = fake_feed["items"][0]["guid"]
+    h1 = g.derive_rss_id.guid_to_hash8(guid)
+    h2 = g.derive_rss_id.guid_to_hash8("另一个-guid")
+    g.ensure_info_json(h1, guid, "http://f")
+    n_after_first = fake_feed["_fetch_calls"]["fetch_xml"]
+    g.ensure_info_json(h2, "另一个-guid", "http://f")
+    assert fake_feed["_fetch_calls"]["fetch_xml"] == n_after_first == 1
+
+
+def test_ensure_info_json_reports_missing_guid(roots, fake_feed):
+    """条目没 guid → 明确失败，不瞎扫 feed。"""
+    path, msg = g.ensure_info_json("deadbeef", "", "http://f")
+    assert path is None
+    assert "guid" in msg
+    assert fake_feed["_fetch_calls"]["fetch_xml"] == 0   # 缺信息就别打网络
+
+
+def test_ensure_info_json_reports_missing_feed_url(roots, fake_feed):
+    """没 feed_url → 明确失败，且不碰网络。"""
+    path, msg = g.ensure_info_json("deadbeef", "g-1", "")
+    assert path is None
+    assert "feed_url" in msg
+    assert fake_feed["_fetch_calls"]["fetch_xml"] == 0
+
+
+def test_ensure_info_json_reports_feed_fetch_error(roots, monkeypatch):
+    """拉 feed 本身失败 → 说清是拉取失败，不是「这期有问题」。"""
+    import fetch_rss_feed
+    monkeypatch.setattr(g, "_FEED_CACHE", {})
+    monkeypatch.setattr(fetch_rss_feed, "fetch_xml",
+                        lambda u: (_ for _ in ()).throw(RuntimeError("curl 失败 (exit=7)")))
+    path, msg = g.ensure_info_json("deadbeef", "g-1", "http://f")
+    assert path is None
+    assert "拉 feed 失败" in msg
+    assert "exit=7" in msg
+
+
+def test_ensure_info_json_reports_episode_not_in_feed(roots, fake_feed):
+    """feed 里没有这一期（源站过保留期）→ 如实说，不要伪装成别的原因。"""
+    path, msg = g.ensure_info_json("deadbeef", "不存在的-guid", "http://f")
+    assert path is None
+    assert "没有这一期" in msg
+
+
+def test_ensure_info_json_rejects_item_without_audio(roots, fake_feed):
+    """这一期没有音频 enclosure → 明确失败（否则后面会下到一个 jpg）。"""
+    guid = fake_feed["items"][0]["guid"]
+    h = g.derive_rss_id.guid_to_hash8(guid)
+    fake_feed["items"][0]["enclosure"] = {}
+    path, msg = g.ensure_info_json(h, guid, "http://f")
+    assert path is None
+    assert "enclosure" in msg
+
+
+def test_ensure_info_json_picks_the_right_episode(roots, fake_feed):
+    """feed 有多期时按 guid 精确匹配，别抓错期。"""
+    real = fake_feed["items"][0]
+    other = dict(real)
+    other["guid"] = "别的-guid"
+    other["title"] = "别的期数"
+    fake_feed["items"] = [other, real]      # 目标不在第一位
+    guid = real["guid"]
+    h = g.derive_rss_id.guid_to_hash8(guid)
+    path, _ = g.ensure_info_json(h, guid, "http://f")
+    info = json.loads(path.read_text(encoding="utf-8"))
+    assert info["item"]["title"] == "第 100 期 标题"
+    assert "别的期数" not in path.name      # 文件名用的是目标那期的标题
 
 
 # ── 接线校验：接缝确实指向已有实现，不是另写一套 ──
@@ -443,14 +644,14 @@ def test_process_state_file_counts_failures_by_stage(tmp_path, monkeypatch, caps
     monkeypatch.setattr(g, "already_done", lambda s, h: False)
     monkeypatch.setattr(g, "sm", type("S", (), {"load_state": staticmethod(lambda p: {})}))
 
-    def fake_run_one(hash8, dry_run):
+    def fake_run_one(hash8, dry_run, guid="", feed_url=""):
         if hash8 == "aaa":
             return True, "完成", f"{hash8} ok"
         return False, "音频", f"{hash8} yt-dlp 下载失败：HTTP Error 500"
 
     monkeypatch.setattr(g, "run_one", fake_run_one)
     r = g.process_state_file(state, dry_run=False)
-    assert r == {"picked": 2, "ok": 1, "fail": 1, "skip": 0}
+    assert r == {"picked": 2, "ok": 1, "fail": 1, "marked": 0, "skip": 0}
     out = capsys.readouterr().out
     assert "失败分布：音频 1 期" in out
 
@@ -464,12 +665,12 @@ def test_process_state_file_counts_skip_separately(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "already_done", lambda s, h: h == "aaa")
     monkeypatch.setattr(g, "sm", type("S", (), {"load_state": staticmethod(lambda p: {})}))
 
-    def fake_run_one(hash8, dry_run):
+    def fake_run_one(hash8, dry_run, guid="", feed_url=""):
         return True, "完成", f"{hash8} ok"
 
     monkeypatch.setattr(g, "run_one", fake_run_one)
     r = g.process_state_file(state, dry_run=False)
-    assert r == {"picked": 2, "ok": 1, "fail": 0, "skip": 1}
+    assert r == {"picked": 2, "ok": 1, "fail": 0, "marked": 0, "skip": 1}
 
 
 def test_stats_shape_has_four_counters():

@@ -10,9 +10,14 @@
 
 | 步骤 | 做什么 | 「已做过」的判据 | 复用 |
 |---|---|---|---|
+| 0 补拉 | `rss/raw/` 没有 info.json 时，从 feed 补这一期的元数据 | `rss/raw/*-<hash8>.info.json` 存在 | `fetch_rss_feed.build_info_json` |
 | 1 音频 | 音频没落盘就下载 | `local.audio_path` 指向的文件存在且非零字节 | `fetch_rss_feed.download_audio` |
 | 2 转写 | ASR 转写 | `rss/transcripts/*-<hash8>.transcript.md` 存在 | `asr_podcast.transcribe_one` |
 | 3 笔记 | v3 四步管线出笔记 | `generate_note_v3.py` 自带防重闸门 | 子进程调 `generate_note_v3.py` |
+
+**步骤 0 是必需项，不是可选优化**：阶段 1 只拉简介做摘要、从不碰音频，
+所以订阅清单里绝大多数期数从来没有过 `info.json`。缺了这一步，
+后面三步对它们全部无从下手（详见 `ensure_info_json` 的说明）。
 
 每步各自判重，重跑不会重复下载、不会重复烧 ASR、不会重复烧 LLM 额度。
 步骤 2 直接调函数而不是起子进程：`asr_podcast.main()` 无论成败都返回 None（退出码恒为 0），
@@ -68,6 +73,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
 
 import subscribe_manager as sm  # noqa: E402
+import derive_rss_id  # noqa: E402
 
 GRAB = sm.CHECKBOX_GRAB          # "[x]"
 DONE = sm.CHECKBOX_DONE         # "[done]"
@@ -110,8 +116,18 @@ def pick_confirmed(state: dict) -> list[dict]:
 def find_hash8(item: dict) -> str | None:
     """从条目里拿 guid_hash8 —— 生成笔记的必需主键。
 
-    优先从 `fields` 里找（`--sync-pick` 归区时写进去的），
-    找不到就退回用 `rss/raw/` 的 info.json 按 guid 反查。
+    三条路，按「最可靠」排序：
+      1. `fields` 里的 guid_hash8 —— **状态文件渲染时落盘**（subscribe_manager
+         `_render_item`），这是主路径，不用算、也不用反查；
+      2. 由 guid 现算 sha256 前 8 位 —— 兜底。派生是纯函数且已与 info.json
+         逐条核对一致，所以老文件/手改过的文件也能算出来；
+      3. 扫 `rss/raw/*.info.json` 按 guid 反查 —— 最后的兜底（慢，580 条要扫
+         几百个文件），保留是为了兼容字段名不是 guid_hash8 的历史文件。
+
+    ⚠️ 原实现在第 1、3 条都拿不到时返回 None，调用方直接跳过。于是
+    「md 里没落这个字段 且 raw/ 里没这期」= **静默丢弃**：秒返回、退出码 0、
+    日志一行「找不到 guid_hash8，跳过」。实测 580 条里 528 条会走到这里，
+    而当时 stage 3 还是新接进定时任务的 —— 看起来一切正常，一条笔记没生成。
     """
     for key, val in (item.get("fields") or {}).items():
         if "hash8" in key.lower() and val:
@@ -119,7 +135,9 @@ def find_hash8(item: dict) -> str | None:
     guid = item.get("guid") or ""
     if not guid:
         return None
-    # 按 guid 前缀找 info.json
+    # 兜底 2：guid 就在条目里，sha256 前 8 位是纯函数，直接算。
+    calc = derive_rss_id.guid_to_hash8(guid)
+    # 兜底 3：反查 info.json（字段名不是 guid_hash8 的历史文件）
     root = SCRIPT_DIR.parent.parent.parent.parent      # → 项目根
     for p in (root / "rss" / "raw").glob("*.info.json"):
         try:
@@ -128,22 +146,197 @@ def find_hash8(item: dict) -> str | None:
             continue
         it = d.get("item") or {}
         if it.get("guid") == guid:
-            return it.get("guid_hash8")
-    return None
+            return it.get("guid_hash8") or calc
+    return calc
 
 
 def already_done(state: dict, hash8: str) -> bool:
-    """已转化区里是否已有这一期（判据是 note 链接里带 hash8）。"""
+    """已转化区里是否已有这一期（判据是笔记链接里带 hash8）。
+
+    ⚠️ 判据要读 **note_path**，不能只读 fields["笔记"]。
+    `subscribe_manager` 解析状态文件时会把 `- 笔记：…` 还原进
+    `item["note_path"]` 并**明确不进 fields**（见其「笔记字段还原到
+    note_path（不进 fields）」那段）。而这里原来读的是 fields["笔记"]，
+    于是对**全部 51 个真实已转化条目都返回 False** —— 这道防重闸门
+    从上线起就是空的。
+    之所以没暴露：pick_confirmed 本来就只扫 confirmed 区里的 `[x]`，
+    已转化条目在另一个区，两者不重叠，这道闸门一直是多余的冗余保险。
+    但一旦有人拿它当「这期到底做完没」的唯一判据（就像标 done 的逻辑），
+    空闸门就变成静默重复处理。
+    """
+    if not hash8:
+        return False
     for item in state.get("done", []):
-        note = str((item.get("fields") or {}).get("笔记", ""))
-        if hash8 and hash8 in note:
+        blob = " ".join((
+            str(item.get("note_path") or ""),
+            str((item.get("fields") or {}).get("笔记", "")),
+        ))
+        if hash8 in blob:
             return True
     return False
+
+
+# 「产物够格才算完成」的字节下限。
+# 依据：本仓现有 52 篇笔记实测，最小 11845 / 中位 28434 / 最大 56407 字节，
+# 无一低于 1000。取 1000 是**远低于**真实下限的保守值 —— 只为拦空文件、
+# 半截写入、异常退出的残骸，不会误伤任何正常笔记。
+# ⚠️ 这个数不是随手拍的：调高了会把正常笔记判成未完成（于是无限重试、
+# 永远标不上 done），调低了会让垃圾产物混进已转化区。
+NOTE_MIN_BYTES = 1000
+
+
+def find_note_path(hash8: str) -> Path | None:
+    """按 hash8 找已落盘的笔记：rss/notes/<节目>/<标题>-<hash8>.md。"""
+    if not hash8:
+        return None
+    root = SCRIPT_DIR.parent.parent.parent.parent      # → 项目根
+    notes = root / "rss" / "notes"
+    # ⚠️ 两个坑都在这里踩过：
+    #   ① glob 模式不能以 / 开头（绝对路径会抛 NotImplementedError）；
+    #   ② `notes.glob("*-xxx.md")` **不递归子目录** —— 笔记都在
+    #      `rss/notes/<节目名>/` 下，所以目录层必须写 `*/`；
+    #   ③ 文件名是 `<标题>-<hash8>.md`，不是裸 `<hash8>.md`，
+    #      所以文件名层要用前缀通配 `*` 而不是精确名。
+    for pattern in (f"*/*{hash8}.md", f"*{hash8}.md"):
+        for p in notes.glob(pattern):
+            return p
+    return None
+
+
+def should_mark_done(hash8: str) -> tuple[bool, str]:
+    """产物是否够格把这一期标成已转化。
+
+    🔴 **判据是「文件真的躺在盘上且够大」，不是「生成脚本退出码是 0」**。
+    退出码只说明进程没崩；文件被写空、写半截、或写到别处，退出码照样是 0。
+    Henry 2026-10-06 明确要求：生成失败绝不能标 done。
+    """
+    p = find_note_path(hash8)
+    if p is None:
+        return False, "笔记文件未落盘"
+    try:
+        n = p.stat().st_size
+    except OSError as e:
+        return False, f"笔记文件读不到：{e}"
+    if n < NOTE_MIN_BYTES:
+        return False, f"笔记只有 {n} 字节（< {NOTE_MIN_BYTES}），判为未完成"
+    return True, f"笔记已落盘 {n} 字节"
+
+
+def mark_done(state_path: Path, hash8: str, note_rel: str) -> bool:
+    """把这一期在 md 里从 `[x]` 改成 `[done]`，并挂上笔记链接。
+
+    只在 `should_mark_done` 通过后调用。**不改分区** —— 归区由
+    `fetch_rss_feed.py --sync-pick` 统一做（别处已有实现，不重复造）。
+    走 sm.load_state/save_state，与 --sync-pick 同一套读写约定
+    （临时文件 + replace 原子替换）。
+    """
+    try:
+        state = sm.load_state(state_path)
+    except Exception as e:
+        print(f"  ⚠️  {hash8} 读状态文件失败，未标 done：{e}"[:200])
+        return False
+    hit = False
+    for zone in ("confirmed", "pending"):
+        for item in state.get(zone, []):
+            if find_hash8(item) != hash8:
+                continue
+            if item.get("checkbox") == "[done]":
+                hit = True
+                continue
+            item["checkbox"] = DONE
+            # 🔴 笔记链接要写进 **item["note_path"]**，不是 fields["笔记"]。
+            # 渲染器 `_render_item` 是从 note_path 出「- 笔记：…」这一行的；
+            # 写进 fields 会被**静默丢掉**（渲染时只按固定字段表取值），
+            # 于是状态是「标了 done、却查不到笔记」——而防重判重
+            # already_done 正是靠这个链接里的 hash8，下一轮就会重复处理。
+            # （读回来时 FIELD_RE 才会把它解析进 fields["笔记"]，所以只读侧用 fields。）
+            item["note_path"] = note_rel
+            fields = item.setdefault("fields", {})
+            fields["笔记"] = note_rel
+            hit = True
+    if not hit:
+        return False
+    try:
+        sm.save_state(state_path, state)
+    except Exception as e:
+        print(f"  ⚠️  {hash8} 写状态文件失败，未标 done：{e}"[:200])
+        return False
+    return True
 
 
 def find_info_json(hash8: str) -> Path | None:
     """rss/raw/ 下这一期的 info.json（找不到返回 None）。"""
     return next(iter(sorted(RAW_DIR.glob(f"*-{hash8}.info.json"))), None)
+
+
+# ── 步骤 0：从 feed 补拉 info.json ──
+# 🔴 这一步是阶段 3 能不能落地的前提，不是可选优化。
+# 580 期订阅清单里 **528 期从未下载过音频**（`rss/raw/` 只有 52 份 info.json），
+# 因为阶段 1（--fetch-updates）只拉简介做摘要、从不碰音频。
+# 于是 `find_info_json` 对绝大多数条目返回 None，原实现在 `run_one` 里直接
+# `return False, "音频", "找不到 info.json"` —— 定时任务每晚跑、每晚失败、
+# 退出码非 0，但一篇笔记也没产出过。**这就是为什么必须补这一步，而不是
+# 把失败当成"这期有问题"。**
+
+# feed 缓存：一次运行内同一个源只拉一次 XML。
+# 不用的话，勾 78 期 `[x]` 就会打 78 次 feed（小xyzfm 站也扛不住这种礼貌）。
+_FEED_CACHE: dict[str, dict] = {}
+
+
+def _load_feed(feed_url: str) -> dict:
+    """取 feed（含缓存）。失败抛异常，由调用方转成失败原因。"""
+    with _LOCAL_LOCK:          # 同一个源只拉一次：并发线程别重复打 feed
+        if feed_url not in _FEED_CACHE:
+            from fetch_rss_feed import fetch_xml
+            import parse_rss
+            _FEED_CACHE[feed_url] = parse_rss.parse_text(fetch_xml(feed_url))
+    return _FEED_CACHE[feed_url]
+
+
+def ensure_info_json(hash8: str, guid: str, feed_url: str) -> tuple[Path | None, str]:
+    """保证 `rss/raw/<标题>-<hash8>.info.json` 存在，缺则从 feed 补这一期。
+
+    **只负责落 info.json，不下载音频** —— 下载仍由 `ensure_audio` 负责。
+    这样拆的好处：下载失败时 info.json 已经在盘上，下一轮
+    `find_info_json` 直接命中、只重试下载，不会重新去 feed 里捞这一期。
+
+    `build_info_json` / `sanitize_title` / `ext_from_enclosure` / `TMP_AUDIO_DIR`
+    全部复用 `fetch_rss_feed` 的实现 —— 命名规则必须和阶段 1 逐字节一致，
+    否则 `find_info_json` 的 glob、ASR 的产物名、笔记文件名三处会对不上。
+    """
+    exist = find_info_json(hash8)
+    if exist is not None:
+        return exist, "info.json 已存在"
+    if not guid:
+        return None, "条目里没有 guid，无法从 feed 反查"
+    if not feed_url:
+        return None, "状态文件 frontmatter 没有 feed_url，无法补拉"
+    try:
+        feed = _load_feed(feed_url)
+    except Exception as e:
+        return None, f"拉 feed 失败：{type(e).__name__}: {e}"[:200]
+    item = next((it for it in feed.get("items", []) if it.get("guid") == guid), None)
+    if item is None:
+        # feed 通常只保留最近若干期，清单里的老期可能已被源站丢弃。
+        # 这是**真限制**，必须如实报出来，不能伪装成"这期有问题"。
+        return None, (f"feed 里已没有这一期（{len(feed.get('items', []))} 期里找不到）"
+                      f"—— 源站可能已过保留期")
+    if not (item.get("enclosure") or {}).get("url"):
+        return None, "feed 里这一期没有音频 enclosure"
+    from fetch_rss_feed import (TMP_AUDIO_DIR, build_info_json,
+                                ext_from_enclosure, sanitize_title)
+    safe = sanitize_title(item["title"])
+    ext = ext_from_enclosure(item["enclosure"].get("type", ""))
+    audio_path = TMP_AUDIO_DIR / f"{safe}-{hash8}.{ext}"
+    info = build_info_json(feed, item, hash8, audio_path)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    out = RAW_DIR / f"{safe}-{hash8}.info.json"
+    try:
+        out.write_text(json.dumps(info, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+    except OSError as e:
+        return None, f"info.json 落盘失败：{e}"[:200]
+    return out, f"已从 feed 补 info.json（{out.name}）"
 
 
 def enclosure_url(info: dict) -> str:
@@ -256,10 +449,11 @@ def generate_note(hash8: str) -> tuple[bool, str]:
     return ok, (f"{'ok' if ok else 'failed'} {int(time.time()-t0)}s {tail[:90]}")
 
 
-def run_one(hash8: str, dry_run: bool) -> tuple[bool, str, str]:
+def run_one(hash8: str, dry_run: bool, guid: str = "",
+            feed_url: str = "") -> tuple[bool, str, str]:
     """跑完一期的完整链路。返回 (是否成功, 卡在哪一步, 日志行)。
 
-    `stage` 取值：`完成` / `音频` / `转写` / `笔记` / `预演`，
+    `stage` 取值：`完成` / `补拉` / `音频` / `转写` / `笔记` / `预演`，
     失败时一眼能看出断在哪一步，不用翻子进程原始输出。
     """
     if dry_run:
@@ -270,7 +464,11 @@ def run_one(hash8: str, dry_run: bool) -> tuple[bool, str, str]:
     else:
         info_path = find_info_json(hash8)
         if info_path is None:
-            return False, "音频", f"{hash8} 找不到 rss/raw/*-{hash8}.info.json"
+            # 没有 info.json 不是终局：从 feed 把这一期补出来再继续。
+            info_path, msg = ensure_info_json(hash8, guid, feed_url)
+            if info_path is None:
+                return False, "补拉", f"{hash8} {msg}"
+            steps.append(msg)
         try:
             info = json.loads(info_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
@@ -300,9 +498,10 @@ def process_state_file(state_path: Path, dry_run: bool) -> dict:
           f"已转化 {len(state.get('done', []))}）")
     if not items:
         print("  ⏭️  无可处理条目，跳过（策略 A：不碰未审阅 / 不碰已排除）")
-        return {"picked": 0, "ok": 0, "fail": 0, "skip": 0}
+        return {"picked": 0, "ok": 0, "fail": 0, "marked": 0, "skip": 0}
 
     todo = []
+    need_fetch = 0
     for it in items:
         h = find_hash8(it)
         if not h:
@@ -311,33 +510,60 @@ def process_state_file(state_path: Path, dry_run: bool) -> dict:
         if already_done(state, h):
             print(f"  ⏭️  {h} 已在已转化区，跳过")
             continue
-        todo.append((h, it.get("title", "")[:40]))
-    print(f"  待生成：{len(todo)} 期")
+        if find_info_json(h) is None:
+            need_fetch += 1
+        todo.append((h, it.get("title", "")[:40], it.get("guid") or ""))
+    print(f"  待生成：{len(todo)} 期"
+          + (f"（其中 {need_fetch} 期需先从 feed 补拉音频）" if need_fetch else ""))
 
     if dry_run:
-        for h, title in todo:
+        for h, title, _g in todo:
             print(f"  [dry-run] {h}  {title}")
-        return {"picked": len(items), "ok": 0, "fail": 0,
+        return {"picked": len(items), "ok": 0, "fail": 0, "marked": 0,
                 "skip": len(items) - len(todo)}
 
     # 并发：LLM 环节（Henry 2026-10-05 要求 5 并发）
     from concurrent.futures import ThreadPoolExecutor
-    ok = fail = 0
+    ok = fail = marked = 0
     by_stage: dict[str, int] = {}
+    feed_url = str((state.get("frontmatter") or {}).get("feed_url") or "")
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
-        futs = {ex.submit(run_one, h, dry_run): (h, title) for h, title in todo}
+        futs = {ex.submit(run_one, h, dry_run, g, feed_url): (h, title)
+                for h, title, g in todo}
+        results = []
         for fu, (h, title) in futs.items():
             good, stage, msg = fu.result()
+            results.append((h, good, stage, msg))
             print(f"  {'✅' if good else '❌'} {msg}")
             if good:
                 ok += 1
             else:
                 fail += 1
                 by_stage[stage] = by_stage.get(stage, 0) + 1
+
+    # 成功之后**再验一次产物**，够格才标 done。
+    # 为什么不直接信 run_one 的 good：它判的是「子进程退出码为 0」，
+    # 而 v3 脚本崩在最后一刻、或文件写空，退出码都可能是 0。
+    # 这一步独立复核磁盘上的真东西 —— 判据是文件存在且够大（见 should_mark_done）。
+    if not dry_run:
+        for h, good, _stage, _msg in results:
+            if not good:
+                continue
+            passed, why = should_mark_done(h)
+            if not passed:
+                print(f"  ⚠️  {h} 生成返回成功但{why} → **不标 done**，下次重试")
+                continue
+            rel = Path(find_note_path(h)).relative_to(
+                SCRIPT_DIR.parent.parent.parent.parent).as_posix()
+            if mark_done(state_path, h, rel):
+                marked += 1
+                print(f"  🏷️  {h} 产物达标（{why}）→ 标 [done]")
+
     if by_stage:
         detail = "、".join(f"{k} {v} 期" for k, v in sorted(by_stage.items()))
         print(f"  ⚠️  失败分布：{detail}")
-    return {"picked": len(items), "ok": ok, "fail": fail,
+    print(f"  🏷️  本轮标 done：{marked} 期")
+    return {"picked": len(items), "ok": ok, "fail": fail, "marked": marked,
             "skip": len(items) - len(todo)}
 
 
@@ -365,7 +591,7 @@ def main() -> int:
     print(f"策略 A：只处理「确认抓取」区 `[x]`；待确认 / 确认不抓 / 已转化 一律跳过")
     print(f"并发：{MAX_PARALLEL}（LLM 环节）{'｜dry-run，不花钱' if a.dry_run else ''}")
 
-    total = {"picked": 0, "ok": 0, "fail": 0, "skip": 0}
+    total = {"picked": 0, "ok": 0, "fail": 0, "marked": 0, "skip": 0}
     for f in files:
         if not f.exists():
             print(f"⚠️ 状态文件不存在：{f}")
@@ -376,7 +602,8 @@ def main() -> int:
 
     print(f"\n{'='*56}")
     print(f"确认抓取 {total['picked']} 期 ｜ ✅ 完成 {total['ok']} "
-          f"｜ ❌ 失败 {total['fail']} ｜ ⏭️ 跳过 {total['skip']}")
+          f"｜ ❌ 失败 {total['fail']} ｜ 🏷️ 标 done {total['marked']}"
+          f" ｜ ⏭️ 跳过 {total['skip']}")
     print("注：每期按 音频 → 转写 → 笔记 依次补齐；已有产物自动跳过对应步骤")
     print("注：已转化区不会被重复处理（防重闸门 + 已转化判定）")
     return 0 if total["fail"] == 0 else 1
