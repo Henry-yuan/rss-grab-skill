@@ -570,7 +570,7 @@ def _call_with_template(client, tpl: str, payload: str, info: dict,
 
 # ── 单篇 ──────────────────────────────────────────────
 def run_long_path(src_path: Path, source: str, client,
-                  work_dir: Path) -> dict:
+                  work_dir: Path, no_typos: bool = False) -> dict:
     """长文路径：①.5 错字纠正 → ② 分块扫描 → ③ 合并去重。
 
     返回 {"topics": [...], "typo_report": {...}, "scan_stats": {...}}
@@ -586,10 +586,16 @@ def run_long_path(src_path: Path, source: str, client,
     # 2026-10-03 起模型输出的是「逐处判断（段号 + 原文 + 决定）」，
     # 程序按段精确定位——不再输出映射表做全文替换。
     # 四组实测误伤均为 0，见 docs/实验/错字纠正方案实测-20261003.md
-    typo_report = run_file(src_path, clean_path, typos_path, client=client)
-    print(f"    [长文] 错字纠正 判定 {typo_report['judgments']} 处 / "
-          f"落成 {typo_report['applied_count']} 处 / "
-          f"成功率 {typo_report['success_rate']:.1%}", flush=True)
+    if no_typos:
+        # 对照实验用：跳过 ①.5，直接把原文复制成 clean
+        import shutil as _sh
+        _sh.copyfile(src_path, clean_path)
+        print("    [长文] --no-typos：跳过 ①.5 错字纠正（对照实验）", flush=True)
+    else:
+        typo_report = run_file(src_path, clean_path, typos_path, client=client)
+        print(f"    [长文] 错字纠正 判定 {typo_report['judgments']} 处 / "
+              f"落成 {typo_report['applied_count']} 处 / "
+              f"成功率 {typo_report['success_rate']:.1%}", flush=True)
 
     clean_text = clean_path.read_text(encoding="utf-8")
 
@@ -619,7 +625,8 @@ def run_long_path(src_path: Path, source: str, client,
 
 
 # ── 编排：产出正文 ─────────────────────────────────────────
-def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos_dir: Path) -> tuple[str, dict, dict]:
+def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos_dir: Path,
+                      no_typos: bool = False) -> tuple[str, dict, dict]:
     """跑完四步，返回 **(正文, 校验报告, 统计)**。
 
     **本函数不写任何文件** —— frontmatter 组装与落盘由调用方做。
@@ -687,6 +694,11 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
         from correct_typos import run_file
         if is_long:
             pass
+        elif no_typos:
+            # 对照实验用：跳过 ①.5，source 保持原文。
+            # stats 显式标出「纠错被跳过」，避免产出看起来像跑过纠错的笔记。
+            print("    [短文] --no-typos：跳过 ①.5 错字纠正（对照实验）", flush=True)
+            stats['typo_skipped'] = True
         else:
             wr = work_dir / stem
             typo_report = run_file(src_path, wr / f'{stem}.clean.md', typos_dir / f'{stem}.typos.json', client=client)
@@ -702,7 +714,7 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
     if is_long:
         wr = work_dir / stem
         try:
-            long_info = run_long_path(src_path, source, client, wr)
+            long_info = run_long_path(src_path, source, client, wr, no_typos=no_typos)
         except Exception as e:
             print(f'    ✗ 长文路径失败: {type(e).__name__}: {str(e)[:160]}', flush=True)
             raise RuntimeError(f'长文路径失败: {type(e).__name__}: {e}') from e
