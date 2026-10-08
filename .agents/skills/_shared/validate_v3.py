@@ -415,15 +415,11 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     # C4 引用回源（观测）
     rep["C4_quote_coverage"] = quote_coverage(body, source)
 
-    # C8 tags
-    tags = llm.get("tags") or []
-    clean = [str(x).strip() for x in tags
-             if str(x).strip() and not re.fullmatch(r"[\d:]+", str(x).strip())]
-    src_tags = set(info.get("tags") or [])
-    overlap = sum(1 for t in clean if t.lstrip("#") in src_tags) / max(1, len(clean))
-    rep["C8_tags"] = {"n": len(clean), "overlap_with_source": round(overlap, 2)}
-    if not 3 <= len(clean) <= 8:
-        rep["C8_tags"]["warn"] = "建议 3-8 个"
+    # ⚠️ V1.2：原 C8 tags 检查已删除。
+    # 标签改由 scripts/retag.py 在产物生成后单独打标，v3 不再产出 tags ——
+    # 该检查恒算 n=0 并写下「建议 3-8 个」，检查的是一个不再存在的东西。
+    # 替代它的质量检查（G1 漏跑 / G2 数量上限 / G3 超长 / G4 近义重复）
+    # 跟随产出方走，定义见 docs/versions/V1.2/spec.md §8。
 
     # C11 summary
     s = str(llm.get("summary") or "").strip()

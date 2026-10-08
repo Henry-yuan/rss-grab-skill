@@ -358,9 +358,9 @@ def main() -> int:
         return 0
 
     # 落盘：信头 + 正文
-    llm = stats.get("llm") or {}          # tags / summary 在 LLM 的 JSON 里
-    fmv = fm.build(info, summary_llm=llm.get("summary", ""),
-                   tags_llm=llm.get("tags", []) or [])
+    llm = stats.get("llm") or {}          # summary 在 LLM 的 JSON 里
+    # V1.2 AC3：tags 不再由 v3 产出，交给 scripts/retag.py 事后按产物打标
+    fmv = fm.build(info, summary_llm=llm.get("summary", ""))
     _write_atomic(a.output, fm.dump(fmv) + "\n" + body + "\n")
 
     # 索引（--no-index 时跳过：批量重生成到暂存目录不该碰生产 INDEX.md）

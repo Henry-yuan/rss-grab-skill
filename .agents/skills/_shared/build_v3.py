@@ -221,7 +221,6 @@ USER_TPL = """## 笔记元信息
 ## 末尾 JSON 格式
 {{
   "summary": "不超过60字的一句话概括",
-  "tags": ["3到8个从内容实质总结的标签"],
   "typos": [
     {{"original": "原样抄写", "target": "纠正后", "reason": "依据"}}
   ]
@@ -436,7 +435,6 @@ USER_TPL_TOPICS = """## 笔记元信息
 ## 末尾 JSON 格式
 {{
   "summary": "不超过60字的一句话概括",
-  "tags": ["3到8个从内容实质总结的标签"],
   "typos": [
     {{"original": "原样抄写", "target": "纠正后", "reason": "依据"}}
   ]
@@ -645,8 +643,9 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
     Returns:
         (body, report, stats)。`report` 是 `validate()` 的报告 dict；
         `stats` 含 route / net_chars / typo_applied / attempts 等，
-        以及 `stats['llm']` —— LLM 产出的 `tags` / `summary`（**信头要用这两个**，
-        它们不在 `report` 里）。
+        以及 `stats['llm']` —— LLM 产出的 `summary`（**信头要用**，
+        它不在 `report` 里）。`tags` **不在**其中：v3 不产出标签，
+        `stats['llm']` 经 `llm.pop("tags", None)` 硬过滤保证不含该键。
 
     Raises:
         RuntimeError: 校验连续 MAX_RETRY+1 次未过，或分块路径失败。
@@ -743,9 +742,14 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
                 stats['last_retry_hint'] = retry_hint
                 print(f'    ⚠️ 第 {attempt} 次校验未过: {last_err}', flush=True)
                 continue
-            # LLM 产出的 tags / summary 在 llm 里，不在校验报告里 ——
+            # LLM 产出的 summary 在 llm 里，不在校验报告里 ——
             # 2026-10-04 漏掉这一步，导致 rss 薄壳写出的 frontmatter
-            # `tags` / `summary` 恒为空。放进 stats 一起返回。
+            # `summary` 恒为空。放进 stats 一起返回。
+            # tags 不再走这里：v3 不产出标签，打标由本仓库外的独立步骤负责，
+            # 两个模板的 JSON 格式里已删掉 tags —— 但那只保证「模型大概率不吐」，
+            # 下面这行是整块透传，模型若仍返回 tags 照样会进 stats。
+            # 所以透传前硬过滤，不给这个已废弃的字段留缝。
+            llm.pop("tags", None)
             stats['llm'] = llm
             # ⚠️ 必须返回 v['body']，不能返回原始 body。
             # validate() 里那一整条归一化链（H3 去编号、重新编号、剥时间戳、
