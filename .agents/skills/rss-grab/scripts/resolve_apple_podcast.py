@@ -12,7 +12,9 @@ Apple 已把节目页改成客户端渲染的播放器壳子（2026-10-09 实测
 
     https://itunes.apple.com/lookup?id=<podcast_id>&media=podcast
 
-  · 命中：resultCount=1，results[0].feedUrl / .collectionName / .collectionDescription
+  · 命中：resultCount=1，results[0].feedUrl / .collectionName / .artistName
+    （实测 collectionDescription **并不返回**，简介取不到时由 RSS feed 侧补，
+      不影响订阅 —— 别把它当成必需字段）
   · 没命中：**resultCount=0 且不报错**（链接无效、已下架、或只是单集链接 id?i=...）
 
 ## 兜底：页面 HTML 解析

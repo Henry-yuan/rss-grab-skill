@@ -26,7 +26,7 @@ flowchart TB
     G --> H[rss/notes/ 沉淀]
 ```
 
-**真实使用方式**（作者日常用法）：在 Apple Podcasts 里找到想订阅的节目，复制节目 web 链接（`podcasts.apple.com/...`）发给 Agent——Agent 会自动反推出这个节目的 RSS feed 地址，用 `--subscribe` 完成订阅。之后节目每出新期，rss-grab 自动拉取增量 + 生成 AI 摘要，你在状态文件里勾选想深挖的期数，它再下载音频、本地转写、生成结构化笔记。**全程不需要手动找 RSS 地址、不需要记命令**。
+**真实使用方式**（作者日常用法）：在 Apple Podcasts 里找到想订阅的节目，复制节目 web 链接（`podcasts.apple.com/...`）发给 Agent——Agent 会通过 **Apple 官方 iTunes Lookup 接口**取到这个节目的 RSS feed 地址完成订阅（只需链接里的那串节目 id，无需手动找 RSS 地址、无需 API 密钥）。之后节目每出新期，rss-grab 自动拉取增量 + 生成 AI 摘要，你在状态文件里勾选想深挖的期数，它再下载音频、本地转写、生成结构化笔记。**全程不需要手动找 RSS 地址、不需要记命令**。
 
 **一句话定位**：rss-grab 是**开源的本地播客笔记工具**——订阅、下载、ASR 转写都在你机器上完成（Apple Silicon 本地推理），AI 摘要与笔记生成调用 OpenAI 兼容 LLM API。
 
@@ -40,7 +40,11 @@ flowchart TB
 **它做了什么**：
 - **本地抓取 + 本地转写**：抓取与 ASR 转写（mlx-whisper，Apple Silicon 本地推理）都在你机器上完成；原始音频不离开设备，转写文本仅在与 LLM API 交互时上传（见「LLM 配置」）
 - **三区状态机**：每源一份 Markdown 状态文件（待确认 / 确认 / 已转化），跟你用邮箱一样自然
-- **Apple Podcasts 反推**：粘一个 Apple 链接，自动反推 RSS feed URL 订阅
+- **Apple Podcasts 一键订阅**：粘一个 Apple 节目链接，通过 **Apple 官方 iTunes Lookup 接口**拿到该节目的 RSS feed 地址自动订阅
+  - 调用方式：`GET https://itunes.apple.com/lookup?id=<节目id>&media=podcast`，返回 JSON 里的 `feedUrl`（RSS 地址）、`collectionName`（节目名）、`artistName`
+  - **你只需要提供那串节目 id**（就在链接的 `id1200361736` 里），无需手动找 RSS 地址、无需 API 密钥
+  - 查不到时返回 `resultCount=0`（链接失效/只是单集链接/节目已下架），会给出可操作的提示而不是报错
+  - ⚠️ 别加 `country=CN` 参数——实测会让中国区节目查不到（`resultCount=0`）
 - **长度自适应**：长短播客统一走 v3 四步管线，净字 15,000 只决定「一次调用」还是「分块扫描」——用户无感，入口只有一个
 - **笔记结构可自定义**：v3 的输出结构由 `_shared/build_v3.py` 顶部的 prompt 模板驱动（`USER_TPL` / `USER_TPL_TOPICS`），改模板字符串即可调整产出风格，不用改管线逻辑
 
@@ -174,20 +178,23 @@ cp .agents/skills/rss-grab/scripts/.env.example .agents/skills/rss-grab/scripts/
 ```bash
 # 1. 订阅一个播客
 #
-# 写法 A（当前唯一可用，推荐先用这个）：你手上只有 RSS feed 地址时，
-#   必须同时用 --feed-url 显式指定。
+# 写法 A（推荐）：粘Apple Podcasts 节目链接，经官方 iTunes Lookup 接口反查 RSS 地址。
+#   只需链接里那串节目 id，无需手动找 RSS 地址、无需 API 密钥。
+#   ⚠️ 不要加 country 参数（实测会导致中国区节目查不到）。
+python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py \
+  --subscribe "https://podcasts.apple.com/us/podcast/id1200361736"
+#   若链接的 id 查不到（resultCount=0：链接失效 / 只是单集链接 ?i=... / 节目已下架），
+#   会给出中文可操作提示，此时改用写法 B。
+#
+# 写法 B：你手上只有 RSS feed 地址时，必须同时用 --feed-url 显式指定。
 #   ⚠️ --subscribe 的第一个位置参数是按「Apple 链接」处理的，只对 podcasts.apple.com
-#      域名做反推；单独传一个裸 feed 地址会直接报错退出
-#      （"❌ 无 feed_url（Apple 反推失败且未传 --feed-url）"），且不会建目录。
+#      域名做反查；单独传一个裸 feed 地址会直接报错退出
+#      （"❌ 无 feed_url"），且不会建目录。
 python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py \
   --subscribe "https://example.com/your-feed.xml" \
   --feed-url "https://example.com/your-feed.xml"
-# 成功后会自动建好 rss/订阅/ 目录、该节目的状态文件和 subscriptions.json
 #
-# 写法 B（传 Apple Podcasts 链接自动反推）：⚠️ **当前会失败，暂不可用**
-#   2026-10-09 实测：Apple 已改版，反推拿不到节目名（title 为 None），
-#   写订阅表时会抛 TypeError。修好前请一律用写法 A。
-# python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py --subscribe "https://podcasts.apple.com/..."
+# 两种写法成功后都会自动建好 rss/订阅/ 目录、该节目的状态文件和 subscriptions.json
 
 # 2. 拉取增量（新期数 + AI 摘要）
 python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py --fetch-updates
