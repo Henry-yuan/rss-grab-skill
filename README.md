@@ -213,23 +213,96 @@ python3 .agents/skills/rss-grab/scripts/generate_note_for_confirmed.py --all    
 python3 .agents/skills/rss-grab/scripts/batch_notes.py
 ```
 
-**定时拉取（可选）**：`--fetch-updates` 幂等、重复执行安全。可配 launchd/cron 每日自动跑，例如 launchd plist 的 ProgramArguments：
+**定时拉取（可选）**：`--fetch-updates` 幂等、重复执行安全，可以配 launchd 每晚自动跑。
+
+仓库里已经带了一份现成的入口脚本 **`.agents/skills/rss-grab/scripts/run_fetch_updates.sh`**，它会遍历 `rss/订阅/subscriptions.json` 里所有源，逐个拉增量 + 生成 AI 摘要。**建议直接用它，不要自己拼 `fetch_rss_feed.py --fetch-updates` 命令**，原因见下。
+
+### 为什么用现成脚本，而不是直接调 py
+
+| 能力 | 直接调 `fetch_rss_feed.py` |
+|---|---|
+| **单实例锁** | 无。上一轮没跑完时下一轮又起 → 两个进程同时拉同一批|
+| **逐源串行 + 抖动** | 一次性并发拉所有源 → 容易触发平台限流 |
+| **日志落盘** | launchd 静默失败你看不到（每晚 exit 127 跑三个月都没人知道） |
+
+> ⚠️ 单实例锁最早用 `flock` 实现，**但 macOS 根本不自带这个命令**，锁形同虚设；现版改用 `mkdir` 的原子性 + PID 存活检查。
+
+### macOS launchd 配置
+
+1. 新建 `~/Library/LaunchAgents/com.example.rss-fetch.plist`（`com.example` 换成你自己的标识）：
 
 ```xml
-<key>ProgramArguments</key>
-<array>
-  <string>/usr/bin/python3</string>
-  <string>/绝对路径/.agents/skills/rss-grab/scripts/fetch_rss_feed.py</string>
-  <string>--fetch-updates</string>
-</array>
-<key>StartCalendarInterval</key>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
-  <key>Hour</key><integer>22</integer>
-  <key>Minute</key><integer>30</integer>
+  <key>Label</key>          <string>com.example.rss-fetch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/绝对路径/到/仓库/.agents/skills/rss-grab/scripts/run_fetch_updates.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>30</integer></dict>
+  <key>RunAtLoad</key>     <false/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- ⚠️ launchd 的默认 locale 不含中文，脚本里的中文会触发 unbound variable -->
+    <key>LANG</key>   <string>en_US.UTF-8</string>
+    <key>LC_ALL</key> <string>en_US.UTF-8</string>
+  </dict>
+  <key>StandardOutPath</key><string>/绝对路径/到/仓库/rss/_logs/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/绝对路径/到/仓库/rss/_logs/launchd.err.log</string>
+</dict>
+</plist>
+```
+
+2. **把所有 `/绝对路径/到/仓库` 换成你自己的实际路径**（共 3 处：脚本、日志、错误日志）。日志目录不用预先创建，脚本会自己建。
+
+3. 加载并验证：
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.example.rss-fetch.plist
+launchctl list | grep rss-fetch        # 应看到 com.example.rss-fetch
+
+# 想立刻试跑一次而不等 22:30：
+launchctl kickstart -k gui/$(id -u)/com.example.rss-fetch
+```
+
+4. 看日志确认真的在跑：`tail -f rss/_logs/fetch-updates-*.log`
+
+### Python 版本要求
+
+脚本需要 **Python 3.12 或更高**。macOS 自带的 `/usr/bin/python3` 是 3.9，缺依赖，**不能直接用**。
+
+脚本会按 `RSS_FETCH_PYTHON` 环境变量 → Homebrew 路径 → PATH 上的 `python3` 依次探测。如果你的 Python 装在别处，在 plist 里加一行：
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>RSS_FETCH_PYTHON</key> <string>/你的/python3/路径</string>
 </dict>
 ```
 
-（cron 用户等价的 crontab 行：`30 22 * * * /usr/bin/python3 /绝对路径/.../fetch_rss_feed.py --fetch-updates`）
+> ⚠️ launchd 给的 PATH 很干净，不含 pip 的用户安装目录。脚本已自行补上
+> `~/Library/Python/3.12/bin`、`3.13/bin` 与 `/opt/homebrew/bin`，否则 yt-dlp
+> 会找不到、每晚静默失败。
+
+### cron 用户等价写法
+
+```bash
+30 22 * * * /bin/bash /绝对路径/到/仓库/.agents/skills/rss-grab/scripts/run_fetch_updates.sh >> /绝对路径/到/仓库/rss/_logs/cron.log 2>&1
+```
+
+### 常见问题
+
+| 现象 | 原因 |
+|---|---|
+| 到点了没反应 | 机器睡眠时 launchd 会跳过触发。醒来后用上面的 `kickstart` 手动补一次 |
+| 日志里 `exit 127` | plist 里的脚本路径不对，或该文件不存在 |
+| 拉取静默失败 | 看 `rss/_logs/launchd.err.log`；最常见是 Python 版本不够或 yt-dlp 不在 PATH |
+| 改完 plist 不生效 | 需先 `launchctl unload` 再 `load` |
 
 ## 目录结构
 

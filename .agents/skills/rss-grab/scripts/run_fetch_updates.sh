@@ -21,13 +21,27 @@ SCRIPTS="$SKILL_DIR"
 LOG_DIR="$PROJECT_ROOT/rss/_logs"
 LOG_FILE="$LOG_DIR/fetch-updates-$(date +%Y%m%d).log"
 
-# Must be 3.12 (the system /usr/bin/python3 is 3.9.6 and lacks deps).
-PY="/usr/local/bin/python3"
+# Must be 3.12+. System /usr/bin/python3 is 3.9.6 on macOS and lacks deps.
+# Try, in order: env override → Homebrew (Apple Silicon / Intel) → python.org
+# installer → whatever python3 is on PATH (last resort: may fail the version
+# check inside the script, but that is a clear error rather than a silent skip).
+PY="${RSS_FETCH_PYTHON:-}"
+if [ -z "$PY" ]; then
+  for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if [ -x "$cand" ]; then PY="$cand"; break; fi
+  done
+fi
+[ -n "$PY" ] || PY="$(command -v python3 || true)"
+if [ -z "$PY" ]; then
+  echo "ERROR: 找不到 python3，请设置 RSS_FETCH_PYTHON 环境变量或在 plist 里指定" >&2
+  exit 127
+fi
 
 # launchd gives a minimal PATH that does NOT include the pip user-install dir
 # where yt-dlp lives. Without this, the audio download step fails with
 # FileNotFoundError on every nightly run (it is not on Homebrew's PATH either).
-export PATH="$HOME/Library/Python/3.12/bin:$PATH"
+# Prepend rather than overwrite, so a Homebrew install keeps working too.
+export PATH="$HOME/Library/Python/3.12/bin:$HOME/Library/Python/3.13/bin:/opt/homebrew/bin:$PATH"
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
