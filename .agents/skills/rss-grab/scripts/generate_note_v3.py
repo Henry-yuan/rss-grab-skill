@@ -334,8 +334,12 @@ def main() -> int:
     t0 = time.time()
 
     print(f"▶ {t.name[:50]}  净字 {shared.net_len(t.read_text(encoding='utf-8')):,}")
+    # ⚠️ 喂 LLM 的必须是 `fm.prompt_info(info)` 而不是原始 `info`：
+    # 共享层的 info_for_prompt / {desc} 占位符都**直取 info 顶层**，而 info.json
+    # 是 feed/item/local 三层嵌套，直传会让元信息区块恒为空（详见 fm.prompt_info）。
+    # 信头侧（fm.build）与索引/状态标记仍用原始 info：它们自己会解嵌套。
     body, report, stats = shared.generate_note_body(
-        t, info, client, a.work_root, SCRIPT_DIR / "typos")
+        t, fm.prompt_info(info), client, a.work_root, SCRIPT_DIR / "typos")
 
     # 源文过短：共享层已跳过正文生成，直接返回 status=empty。注意此时的 stats
     # **没有** net_chars / route（赋值在闸门之后），下面统计行会 KeyError；

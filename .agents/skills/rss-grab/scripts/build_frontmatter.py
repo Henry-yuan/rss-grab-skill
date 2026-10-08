@@ -220,6 +220,39 @@ def build(info: dict, *, transcript_status: str = "ok",
     }
 
 
+def prompt_info(info: dict) -> dict:
+    """把三层嵌套的 info 拍平成「喂给 LLM 的元信息」dict。
+
+    ## 为什么需要它
+
+    `_shared/build_v3.py` 的 `info_for_prompt()` 按 `PROMPT_INFO_FIELDS` 白名单
+    **直取 info 顶层**（`info.get(k)`），而本源的 info.json 是
+    `{feed, item, local}` **三层嵌套**、顶层并没有 `title`/`description` 这些键
+    —— 白名单全部落空，喂给模型的元信息区块**恒为空**（实测 96/96 份真实
+    info.json 全空）。同一模块的 `{desc}` 模板占位符也是 `info.get("description")`
+    直取顶层，一并失效。
+    信头正常是因为 `build()` 会解嵌套：白名单与嵌套层之间缺了这一步适配。
+
+    ## 取值一律从 build() 派生，不另起一套
+
+    `build()` 的返回 dict **键名与白名单完全一致**，且那正是本仓已在用、
+    实测 96/96 取值正确的逻辑。所以这里直接按白名单投影 `build()` 的结果：
+    「与 frontmatter 同源」由**构造**保证，而不是靠约定维护 ——
+    改 `build()` 一处，拍平结果自动跟着变，不会出现信头对、提示词不对的分裂。
+
+    ## 纯附加，不破坏既有读法
+
+    返回值是 `info` 的浅拷贝 + 白名单键，**顶层原有的 `feed`/`item`/`local`
+    全部保留**，共享层将来若再读嵌套键也不会因这次拍平而拿到 None。
+    传入的 `info` 不会被修改，info.json 的落盘内容一概不碰。
+    """
+    fmv = build(info)
+    out = dict(info)                     # 浅拷贝：保留 feed/item/local 等原有读法
+    for k in PROMPT_INFO_FIELDS:
+        out[k] = fmv.get(k, "")          # 取不到就是空串，不猜、不填占位值
+    return out
+
+
 # 字段契约与序列化统一在 `_shared/build_frontmatter.py`（三源共用）。
 # 本模块只负责 rss 侧的「从 info.json 取数」，字段集由 FIELDS 兜底：
 # normalize() 会按 FIELDS 顺序补齐缺失键，多余键丢弃。

@@ -212,9 +212,6 @@ SYSTEM_PROMPT = """你是笔记生成助手。基于下方机器转写文本，�
 USER_TPL = """## 笔记元信息
 {info}
 
-## 笔记描述
-{desc}
-
 ## 机器转写文本（全文）
 {src}
 
@@ -422,9 +419,6 @@ SYSTEM_PROMPT_TOPICS = """你是一个笔记撰写者。下方是一篇长转写
 USER_TPL_TOPICS = """## 笔记元信息
 {info}
 
-## 笔记描述
-{desc}
-
 ## 主题清单（共 {n} 个主题）
 
 > 这是全文的主干覆盖清单。
@@ -537,7 +531,10 @@ def _call_with_template(client, tpl: str, payload: str, info: dict,
                         n_topics: int = 0, retry_hint: str = "") -> str:
     user = tpl.format(
         info=info_for_prompt(info),
-        desc=(info.get("description") or "(无)").strip() or "(无)",
+        # 2026-10-08：曾有独立的「## 笔记描述」区块（占位符 {desc}），与
+        # 「## 笔记元信息」里的 description 完全重复（实测两处一字不差），
+        # 已连区块一起删除。简介现在**只经白名单**走 info_for_prompt() 一条路，
+        # 故不再传 desc=。对应护栏见 tests/test_no_duplicate_desc_block.py。
         src=payload,   # 长文模板不用 {src}（实测加原文掉保真率），保留占位以兼容短文模板
         topics=payload,
         n=n_topics,
