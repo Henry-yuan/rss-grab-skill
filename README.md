@@ -116,7 +116,7 @@ flowchart TB
 ## LLM 配置（OpenAI 兼容）
 
 - 代码通过 OpenAI 兼容接口调用 LLM，**不绑定任何特定服务**——你的 `.env` 配哪家就用哪家
-- **支持任意 OpenAI 兼容服务**（DeepSeek / OpenAI / MiniMax / 本地 Ollama 等），只需在 `.agents/skills/rss-grab/scripts/.env` 配置（模板见根目录 `.env.example`）：
+- **支持任意 OpenAI 兼容服务**（DeepSeek / OpenAI / MiniMax / 本地 Ollama 等），只需在 `.agents/skills/rss-grab/scripts/.env` 配置（模板见同目录的 `.env.example`，**只有这一份**）：
   ```bash
   LLM_API_KEY=your-key                    # 你的服务 API key
   LLM_BASE_URL=https://your-llm-service/v1   # 你的服务 base_url
@@ -163,16 +163,31 @@ ln -s ~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo \
 # （若尚未安装 huggingface-cli：brew install huggingface-cli 或 pip install "huggingface_hub[cli]"）
 
 # API Key（AI 摘要 + 笔记生成）
-# 模板见根目录 .env.example；生效位置是 scripts/ 目录（脚本从这里读）
-cp .env.example .agents/skills/rss-grab/scripts/.env
+# ⚠️ 生效位置是 scripts/ 目录（脚本只从这里读），仓库根目录的 .env 不会被读取
+# 模板就在 scripts/ 目录里（全仓库唯一一份），在仓库根目录执行：
+cp .agents/skills/rss-grab/scripts/.env.example .agents/skills/rss-grab/scripts/.env
 # 编辑 .agents/skills/rss-grab/scripts/.env，填入你的 LLM_API_KEY（OpenAI 兼容接口）
 ```
 
 ## 快速开始（命令行）
 
 ```bash
-# 1. 订阅一个播客（RSS feed URL 或 Apple Podcasts 链接）
-python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py --subscribe "https://feed.xyzfm.space/xxx"
+# 1. 订阅一个播客
+#
+# 写法 A（当前唯一可用，推荐先用这个）：你手上只有 RSS feed 地址时，
+#   必须同时用 --feed-url 显式指定。
+#   ⚠️ --subscribe 的第一个位置参数是按「Apple 链接」处理的，只对 podcasts.apple.com
+#      域名做反推；单独传一个裸 feed 地址会直接报错退出
+#      （"❌ 无 feed_url（Apple 反推失败且未传 --feed-url）"），且不会建目录。
+python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py \
+  --subscribe "https://example.com/your-feed.xml" \
+  --feed-url "https://example.com/your-feed.xml"
+# 成功后会自动建好 rss/订阅/ 目录、该节目的状态文件和 subscriptions.json
+#
+# 写法 B（传 Apple Podcasts 链接自动反推）：⚠️ **当前会失败，暂不可用**
+#   2026-10-09 实测：Apple 已改版，反推拿不到节目名（title 为 None），
+#   写订阅表时会抛 TypeError。修好前请一律用写法 A。
+# python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py --subscribe "https://podcasts.apple.com/..."
 
 # 2. 拉取增量（新期数 + AI 摘要）
 python3 .agents/skills/rss-grab/scripts/fetch_rss_feed.py --fetch-updates
