@@ -72,8 +72,16 @@ def _prod_notes_dir() -> pathlib.Path:
     抽成函数而不是内联表达式：打标闸门要判断「产物是否落在生产目录」，
     单测需要把这个基准换到 tmp 下。内联的话单测只能改模块级常量，
     与生产代码的实际推导脱节，等于没测到闸门本身。
+
+    ⚠️ 2026-10-08 修：原先写 `_SHARED.parent.parent / "rss" / "notes"`，
+    但 `_SHARED` = `<repo>/.agents/skills/_shared`，往上两层是
+    `<repo>/.agents/skills`，拼出来是 `<repo>/.agents/rss/notes` ——
+    **这个目录不存在**。而闸门是 `prod in output.resolve().parents`，
+    基准不存在时该判断恒为 False → **rss 侧自动打标永不触发，且不报错**
+    （静默失败，单测因把基准换成 tmp 目录而没抓到）。改用按 `.agents`
+    反推的 `_REPO_ROOT`，它才是真正的仓库根。
     """
-    return _SHARED.parent.parent / "rss" / "notes"
+    return _REPO_ROOT / "rss" / "notes"
 
 SCRIPTS_ENV = SCRIPT_DIR          # .env 在本目录（rss 的键名是 LLM_*）
 

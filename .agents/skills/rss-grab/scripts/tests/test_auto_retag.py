@@ -79,6 +79,42 @@ def staged(tmp_path, monkeypatch):
     return t, info_path, root
 
 
+def test_prod_notes_dir_not_offset_by_one_level():
+    """断言 4：生产态的 `_prod_notes_dir()` 必须真的指向 `<repo>/rss/notes`。
+
+    **这条是补 2026-10-08 那个静默 bug 的回归防护。**
+
+    当时它写的是 `_SHARED.parent.parent / "rss" / "notes"`，而 `_SHARED`
+    = `<repo>/.agents/skills/_shared`，往上两层是 `<repo>/.agents/skills`
+    —— 拼出 `<repo>/.agents/rss/notes`，**这个目录不存在**。闸门是
+    `prod in output.resolve().parents`，基准不存在时恒为 False，
+    于是 **rss 侧自动打标永不触发，且不报任何错**。
+
+    为什么其它测试抓不到：它们都经 `staged` fixture 把路径相关常量
+    monkeypatch 到 tmp 下，测的是「另一套路径」，永远碰不到生产推导本身。
+    故本测试**不依赖任何 fixture**，直接加载生产模块验证推导。
+
+    实现说明：模块用 `spec_from_file_location` 加载（不在 sys.modules 标准
+    名下），`importlib.reload` 会抛 ModuleNotFoundError，所以直接调函数。
+    """
+    # 按生产源码的原表达式重算，作为「正确答案」
+    shared_dir = v3.SCRIPT_DIR.parent.parent / "_shared"
+    expected = v3._REPO_ROOT / "rss" / "notes"
+    assert expected == shared_dir.parent.parent.parent / "rss" / "notes", (
+        f"参考推导本身不一致：{expected} vs "
+        f"{shared_dir.parent.parent.parent / 'rss' / 'notes'}")
+
+    actual = v3._prod_notes_dir()
+
+    assert actual.name == "notes" and actual.parent.name == "rss", actual
+    # 核心判据：上上级是仓库根，**不是 .agents** —— 这正是原 bug 的形态
+    assert actual.parent.parent.name != ".agents", (
+        f"_prod_notes_dir() 错位到 {actual}（落在 .agents 下），"
+        "闸门基准不存在 → 自动打标永不触发且不报错")
+    assert actual == expected, f"{actual} != {expected}"
+    assert actual.parent.parent == v3._REPO_ROOT, actual.parent.parent
+
+
 def test_main_tags_after_write(tmp_path, monkeypatch, spy, staged):
     """断言 1：正文写完后打标被调用一次，且带上这篇期号 + 正确的 source。"""
     t, info_path, root = staged
