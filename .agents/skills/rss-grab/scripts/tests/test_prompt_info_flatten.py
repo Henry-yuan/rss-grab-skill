@@ -202,8 +202,14 @@ def test_thin_shell_passes_flattened_info_to_pipeline(monkeypatch, tmp_path):
     import json
     import generate_note_v3 as v3
 
+    # ⚠️ 三个键**都要**给：`_shared/env.py` 的 `load_env()` 缺任一键都会
+    # 会 `sys.exit`（这是有意的防呆，不是 bug），而 `generate_note_v3.main()`
+    # 在流程开头就调它。此前这里只设了 API_KEY / BASE_URL，漏了 LLM_MODEL ——
+    # 开发机上有 `scripts/.env` 兜底所以全绿，干净克隆（无 .env）直接 exit。
+    # 值也不能用含 `your-api` 的占位串：`load_env` 会把它当未配置再 exit 一次。
     monkeypatch.setenv("LLM_API_KEY", "test-key-not-a-real-one")
     monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:1/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model-name")
     for var in ("MINIMAX_API_KEY", "MINIMAX_BASE_URL"):
         monkeypatch.delenv(var, raising=False)
 

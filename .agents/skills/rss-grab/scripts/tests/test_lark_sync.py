@@ -571,14 +571,46 @@ def test_cli_push_still_accepts_force():
     assert "--force" in _cli("push", "--help").stdout
 
 
-def test_cli_sync_does_not_require_credentials():
-    """dry-run 不读凭证：没配飞书也要能预览（否则「先试 dry-run」就没意义）。"""
-    env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp"}
+def _fake_project(tmp_path):
+    """在 tmp 下搭一棵与真实仓库**同构**的最小目录树，返回其根。
+
+    `lark_sync.py` 用 `Path(__file__).resolve().parents[4]` 定位项目根，
+    再拼出 `rss/订阅`。本仓库的 `rss/` 被 .gitignore 排除，
+    所以干净 clone（CI / 新用户）里那个目录**根本不存在** ——
+    直接跑 CLI 必然 exit 2，测试就不是在测「要不要凭证」而是在测「目录在不在」。
+
+    刻意**复制**一份 lark_sync.py 到骨架里，而不是 monkeypatch 它的常量：
+    本用例测的正是**子进程 CLI 入口**的凭证读取时机，monkeypatch 对子进程无效。
+    层级必须与仓库一致（.agents/skills/rss-grab/scripts），
+    否则 parents[4] 会落到别处。
+    """
+    root = tmp_path / "proj"
+    scripts = root / ".agents" / "skills" / "rss-grab" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "lark_sync.py").write_bytes(
+        (SCRIPT_DIR / "lark_sync.py").read_bytes())
+    sub = root / "rss" / "订阅"
+    sub.mkdir(parents=True)
+    (sub / "测试节目.md").write_text(SAMPLE, encoding="utf-8")
+    return root
+
+
+def test_cli_sync_does_not_require_credentials(tmp_path):
+    """dry-run 不读凭证：没配飞书也要能预览（否则「先试 dry-run」就没意义）。
+
+    反向断言同样重要：若哪天 `main()` 把 `lark_config()` 提到 dry_run 判断**之前**，
+    这里会因缺 LARK_BASE_TOKEN 而非零退出，当场变红。
+    """
+    root = _fake_project(tmp_path)
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp"}   # 刻意不给任何 LARK_* 凭证
     r = subprocess.run(
-        [sys.executable, str(SCRIPT_DIR / "lark_sync.py"), "push", "--dry-run"],
+        [sys.executable,
+         str(root / ".agents/skills/rss-grab/scripts/lark_sync.py"),
+         "push", "--dry-run"],
         capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stderr
     assert "LARK_BASE_TOKEN" not in r.stderr
+    assert "dry-run" in r.stdout          # 确实跑到了预览，而不是空转退出
 
 
 def test_cli_missing_credentials_exits_nonzero(monkeypatch):
