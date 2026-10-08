@@ -261,11 +261,15 @@ def cmd_subscribe(apple_url: str, feed_url_override: str = "") -> None:
         try:
             result = resolve_apple_podcast.resolve_apple_url(apple_url)
             feed_url = result["feed_url"]
+            # 用 `or ""` 而不是 .get(k, "")：default 只在 **key 缺失** 时生效，
+            # 反推拿不到节目名时 value 是 None（key 在），.get(k, "") 会原样返回
+            # None，后面 setdefault 也不覆盖已有的 None → 一路带到文件名 sanitize
+            # 触发 re.sub TypeError 栈回溯。
             meta = {
-                "title": result.get("title", ""),
-                "description": result.get("description", ""),
+                "title": result.get("title") or "",
+                "description": result.get("description") or "",
             }
-            print(f"✅ Apple Podcasts 反推成功：{result.get('title', '')}")
+            print(f"✅ Apple Podcasts 反推成功：{meta['title'] or '(节目名未知)'}")
             print(f"   feed_url: {feed_url}")
         except (RuntimeError, ValueError) as e:
             if not feed_url_override:
@@ -296,14 +300,21 @@ def cmd_subscribe(apple_url: str, feed_url_override: str = "") -> None:
         sys.exit(1)
 
     # 补全 meta（反推可能只拿到 title/description，RSS XML 有完整元数据）
-    meta.setdefault("title", feed["title"])
+    # 用 `if not` 而不是 setdefault：setdefault 不覆盖 **已存在的 None**，
+    # 反推失败时 meta["title"] 恰恰是 None，兜底就会静默失效。
+    if not meta.get("title"):
+        meta["title"] = feed["title"]
     meta["author"] = feed.get("author", "")
     meta["language"] = feed.get("language", "")
     meta["link"] = feed.get("link", "")
     # 优先 RSS 完整简介（Apple 反推的可能只有摘要段落）；RSS 没有才用 Apple 的
-    meta["description"] = feed.get("description", "") or meta.get("description", "")
+    meta["description"] = feed.get("description") or meta.get("description") or ""
 
     source_name = meta["title"]
+    if not source_name:
+        print("❌ 节目名无法确定（Apple 反推与 RSS 元数据都没有 title），退出")
+        print("   可用 --feed-url <manual> 手动指定 RSS feed URL 后重试")
+        sys.exit(1)
     entry = subscribe_manager.add_subscription(feed_url, source_name, meta)
     print(f"\n✅ 订阅成功：{source_name}")
     print(f"   状态文件: {entry.get('state_file', '')}")

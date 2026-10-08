@@ -653,9 +653,22 @@ def main() -> int:
 
     if a.all:
         root = SCRIPT_DIR.parent.parent.parent.parent
-        subs = json.loads((root / "rss" / "订阅" / "subscriptions.json")
-                          .read_text(encoding="utf-8"))
-        files = [root / src["state_file"] for src in subs["sources"]]
+        subs_path = root / "rss" / "订阅" / "subscriptions.json"
+        # 用户还没订阅任何节目就跑 --all 是正常的起步动作（README 的「先看清单」），
+        # 不是错误。读之前先判断，给一行提示正常退出，别抛 FileNotFoundError 栈回溯。
+        if not subs_path.exists():
+            print("💡 还没有任何订阅：找不到 rss/订阅/subscriptions.json")
+            print("   请先添加订阅，例如：")
+            print("     fetch_rss_feed.py --subscribe <Apple Podcasts 链接>")
+            return 0
+        subs = json.loads(subs_path.read_text(encoding="utf-8"))
+        sources = subs.get("sources") or []
+        if not sources:
+            print("💡 订阅表是空的（sources 没有任何条目），没有可处理的内容")
+            print("   请先添加订阅，例如：")
+            print("     fetch_rss_feed.py --subscribe <Apple Podcasts 链接>")
+            return 0
+        files = [root / src["state_file"] for src in sources]
     elif a.state_file:
         files = [Path(a.state_file)]
     else:

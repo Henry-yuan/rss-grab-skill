@@ -165,6 +165,10 @@ def add_subscription(feed_url: str, source_name: str, meta: dict | None = None) 
     meta = meta or {}
     data = load_subscriptions()
 
+    # 节目名兜底：None/空白会让 _sanitize_filename 里的 re.sub 抛 TypeError
+    # （re.sub 的 pattern 收 str，subject 收 None 就炸），变成裸栈回溯。
+    source_name = (source_name or "").strip() or "未命名节目"
+
     # 查重：同名声源更新，不新增
     existing = None
     for src in data["sources"]:
