@@ -30,7 +30,7 @@ import append_index                      # noqa: E402
 import generate_note_v3 as v3          # noqa: E402
 import subscribe_manager as sm         # noqa: E402
 
-FULL_GUID = "6a7410b31b5e24969ce9c46e"
+FULL_GUID = "rss-episode-guid-0001"
 HASH8 = "f35eb04d"
 SHOW = "独树不成林"
 

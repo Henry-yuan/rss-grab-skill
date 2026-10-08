@@ -39,6 +39,42 @@ sys.path.insert(0, str(_SHARED))
 
 from env import load_env  # noqa: E402
 
+# 打标接线：笔记落盘后自动补跑 scripts/retag.py。
+# import 本模块只做 subprocess 调脚本，不把 retag / openai 拖进本进程，
+# 因此不会给正文生成引入额外的 import 期副作用。
+#
+# ⚠️ 仓根必须按 `.agents` 这个目录名反推，不能用 `_SHARED.parent.parent`
+# —— 后者会因本脚本被软链到别处（~/.agents/skills/…）而指向错误的目录，
+# 于是 `scripts/` 找不到、import 期就 ModuleNotFoundError，
+# 连 `--help` 都跑不起来。
+_REPO_ROOT = next((p for p in [SCRIPT_DIR, *SCRIPT_DIR.parents]
+                   if p.name == ".agents"), None)
+_REPO_ROOT = (_REPO_ROOT.parent if _REPO_ROOT else
+              SCRIPT_DIR.parent.parent.parent.parent)
+if str(_REPO_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+try:
+    from retag_hook import auto_retag
+except ImportError:      # noqa: BLE001
+    # 打标接线缺失**不能**让正文生成整个不可用（本脚本还得能被 --help 探测、
+    # 被批量入口当子进程调用）。降级成「不自动打标」，由既有的体检告警兜。
+    def auto_retag(source, ids, apply=True):       # noqa: ANN001, ANN201
+        print("⚠️ 未找到 retag_hook，自动打标已跳过（不影响正文产出）；"
+              "标签留空，下次体检会被 G1 告警抓出来。", flush=True)
+        return False
+
+RETAG_SOURCE = "rss"
+
+
+def _prod_notes_dir() -> pathlib.Path:
+    """生产笔记目录 `rss/notes`。
+
+    抽成函数而不是内联表达式：打标闸门要判断「产物是否落在生产目录」，
+    单测需要把这个基准换到 tmp 下。内联的话单测只能改模块级常量，
+    与生产代码的实际推导脱节，等于没测到闸门本身。
+    """
+    return _SHARED.parent.parent / "rss" / "notes"
+
 SCRIPTS_ENV = SCRIPT_DIR          # .env 在本目录（rss 的键名是 LLM_*）
 
 
@@ -278,6 +314,17 @@ def main() -> int:
     else:
         ap.error("需要 <guid_hash8> 或 --transcript + --info")
 
+    if not a.transcript and not a.info and not a.guid_hash8:
+        ap.error("需要 <guid_hash8> 或 --transcript + --info")
+
+    # hash8 在打标接线处也要用（retag --ids 的主键），而下面只在「没有显式
+    # --output 且没有既有产物」那条分支里算它 —— 早退路径上它是未定义的。
+    # 提到这里统一算一次，两处共用同一个值。
+    # 从源文件名尾部取（`<标题>-<hash8>.transcript.md`），别用 `t.stem` ——
+    # 它只剥 `.md`，会留下 `...-6505cacd.transcript` 这种尾巴。
+    _m_hash = re.search(r"-([0-9a-f]{8})\.transcript\.md$", t.name)
+    hash8 = a.guid_hash8 or (_m_hash.group(1) if _m_hash else t.name)
+
     if not a.output:
         # ⚠️ 2026-10-05（与 bili 侧同源修复）：原先默认落
         # `SCRIPT_DIR / f"d3out-{t.stem}.md"` —— **skill 脚本目录内部**，
@@ -290,11 +337,6 @@ def main() -> int:
             a.output = existing
         else:
             info = json.loads(pathlib.Path(i).read_text(encoding="utf-8"))
-            # hash8：位置参数优先；`--transcript` 分支从源文件名尾部取
-            # （`<标题>-<hash8>.transcript.md`），别用 `t.stem` —— 它只剥 `.md`，
-            # 会留下 `...-6505cacd.transcript` 这种尾巴。
-            m = re.search(r"-([0-9a-f]{8})\.transcript\.md$", t.name)
-            hash8 = a.guid_hash8 or (m.group(1) if m else t.name)
             # 源目录名 = feed.title（与既有 `rss/notes/<节目名>/` 布局一致，
             # 实测 十字路口Crossing / 独树不成林 都是这么来的）。
             # ⚠️ 不要自造 `_source_dir` 之类字段 —— info.json 里根本没有它。
@@ -386,6 +428,18 @@ def main() -> int:
     # 会把本来能标记的单篇生成一并跳过。
     if not a.no_index:
         print(f"   订阅状态={mark_subscribe_done(info, a.output)}")
+
+    # 自动打标：正文已落盘，这里才打标。本脚本一次只处理一篇（批量由
+    # batch_notes.py 起多个进程驱动），所以每篇调一次。
+    # 闸门是「产物落在生产 notes 目录」：--output 指到别处（如批量重生成到
+    # 暂存目录）时不消耗打标额度。--no-index 批量跑产物仍在生产目录，故仍打标。
+    try:
+        _prod_notes = _prod_notes_dir().resolve()
+        _in_prod = _prod_notes in a.output.resolve().parents
+    except OSError:
+        _in_prod = False
+    if _in_prod:
+        auto_retag(RETAG_SOURCE, [hash8])
     return 0
 
 
