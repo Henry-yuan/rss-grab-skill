@@ -114,19 +114,52 @@ def _segs(n, text):
     return [{"start": float(i), "end": float(i) + 1, "text": text} for i in range(n)]
 
 
-def test_段数过少算失败():
+def test_正文净字数过少算失败():
     failed, reason = asr.is_asr_failed(_segs(1, "any content at all"))
     assert failed is True
-    assert "segments" in reason
+    assert "净字数" in reason
 
 
-def test_幻觉输出算失败():
-    """whisper 在无语音时的固定输出：必须拦下，不能拿去生成笔记。"""
+def test_段数少但内容足不算失败():
+    """🔴 2026-10-12 修的真 bug 的回归锁。
+
+    旧判据 `segments < 3` 把「段数」当「内容量」用。whisper 遇到连续密集口播
+    会合并成大段，少段数不等于没内容 —— 实测有笔记 48 秒只出 2 段、
+    336 字完整正文，却被判「无语音」，内容直接丢失。
+    """
+    real = ("要做好需求管理呢,一定要掌握三层管理法。第一层,战略层需求,"
+            "对应的是咱们年度季度的战略目标。数量少,但是每个都决定着项目的生死。"
+            "核心管理逻辑是,高层研讨确定,季度规划,且定了就基本不动。"
+            "第二层是常规的业务需求,来自月度周度的数据分析,用户反馈和市场变化。")
+    for n in (1, 2):
+        assert asr.is_asr_failed(_segs(n, real))[0] is False, \
+            f"{n} 段但长正文应判成功，段数少不是内容少的证据"
+
+
+def test_长篇循环幻觉仍算失败():
+    """字数判据兜不住的那一半：whisper 会把同一句幻觉循环重复几十遍。
+
+    这种样本字数轻松过阈值，只能靠模式识别 —— 所以模式表不许被「反正有字数
+    判据了」的理由删掉。
+    """
+    for loop in ("字幕志愿者 " * 80, "Thanks for watching! " * 60,
+                 "Subtitles by the Amara.org community " * 40):
+        failed, reason = asr.is_asr_failed(_segs(9, loop))
+        assert failed is True, "长篇循环幻觉必须判失败"
+        assert "幻觉" in reason
+
+
+def test_短幻觉一律被拦():
+    """whisper 在无语音时的固定输出：必须拦下，不能拿去生成笔记。
+
+    ⚠️ 这里**不断言 reason 含「幻觉」**：这些样本都很短，先被字数阈值拦下，
+    报的是「正文净字数不足」。模式判据那条路径由
+    `test_长篇循环幻觉仍算失败` 单独覆盖 —— 两层各测各的，别混在一起断言。
+    """
     for text in ("字幕志愿者", "字幕君", "字幕组", "字幕字幕字幕",
                  "Thanks for watching!", "Subtitles by the Amara.org community"):
         failed, reason = asr.is_asr_failed(_segs(6, text))
-        assert failed is True, f"幻觉「{text}」应判失败"
-        assert "幻觉" in reason
+        assert failed is True, f"幻觉「{text}」应判失败，实际报：{reason}"
 
 
 def test_任何语种的正常转写都不算失败():
@@ -135,18 +168,33 @@ def test_任何语种的正常转写都不算失败():
     判据只看「有没有内容」，绝不能把非中文内容误判成失败 ——
     主项目曾用「中文字符 < 50」当判据，实测 5 份真实英文访谈笔记中招，
     转写稿顶部还挂了假的「未识别到有效内容」横幅。
+
+    ⚠️ 样本必须够长（>80 字）才有意义：判据问的是**内容量**不是语种，
+    用一句十几字的日文证明「不判失败」，测的其实是字数够不够 —— 两件事别混。
     """
-    for text in ("Welcome back to the show, today we talk about AI.",
-                 "こんにちは、今日の番組です",
-                 "OK so 这个 topic 很有意思"):
+    for text in ("Welcome back to the show. Today we discuss how podcast hosts "
+                 "prepare for interviews and why most episodes lose listeners "
+                 "in the first ten minutes of the conversation.",
+                 "こんにちは、今日はこの番組についてお話しします。"
+                 "ポッドキャストのホストがインタビュー准备的をどう整えるか、"
+                 "詳しく見ていきましょう。実例を挙げながら説明します。",
+                 "OK so 这个 topic 真的很有意思 we should talk about it "
+                 "in more detail with the guests and the listeners"):
         failed, reason = asr.is_asr_failed(_segs(8, text))
         assert failed is False, f"「{text[:20]}…」应判成功，实际：{reason}"
 
 
-def test_签名里没有语种旋钮():
-    """`min_chinese_chars` 不得以任何形式回来 —— 那是被删掉的错误判据。"""
+def test_签名里没有已删旋钮():
+    """被删掉的旋钮不得以任何形式回来 —— 那是被证伪的判据。
+
+    min_chinese_chars：语种 ≠ 内容量（误伤真英文访谈）
+    min_segments：段数 ≠ 内容量（误杀密集口播）
+    """
     import inspect
-    assert "min_chinese_chars" not in inspect.signature(asr.is_asr_failed).parameters
+    params = inspect.signature(asr.is_asr_failed).parameters
+    assert "min_chinese_chars" not in params
+    assert "min_segments" not in params, "旧段数旋钮已删，签名里不该还留着"
+    assert "min_body_chars" in params
     src = inspect.getsource(asr.is_asr_failed)
     assert "chinese" not in src.lower() and "\\u4e00" not in src
 
