@@ -17,6 +17,13 @@
 5. G2 数量上限：超限报、恰好等于上限不报（边界必须锁）
 6. rss 主键形态（8 位 hex）与 `raw/` 三层结构的对账取值器
 
+## 依赖前提
+
+`audit_frontmatter.py` 直接 `import yaml`。缺 PyYAML 时那个脚本走
+`sys.exit(...)`，会让本文件在 **collection 阶段**抛 SystemExit，
+pytest 报 **INTERNALERROR**——一个测试都没跑起来，其它文件的失败也被掩盖。
+故这里用 `importorskip`：缺依赖只跳过**本文件**，其余测试照常跑出结果。
+
 运行：
     python3 -m pytest .agents/skills/rss-grab/scripts/tests/test_audit_frontmatter.py -v
 """
@@ -35,6 +42,10 @@ TESTS_DIR = pathlib.Path(__file__).resolve().parent.parent      # …/rss-grab/s
 SKILL_DIR = TESTS_DIR.parent
 REPO_ROOT = SKILL_DIR.parent.parent.parent                       # tests→scripts→skill→skills→repo
 sys.path.insert(0, str(REPO_ROOT / "scripts"))                  # _tag_limits 在仓根 scripts/ 下
+
+# 缺 PyYAML 只跳过**本文件**，而不是让下面的 exec_module 抛 SystemExit
+# 把整个 pytest 打成 INTERNALERROR（一个测试都跑不起来、其余失败被掩盖）。
+pytest.importorskip("yaml", reason="audit_frontmatter 依赖 PyYAML；见 requirements.txt")
 
 _spec = importlib.util.spec_from_file_location(
     "audit_under_test", REPO_ROOT / "scripts" / "audit_frontmatter.py")

@@ -14,7 +14,18 @@ import pathlib
 import sys
 
 import pytest
-import yaml
+
+# 本文件直接 `import yaml` 并从 frontmatter_contract 导入符号。
+# 缺 PyYAML 时这行会 ImportError → pytest 在 **collection 阶段**报错 →
+# 整个 run 被打断（别的测试一个都跑不到）。用 importorskip 把它降级成
+# 「只跳过本文件」，其余测试照常出结果。
+# 2026-10-14：GitHub runner 镜像不再自带 PyYAML，CI 首次因此全红。
+pytest.importorskip("yaml", reason="frontmatter_contract 依赖 PyYAML；见 requirements.txt")
+
+# ⚠️ 必须放在 importorskip **之后**：本文件的用例直接用 `yaml.safe_load` 读回
+# 校验值。缺依赖时由上一行跳过本文件；若把 import 提到它前面，
+# collection 阶段就 ImportError，整个 run 被打断（更坏的失败形态）。
+import yaml  # noqa: E402
 
 _SHARED = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SHARED))
