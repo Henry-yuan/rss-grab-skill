@@ -76,7 +76,8 @@ def _has_existing_note(source_cfg: dict, id_: str) -> bool:
 
 
 def _run_regenerate(regenerate_script: Path, id_: str,
-                     touch_index: bool = False) -> tuple[bool, str]:
+                     touch_index: bool = False,
+                     force: bool = False) -> tuple[bool, str]:
     """跑 generate_note_v3.py 单期，返回 (ok, msg)。
 
     ⚠️ 2026-10-05：默认给子进程加 `--no-index`。
@@ -88,6 +89,8 @@ def _run_regenerate(regenerate_script: Path, id_: str,
     cmd = [sys.executable, str(regenerate_script), id_]
     if not touch_index:
         cmd.append("--no-index")
+    if force:
+        cmd.append("--force")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if r.returncode == 0:
@@ -207,7 +210,7 @@ def main():
             semaphore.acquire()  # 占一个并发位（熔断后这里等更久）
             id_ = _extract_id(tp, source_cfg)
             fut = pool.submit(_run_regenerate, source_cfg["regenerate"], id_,
-                              args.index)
+                              args.index, force=args.force)
             # 关键修复：future 完成后必须释放信号量位，否则 20 个位被永久占用，
             # 第 21 篇 semaphore.acquire() 永久阻塞，整个循环卡死（20 篇后停滞的根因）
             fut.add_done_callback(_release_slot)

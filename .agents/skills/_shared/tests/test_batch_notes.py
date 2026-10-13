@@ -287,3 +287,105 @@ if __name__ == "__main__":
         test_todo_build_with_max(None, Path(td))
 
     print(f"\n全部 {len(simple) + 2} 个测试通过")
+
+
+# ===== 2026-10-13：--force 假成功（批量管道里最难发现的那类）=====
+#
+# 背景：`--force` 原先只用于 `collect_todo()` 决定收哪些 transcript，
+# **从不下传给生成脚本**。下游脚本有自己的防重闸门，见产物就跳过 ——
+# 于是 `batch_notes.py --force` 打印「成功 N / 失败 0」却一篇都没重生成。
+
+
+def test_force_被透传给子进程(monkeypatch):
+    """接线层：`force=True` 时子进程命令行必须含 `--force`，False 时不含。"""
+    import subprocess
+    seen = []
+
+    class _R:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        seen.append(list(cmd))
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    bn._run_regenerate(Path("/x/gen.py"), "abc", force=True)
+    assert "--force" in seen[-1], f"force 没透传下去：{seen[-1]}"
+
+    bn._run_regenerate(Path("/x/gen.py"), "abc", force=False)
+    assert "--force" not in seen[-1], f"没 force 却传了：{seen[-1]}"
+
+
+def test_force_真的让下游重生成_而非只把参数传出去(tmp_path):
+    """端到端：`--force` 必须真的触发重生成。
+
+    ⚠️ 只测「命令行里有 --force」挡不住「传了但下游不认」——
+    这里用一个**复刻下游防重闸门行为**的假生成脚本：
+    产物存在就跳过，除非收到 `--force`。只有产物真被改写才算通过。
+    """
+    import subprocess
+
+    gen = tmp_path / "fake_gen.py"
+    gen.write_text(
+        "import sys, pathlib\n"
+        "args = sys.argv[1:]\n"
+        "out = pathlib.Path(args[0])\n"
+        "if out.exists() and '--force' not in args:\n"
+        "    print('skip: 已有产物')\n"
+        "    sys.exit(0)\n"
+        "out.write_text('regenerated|' + '|'.join(args), encoding='utf-8')\n"
+        "print('ok: 已重新生成')\n",
+        encoding="utf-8",
+    )
+    product = tmp_path / "note.md"
+    product.write_text("旧内容", encoding="utf-8")
+
+    ok, msg = bn._run_regenerate(gen, str(product), force=False)
+    assert ok, f"退出码非 0：{msg}"
+    assert product.read_text(encoding="utf-8") == "旧内容", \
+        "没传 force 却被重写了 —— 防重闸门失效"
+
+    ok, msg = bn._run_regenerate(gen, str(product), force=True)
+    assert ok, f"退出码非 0：{msg}"
+    new = product.read_text(encoding="utf-8")
+    assert new.startswith("regenerated"), f"带 force 仍未重生成，产物={new[:60]!r}"
+    assert "--force" in new, "产物里没有 --force，说明参数没到下游"
+
+
+def test_各源生成脚本都接受_force():
+    """守门：SOURCES 里每个源的生成脚本都必须真的接受 `--force`。
+
+    刻意不做「能力声明」——漏传会静默失效，多传会 argparse 响亮报错。
+    宁可响亮失败，也不要静默空转。
+    """
+    import subprocess as sp
+    missing = []
+    for name, cfg in bn.SOURCES.items():
+        script = Path(cfg["regenerate"])
+        if not script.exists():
+            missing.append(f"{name}(脚本不存在)")
+            continue
+        r = sp.run([sys.executable, str(script), "--help"],
+                   capture_output=True, text=True, timeout=60)
+        if "--force" not in (r.stdout + r.stderr):
+            missing.append(name)
+    assert not missing, \
+        f"这些源的生成脚本不接受 --force（batch_notes 会 argparse 报错）：{missing}"
+
+
+def test_main_把_args_force_接到_run_regenerate():
+    """守门：调用点必须把 `args.force` 传下去。
+
+    ⚠️ 这条是变异验证补出来的：只测 `_run_regenerate` 函数本身的话，
+    把调用点的 `force=args.force` 删掉后测试依然全绿——
+    而那正是本 bug 最初的样子（flag 收了、没接到下游）。
+    """
+    src = Path(bn.__file__).read_text(encoding="utf-8")
+    m = re.search(r"pool\.submit\(\s*_run_regenerate\b(.{0,400}?)\)\s*\n", src, re.S)
+    assert m, "找不到 pool.submit(_run_regenerate, ...) 调用点"
+    call = m.group(1)
+    assert "args.force" in call, \
+        f"调用点没把 args.force 接到 _run_regenerate（这正是原 bug）：\n{call.strip()[:240]}"
