@@ -155,6 +155,33 @@ def apply_429_breaker(msg: str, breaker: list[int], active_limit: list[int]) -> 
     return active_limit[0]
 
 
+def _warn_force_clears_tags(force: bool, source: str, done: int) -> None:
+    """`--force` 重生成会清空 tags —— 2026-10-13 实测后加的告警。
+
+    打标是**独立的后置步骤**（`scripts/retag.py`，刻意从 v3 管线剥离，
+    因为打标要反复跑、不该每篇生成都烧一次 LLM）。重生成只跑 v3 四步管线、
+    不跑打标 → 产出的 `tags` 是空的。
+
+    实测量化（隔离副本内）：干净库重生成 53 篇后 60 处异常，
+    绝大多数 `G1_tags_missing`。
+
+    刻意只告警、**不自动接回打标**：打标独立是刻意设计，
+    接回去等于每篇生成都多烧一次 LLM token。恢复动作交回给使用者。
+
+    只在「确实 --force 且确实成功了至少一篇」时告警——
+    没 force、或一篇都没成功时，tags 没被动过，告警是噪音。
+    """
+    if not (force and done):
+        return
+    print("")
+    print("  ⚠️⚠️⚠️  --force 重生成会清空 tags  ⚠️⚠️⚠️")
+    print("  打标是独立后置步骤（scripts/retag.py），重生成只跑 v3 管线、不跑打标，")
+    print(f"  故本次成功的 {done} 篇的 tags 已被清空。")
+    print(f"  恢复：python3 scripts/retag.py --source {source} --apply")
+    print("  （只想补本次这几篇可加 --ids <逗号分隔主键> 定向跑，省 token）")
+    print("  不恢复的话，audit_frontmatter.py 会报 G1_tags_missing。")
+
+
 def main():
     ap = argparse.ArgumentParser(description="批量笔记生成（20 并发，可暂停续跑）—— rss 专用")
     ap.add_argument("--source", choices=["rss"], required=True,
@@ -261,6 +288,20 @@ def main():
             sys.exit(130)
 
     print(f"\n=== 笔记完成[{args.source}]：成功 {done_count[0]} / 失败 {fail_count[0]} ===")
+
+    # ⚠️ --force 会清空 tags —— 2026-10-13 实测后加的告警。
+    #
+    # 打标是**独立的后置步骤**（`scripts/retag.py`，刻意从 v3 管线剥离，
+    # 因为打标要反复跑、不该每篇生成都烧一次 LLM）。重生成只跑 v3 四步管线、
+    # 不跑打标 → 产出的 `tags` 是空的。
+    #
+    # 实测量化（隔离副本内）：干净库重生成 53 篇后 60 处异常，
+    # 绝大多数 `G1_tags_missing`。
+    #
+    # 刻意只告警、**不自动接回打标**：打标独立是刻意设计，
+    # 接回去等于每篇生成都多烧一次 LLM token。恢复动作交回给使用者。
+    _warn_force_clears_tags(args.force, args.source, done_count[0])
+
     if fail_count[0]:
         print("  失败的期下次重跑会重试（无笔记不算完成）")
         sys.exit(1)  # 有失败 -> 非零退出码（脚本化调用可感知）

@@ -389,3 +389,31 @@ def test_main_把_args_force_接到_run_regenerate():
     call = m.group(1)
     assert "args.force" in call, \
         f"调用点没把 args.force 接到 _run_regenerate（这正是原 bug）：\n{call.strip()[:240]}"
+
+
+def test_force_成功时打印_tags_告警(capsys):
+    """--force 且至少成功一篇 → 必须打印清空 tags 的告警，且带上篇数。"""
+    bn._warn_force_clears_tags(True, "rss", 3)
+    out = capsys.readouterr().out
+    assert "--force" in out and "tags" in out, f"没打印告警：{out!r}"
+    assert "3" in out, f"告警里应含被清空的篇数：{out!r}"
+    assert "retag.py" in out, f"告警必须给出恢复命令：{out!r}"
+
+
+def test_没_force_时不告警(capsys):
+    """没加 --force → tags 没被动过，告警是噪音。"""
+    bn._warn_force_clears_tags(False, "rss", 3)
+    assert capsys.readouterr().out == "", "没 force 却告警了"
+
+
+def test_force_但零成功_时不告警(capsys):
+    """--force 但一篇都没成功 → 没产物被重写，tags 没被动过。"""
+    bn._warn_force_clears_tags(True, "rss", 0)
+    assert capsys.readouterr().out == "", "零成功却告警了"
+
+
+def test_main_收尾_调用了_tags_告警():
+    """守门：收尾必须真的调用它（否则函数存在但从不执行，等于没写）。"""
+    src = Path(bn.__file__).read_text(encoding="utf-8")
+    assert "_warn_force_clears_tags(args.force" in src, \
+        "main() 收尾没调用 _warn_force_clears_tags —— 告警写了但从不触发"
