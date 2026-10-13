@@ -37,10 +37,23 @@ sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
 TS_LINE = re.compile(r"^\*\*\[\d{1,2}:\d{2}\]\*\*")
 SENT_END = re.compile(r"[。！？!?…；;]([\"』」）)]*)\s*$")
 
-MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash-Preview")
-BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1")
-MAX_COMPLETION = int(os.environ.get("MINIMAX_MAX_COMPLETION", "100000"))
+# 通用名优先、专有名兜底（2026-10-14）。本仓 env.py 的 load_env 只认通用名
+# LLM_API_KEY / LLM_BASE_URL / LLM_MODEL，本文件此前只认专有名 ——
+# 照 .env.example 配好通用名的用户，在这里会被塞回写死的默认模型与服务地址。
+# 嵌套 os.environ.get 而非 `or`：`or` 分不清「未设置」与「显式设空」。
+MODEL = os.environ.get("LLM_MODEL",
+                       os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash-Preview"))
+BASE_URL = os.environ.get("LLM_BASE_URL",
+                           os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1"))
+MAX_COMPLETION = int(os.environ.get(
+    "LLM_MAX_COMPLETION", os.environ.get("MINIMAX_MAX_COMPLETION", "100000")))
 TIMEOUT = 1800
+
+# 逐块抽取 / 合并的 effort 档位。同样支持 LLM_EFFORT 统一覆盖
+# （不想逐档微调时，一个变量管全部）；显式设空（LLM_EFFORT=）
+# → 取到 "" → 调用时不发 reasoning_effort，见 _call。
+SCAN_EFFORT = os.environ.get("LLM_EFFORT", os.environ.get("MINIMAX_EFFORT", "xhigh"))
+MERGE_EFFORT = os.environ.get("LLM_EFFORT", os.environ.get("MINIMAX_EFFORT", "medium"))
 
 # ── ② 逐块抽取提示词 ─────────────────────────────────
 SCAN_SYS = """你是转写内容分析助手。下方是某段语音转写的一个片段。
@@ -278,8 +291,10 @@ def _call(client, sys_p, user_p, effort: str) -> str:
     th = threading.Thread(target=_beat, daemon=True)
     th.start()
     try:
+        # effort == ""（LLM_EFFORT 显式设空）→ 不发 reasoning_effort
+        effort_kwargs = {} if effort == "" else {"reasoning_effort": effort}
         r = client.chat.completions.create(
-            model=MODEL, reasoning_effort=effort,
+            model=MODEL, **effort_kwargs,
             max_completion_tokens=MAX_COMPLETION, temperature=0.2,
             timeout=TIMEOUT,
             messages=[{"role": "system", "content": sys_p},
@@ -437,10 +452,12 @@ def main() -> int:
     ap.add_argument("--size", type=int, default=10000,
                     help="分块目标字符数。实测选定 10000（Orca 篇 n=2 召回 98.7%%，零波动）")
     ap.add_argument("--overlap", type=int, default=1)
-    ap.add_argument("--scan-effort", default="xhigh",
-                    help="逐块抽取 effort。实测选定 xhigh（96.2%% > max 94.9%%，且快一倍）")
-    ap.add_argument("--merge-effort", default="medium",
-                    help="合并 effort。⚠️ 尚未实测，当前为占位默认值")
+    ap.add_argument("--scan-effort", default=SCAN_EFFORT,
+                    help="逐块抽取 effort。实测选定 xhigh（96.2%% > max 94.9%%，且快一倍）；"
+                         "可用环境变量 LLM_EFFORT 统一覆盖，显式设空则不发该参数")
+    ap.add_argument("--merge-effort", default=MERGE_EFFORT,
+                    help="合并 effort。⚠️ 尚未实测，当前为占位默认值；"
+                         "可用环境变量 LLM_EFFORT 统一覆盖，显式设空则不发该参数")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="逐块抽取的并发数；>1 时按 --stagger 错开发射")
     ap.add_argument("--stagger", type=float, default=2.0,
@@ -455,12 +472,17 @@ def main() -> int:
     args = ap.parse_args()
 
     _load_env()
-    if not os.environ.get("MINIMAX_API_KEY"):
-        print("❌ 未配置 MINIMAX_API_KEY", file=sys.stderr)
+    # 通用名优先、专有名兜底。⚠️ 这里此前**只读专有名**，而本仓 env.py 的
+    # load_env 放行的恰恰只有通用名 LLM_API_KEY —— 于是任何照 .env.example
+    # 配好的用户都必然撞上「未配置 MINIMAX_API_KEY」并退出，本脚本在本仓不可用。
+    # 必须在 load_env **之后**读：.env 此刻才刚被载入，不能提到模块级。
+    api_key = os.environ.get("LLM_API_KEY", os.environ.get("MINIMAX_API_KEY", ""))
+    if not api_key:
+        print("❌ 未配置 LLM_API_KEY（MINIMAX_API_KEY 亦可）", file=sys.stderr)
         return 1
 
     from openai import OpenAI
-    client = OpenAI(api_key=os.environ["MINIMAX_API_KEY"],
+    client = OpenAI(api_key=api_key,
                     base_url=BASE_URL, timeout=TIMEOUT)
 
     # ── 合并步单独实验：复用已有要点，跳过分块与抽取 ──

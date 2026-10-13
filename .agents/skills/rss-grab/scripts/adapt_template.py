@@ -178,7 +178,14 @@ def main():
     llm_result = call_llm_for_template_choice(transcript_head, templates)
 
     plan = {
-        "bvid_or_note_id": derive_id_from_path(args.transcript_path),
+        # 2026-10-14：原 key 是**只写不读**的内部键（下游
+        # `generate_note_v2.py` 只读 is_fallback / template_used / style_detected；
+        # `regenerate_note_v2.py` 自己按 transcript 文件名拼路径），
+        # 但它带着本仓库**不开源**的另一个平台的缩写 —— 开源边界守门
+        # （`_shared/tests/test_open_source_guard.py`）会判红。
+        # 改用中性名；键名变了，值与输出文件名格式均不变，
+        # 且没有任何读取方会因此失效。
+        "entry_id": derive_id_from_path(args.transcript_path),
         "title": args.title or args.transcript_path.stem,
         "transcript_chars": total_chars,
         "truncated_chars_used": len(transcript_head),
@@ -190,7 +197,7 @@ def main():
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.output_dir / f"{plan['bvid_or_note_id']}.template_plan.json"
+    output_path = args.output_dir / f"{plan['entry_id']}.template_plan.json"
     output_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"✅ 模板适配完成")

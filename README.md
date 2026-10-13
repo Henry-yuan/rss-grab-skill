@@ -74,6 +74,7 @@ flowchart TB
 | 批量下载 | 利用 yt-dlp 下载音频（串行 + CDN 礼仪间隔） |
 | ASR 转写 | mlx-whisper large-v3-turbo（仅 Apple Silicon），带**时长完整性校验** |
 | 笔记生成 | v3 四步管线（错字纠错 → 分块扫描 → 合并去重 → 撰写 → 校验），长短文同一入口，批量 20 并发 |
+| 自动打标 | 笔记**落盘之后**另跑一次 LLM 生成 `tags`（与正文生成是两个独立阶段），可用体检脚本核查 |
 | Apple Podcasts 反向解析 | 网页链接 → RSS feed URL 自动提取 |
 | LLM 兼容 | OpenAI 兼容接口，不绑定任何特定服务，可配任意兼容服务 |
 
@@ -82,11 +83,39 @@ flowchart TB
 批量调用 LLM 时内置了并发与限流保护，避免打爆 API 或触发限流：
 
 - **并发 20**：AI 摘要、批量笔记生成默认 20 并发（实测无 429 限流）
-- **发射间隔**：每请求间隔 ≥2s（摘要 ≥5s），避免瞬时请求风暴
+- **发射间隔**：每请求间隔 ≥2s（摘要与批量笔记同一档），避免瞬时请求风暴
 - **429 熔断降级**：遇到限流自动降并发（摘要 20→15；笔记 20→15→10），并指数退避重试
 - **断点续跑**：中断后重跑自动跳过已处理项（checkpoint 落盘），不会重复消耗 token
 - **v3 分块扫描并发**：长播客②步分块并行精读（单块失败自动沿用原文并告警，不静默丢内容）
 - **阶段 3 自动化默认 5 并发**（`NOTE_MAX_PARALLEL` 可调）：`generate_note_for_confirmed.py` 只处理「确认抓取」区的 `[x]`，待确认 `[ ]` / 确认不抓 `[~]` / 已转化 `[done]` 一律跳过——不为用户没审过的内容烧 token
+
+### 自动打标（`tags`）
+
+**标签不是笔记生成管线产出的**，是笔记落盘之后**单独再跑一次** LLM 生成的。
+
+- 正文管线（v3）只写正文与信头，**不写 `tags`**；标签由 `scripts/retag.py` 补上
+- 走的是 `scripts/retag_hook.py` 这个薄壳：单篇生成后立刻调一次，批量生成则把全部 id 一次传给同一个进程（避免每篇起一次进程、放大环境加载与限流风险）
+- 打标失败**不影响正文**——正文已落盘，hook 只打印一行提示、不抛异常；痕迹是「`tags` 为空但转写状态正常」，交给体检脚本抓
+- 打标输入是**产物自己的 `## TL;DR` + `## 要点总结` 两节**，刻意不喂发布者自打标签与标题（避免复读）；默认 ≤10 个
+
+手动补跑（默认 dry-run，只报告不写盘）：
+
+```bash
+# 抽样看看效果（默认 6 篇）
+python3 scripts/retag.py --source rss --sample 6
+
+# 确认没问题再写盘
+python3 scripts/retag.py --source rss --sample 6 --apply
+
+# 只处理指定笔记
+python3 scripts/retag.py --source rss --ids <note_id,note_id> --apply
+```
+
+体检（查标签漏跑、超数量上限、近义重复等）：
+
+```bash
+python3 scripts/audit_frontmatter.py --source rss
+```
 
 ## 跟同类项目对比
 
@@ -119,17 +148,30 @@ flowchart TB
 
 ## LLM 配置（OpenAI 兼容）
 
-- 代码通过 OpenAI 兼容接口调用 LLM，**不绑定任何特定服务**——你的 `.env` 配哪家就用哪家
+- 代码只走 **OpenAI 兼容接口**（`/chat/completions` + `reasoning_effort` 可选参数），**不绑定任何特定服务**——你的 `.env` 配哪家就用哪家
 - **支持任意 OpenAI 兼容服务**（DeepSeek / OpenAI / MiniMax / 本地 Ollama 等），只需在 `.agents/skills/rss-grab/scripts/.env` 配置（模板见同目录的 `.env.example`，**只有这一份**）：
   ```bash
   LLM_API_KEY=your-key                    # 你的服务 API key
   LLM_BASE_URL=https://your-llm-service/v1   # 你的服务 base_url
-  LLM_MODEL=your-model                    # 你的模型名
+  LLM_MODEL=your-model                    # 你的模型名（三项里最常需要改的一项）
   ```
 - ⚠️ **两个常见踩坑**：
   1. **生效位置是 `scripts/.env`**（`.agents/skills/rss-grab/scripts/.env`）——放在仓库根目录的 `.env` 不会被读取；
   2. **`LLM_MODEL` 是必填**（三项都缺一不可），缺失时脚本会报错退出。
 - 未配置 `LLM_BASE_URL` 时脚本会报错提示。
+
+### 推理强度（`LLM_EFFORT`）
+
+两个 LLM 环节的**默认档位不同**，都可用 `LLM_EFFORT` 统一覆盖：
+
+| 环节 | 默认档位 | 为什么是这个档 |
+|---|---|---|
+| AI 摘要（`preview_podcast.py`） | `high` | 读一遍简介写两句话，不需要更深 |
+| 笔记生成（`_shared/build_v3.py`） | `max` | 四步管线 + 校验，质量优先 |
+
+- 解析顺序：**`LLM_EFFORT` → `MINIMAX_EFFORT` → 默认值**；模型名同理（`LLM_MODEL` → `MINIMAX_MODEL` → 内置兜底），所以厂商专有名的变量仍能用，通用名优先
+- ⚠️ **`LLM_EFFORT=` 显式留空 = 完全不发 `reasoning_effort` 这个参数**。给**不支持该参数的服务**用——发了会直接报 400，整个脚本跑不起来
+- 调高 effort 会明显多花 reasoning token（实测摘要档从 `high` 提到 `xhigh` 平均多花 2.9 倍），不确定时先留着默认值
 
 ## 两种使用方式
 
@@ -158,6 +200,7 @@ brew install yt-dlp ffmpeg
 pip3 install -r requirements.txt   # openai + mlx-whisper（模型见下）
 
 # MLX-Whisper 模型（仅 Apple Silicon）
+# ⚠️ tools/ 在 .gitignore 里（模型体积大），clone 下来是空的，需要自己建
 # 1. 下载模型权重（约 1.6GB，只需一次）
 huggingface-cli download mlx-community/whisper-large-v3-turbo
 # 2. 建软链指向模型
@@ -171,6 +214,7 @@ ln -s ~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo \
 # 模板就在 scripts/ 目录里（全仓库唯一一份），在仓库根目录执行：
 cp .agents/skills/rss-grab/scripts/.env.example .agents/skills/rss-grab/scripts/.env
 # 编辑 .agents/skills/rss-grab/scripts/.env，填入你的 LLM_API_KEY（OpenAI 兼容接口）
+# 可选：LLM_EFFORT 控制推理强度（见「LLM 配置」一节），给不支持该参数的服务要显式留空
 ```
 
 ## 快速开始（命令行）
@@ -212,6 +256,23 @@ python3 .agents/skills/rss-grab/scripts/generate_note_for_confirmed.py --all    
 # 或全量批量（扫所有转写稿）
 python3 .agents/skills/rss-grab/scripts/batch_notes.py
 ```
+
+### 常用参数
+
+多数脚本带 `--help`，下面是实际最常用的几个：
+
+| 参数 | 脚本 | 作用 |
+|---|---|---|
+| `--transcribe` | `fetch_rss_feed.py` | 下载后**直接转写**，省掉分开跑两条命令 |
+| `--force` | `fetch_rss_feed.py` / `batch_transcribe.py` / `generate_note_v3.py` | 跳过 dedup 强制重下 / 强制重转 / 强制重生成笔记 |
+| `--max-updates N` | `fetch_rss_feed.py` | 配合 `--fetch-updates`：每源最多处理 N 期新增（0=全部）。**首次订阅几百期的大 feed 建议限 5**，否则一次性烧掉几百次摘要调用的额度 |
+| `--retry-summary <guid>` | `fetch_rss_feed.py` | 单期重跑 AI 摘要（结果写回状态文件），不用整源重来 |
+| `--sync-pick <状态文件>` | `fetch_rss_feed.py` | 按 checkbox（`[x]`/`[~]`/`[done]`）重新归区 + 更新提示行 |
+| `--unsubscribe <节目名>` | `fetch_rss_feed.py` | 退订：从订阅表删除 + 状态文件标记已退订 |
+| `--auto-notes` | `fetch_rss_feed.py` | 每抓成功一期就入笔记队列 |
+| `--max-parallel N` | `generate_note_for_confirmed.py` | 阶段 3 并发数（默认 5，`NOTE_MAX_PARALLEL` 环境变量同效） |
+| `--keep-audio` | `generate_note_for_confirmed.py` | 转写后**保留** `/tmp` 下的音频（默认删除；排障或想重听时用） |
+| `--max-workers N` | `batch_notes.py` | 批量笔记并发数（默认 20） |
 
 **定时拉取（可选）**：`--fetch-updates` 幂等、重复执行安全，可以配 launchd 每晚自动跑。
 
@@ -295,6 +356,22 @@ launchctl kickstart -k gui/$(id -u)/com.example.rss-fetch
 30 22 * * * /bin/bash /绝对路径/到/仓库/.agents/skills/rss-grab/scripts/run_fetch_updates.sh >> /绝对路径/到/仓库/rss/_logs/cron.log 2>&1
 ```
 
+### 可选：飞书表格镜像（`lark_sync.py`）
+
+**飞书是可选增强，不是依赖**——不装飞书、不配凭证，这个脚本根本不会被调用，`run_fetch_updates.sh` 也完全不碰它。采集主链路不受任何影响。
+
+想用的话：先 `lark-cli auth login`，再在 `.agents/skills/rss-grab/scripts/.env` 里配好表格凭证（变量名与说明见同目录 `.env.example` 的可选段），然后：
+
+```bash
+python3 .agents/skills/rss-grab/scripts/lark_sync.py push   # md → 飞书（新建 + 镜像列对齐）
+python3 .agents/skills/rss-grab/scripts/lark_sync.py pull   # 飞书 → md（只回写状态列）
+python3 .agents/skills/rss-grab/scripts/lark_sync.py sync   # 双向
+python3 .agents/skills/rss-grab/scripts/lark_sync.py push-status  # 只把「已转化」回写飞书
+# 通用参数：--dry-run（只预览不连飞书）/ --节目名 "xxx"（限单源）/ --force（push 才有效：全量重写镜像列）
+```
+
+分工上「状态列归飞书所有」是**结构上保证的**：`push` 更新已有记录时的载荷里根本不放状态这个键，`pull` 只投影「状态 + guid」两列——两边不会互相覆盖。
+
 ### 常见问题
 
 | 现象 | 原因 |
@@ -314,12 +391,27 @@ launchctl kickstart -k gui/$(id -u)/com.example.rss-fetch
 │   └── SKILL.md               # Agent 指令：触发条件 + 阶段 1-4 工作流 + 路径约定
 └── _shared/                   # 共享模块（ASR 转写、.env 加载、路径定位、批量笔记、v3 管线本体）
 
+scripts/                       # 跨阶段工具（入 git，不随 skill 走）
+├── retag.py                   # 打标：按产物正文重生成 frontmatter 的 tags
+├── retag_hook.py              # 打标接线薄壳：笔记落盘后被生成脚本调用
+├── audit_frontmatter.py       # 产物体检（信头字段、标签质量 G1-G4 等）
+└── _tag_limits.py             # 标签数量/长度阈值（retag 与体检共用的唯一真源）
+
 rss/                           # 运行数据（安装后由脚本生成，不入 git）
 ├── 订阅/                    # 订阅表 + 每源状态文件（待确认/确认/已转化 三区）
 ├── raw/                     # 期数元数据（info.json，含 enclosure url）
 ├── transcripts/             # ASR 转写稿（可入 git 防丢失）
-└── notes/                   # 结构化笔记（按源分目录）
+├── notes/                   # 结构化笔记（按源分目录）
+└── _logs/                   # run_fetch_updates.sh / launchd 的日志（自动创建）
+
+tools/                         # 本地模型权重（不入 git，见「安装」第 2 步）
+└── asr-poc/models/whisper-large-v3-turbo/   # 软链到 huggingface 缓存
+
+待抓取URL/                     # 手动维护的批量抓取清单（不入 git）
+└── RSS.md                    # fetch_rss_pending.py 的输入：每行一个 `- [ ] <feed url>`
 ```
+
+> **哪些目录不入 git**：`rss/`（运行数据）、`tools/`（模型权重，体积大且可重新下载）、`待抓取URL/`（个人抓取清单）都在 `.gitignore` 里，clone 下来后由脚本自行创建。`transcripts/` 与 `notes/` 是产物备份价值最高的，可以自行决定是否放开。
 
 音频临时存 `/tmp/rss-grab-audio/`（转写后可用 `--cleanup-audio` 清理；info.json 里存了源 url，需要时可重下）。
 
@@ -329,7 +421,7 @@ rss/                           # 运行数据（安装后由脚本生成，不�
 python3 -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/tests/ -v
 ```
 
-其中 `test_open_source_guard.py` 是**开源边界守门测试**：扫描全仓库，禁止出现非本项目的平台特征（其他采集源、专有字段名、主项目路径等）。它拦的是「git 历史不可逆」的那类事故——文件删了也留在历史里，只能前置拦截。改本仓库任何文件后都应跑一遍。
+其中 `test_open_source_guard.py` 是**开源边界守门测试**：扫描全仓库，禁止出现非本项目的平台特征（其他采集源的痕迹、专有字段名、本机绝对路径等）。它拦的是「git 历史不可逆」的那类事故——文件删了也留在历史里，只能前置拦截。改本仓库任何文件后都应跑一遍。
 
 ## 免责声明
 
@@ -337,17 +429,18 @@ python3 -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/
 
 ## Roadmap
 
-- [ ] **补建 `rss/raw/*.info.json`**（2026-10-06 定位）：阶段 3 靠 info.json 里的
-      enclosure URL 下载音频，而它只在新拉取时生成。**手工加进状态文件、或早于
-      该机制存在的条目没有它**，于是被勾成 `[x]` 后必然卡在「找不到 info.json」。
-      实测 580 条里只有 52 条有。修法二选一：① `fetch_rss_feed.py --pick-subscribe`
-      先跑一遍补建（它会顺带下音频，与阶段 3 的 `ensure_audio` 重复）② 让
-      `generate_note_for_confirmed.ensure_audio` 在缺 info.json 时回 feed 现场取。
-- [ ] **`scripts/.env` 的飞书凭证键名**：已弃用普通表格，需从 `LARK_SPREADSHEET_TOKEN`
-      / `LARK_SHEET_NAME` 换成 `LARK_BASE_TOKEN` / `LARK_TABLE_ID`（见 SKILL.md）。
-      未换之前 22:30 链路的 stage 2 / stage 4 会各自失败一次（非阻塞，不影响采集）。
+- [ ] **补建 `rss/raw/*.info.json`**：阶段 3 靠 info.json 里的 enclosure URL 下载音频，
+      而它只在新拉取时生成。**手工加进状态文件、或早于该机制存在的条目没有它**，
+      于是被勾成 `[x]` 后会卡在「找不到 info.json」。这类条目的数量取决于你的订阅历史
+      ——手工导入过、或订阅时间早于该机制的节目，基本都会命中。修法二选一：
+      ① `fetch_rss_feed.py --pick-subscribe` 先跑一遍补建（它会顺带下音频，
+      与阶段 3 的 `ensure_audio` 有重复下载）② 让 `generate_note_for_confirmed.ensure_audio`
+      在缺 info.json 时回 feed 现场取。
+- [ ] **飞书表格凭证的配置方式**：凭证变量名以
+      `.agents/skills/rss-grab/scripts/.env.example` 的可选段为准（该文件是唯一模板）。
+      配错或缺失时 22:30 链路的 stage 2 / stage 4 会各失败一次——**非阻塞，不影响采集**。
 
-### 2026-10-06 夜间定时链路（已上线，22:30 触发）
+### 夜间定时链路（22:30 触发）
 
 | 阶段 | 做什么 | 失败是否阻塞 |
 |---|---|---|
@@ -356,7 +449,7 @@ python3 -m pytest .agents/skills/rss-grab/scripts/tests/ .agents/skills/_shared/
 | 3 | `generate_note_for_confirmed.py --all`：按 `[x]` 抓取转笔记 | — |
 | 4 | `lark_sync.py push-status`：把程序判定的「已转化」回写飞书 | **否** |
 
-- **状态机按「转换」划分归属，不是按字段**（Henry 2026-10-06）：
+- **状态机按「转换」划分归属，不是按字段**：
   `待确认→确认抓取` / `待确认→确认不抓` 由**用户**在飞书发起，只往 md 走；
   `确认抓取→已转化` 由**程序**在产物验证通过后发起，只往飞书走。
   同一个转换只有一个方向，两边永不互相覆盖。

@@ -62,11 +62,25 @@ def info_for_prompt(info: dict) -> str:
     return "\n".join(lines)
 
 # ── 配置 ──────────────────────────────────────────────
-MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash-Preview")
-BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1")
-EFFORT = os.environ.get("MINIMAX_EFFORT", "max")
-MAX_COMPLETION = int(os.environ.get("MINIMAX_MAX_COMPLETION", "100000"))
-TIMEOUT = int(os.environ.get("MINIMAX_TIMEOUT", "1800"))
+# 环境变量一律「通用名优先、专有名兜底」（2026-10-14）：
+# 本仓 env.py 的 load_env **只认**通用名 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+# （开源用户可能用任何 OpenAI 兼容服务，不该被绑死在某一家），
+# 但本文件此前**只认专有名** —— 用户照 .env.example 配好通用名后，
+# 笔记这一步拿到的却是写死的默认模型与服务地址，必然连不上。
+#   · 通用名 LLM_* 优先，专有名 MINIMAX_* 兜底（两边都认，不删任何一边）
+#   · **不要用 `or`**：`or` 会把「显式设为空串」和「未设置」混为一谈。
+#     嵌套 os.environ.get 能区分二者（未设置→None，显式设空→""），
+#     effort 正是靠这个差异实现「显式设空 = 调用时不发该参数」。
+MODEL = os.environ.get("LLM_MODEL",
+                       os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash-Preview"))
+BASE_URL = os.environ.get("LLM_BASE_URL",
+                           os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1"))
+# EFFORT == "" 表示用户显式关掉了该参数（LLM_EFFORT= ），见下方调用处
+EFFORT = os.environ.get("LLM_EFFORT", os.environ.get("MINIMAX_EFFORT", "max"))
+MAX_COMPLETION = int(os.environ.get(
+    "LLM_MAX_COMPLETION", os.environ.get("MINIMAX_MAX_COMPLETION", "100000")))
+TIMEOUT = int(os.environ.get(
+    "LLM_TIMEOUT", os.environ.get("MINIMAX_TIMEOUT", "1800")))
 TEMPERATURE = 0.2
 MAX_RETRY = 2
 HEARTBEAT = 30
@@ -553,9 +567,12 @@ def _call_with_template(client, tpl: str, payload: str, info: dict,
         th = threading.Thread(target=_beat, daemon=True)
         th.start()
     try:
+        # EFFORT 被显式设成空串（LLM_EFFORT=）→ **不发** reasoning_effort。
+        # 部分 OpenAI 兼容服务不接受这个参数，无条件传会直接 400。
+        effort_kwargs = {} if EFFORT == "" else {"reasoning_effort": EFFORT}
         r = client.chat.completions.create(
             model=MODEL,
-            reasoning_effort=EFFORT,
+            **effort_kwargs,
             max_completion_tokens=MAX_COMPLETION,
             temperature=TEMPERATURE,
             timeout=TIMEOUT,

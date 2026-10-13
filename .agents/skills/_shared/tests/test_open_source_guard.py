@@ -51,8 +51,25 @@ BANNED = {
     # ⚠️ 同样按「源码转义形态」修：`\.ai-zh\.` 在源码里带反斜杠，
     # 写死 `ai-zh` 虽然能命中，但为与其他条目一致，这里允许中间有转义符。
     "B 站字幕产物后缀": re.compile(r"ai[-]?zh"),
-    # ⚠️ 2026-10-06 补：B 站字段名。实测 `bvid_or_note_id` 就在 rss 脚本里。
-    "B 站字段名": re.compile(r"\bbvid\b"),
+    # 🔴 2026-10-14 修一条**从未生效过**的规则。
+    # 2026-10-06 补这条时，注释写的是「实测 `bvid_or_note_id` 就在 rss 脚本里」——
+    # 但那句话是**自我欺骗**：规则本身 `\bbvid\b` 根本匹配不上它，
+    # 所以「实测发现」那一步从未成立，这条规则加进来以后**一次都没拦过**
+    # 它声称要拦的那个字符串。当时的注释只记了结论、没留验证命令，
+    # 正是这类「加完就以为生效了」的规则能长期存活的原因。
+    # 现在补上当时的实测：`re.search(r"\bbvid\b", "bvid_or_note_id")` → None
+    # （下划线是单词字符，`bvid` 后面不构成词边界）。
+    #
+    # 🔴 修法：**放弃词边界，按子串匹配**。理由有两条，缺一不可：
+    #   ① `bvid` 不是任何英文单词的词根 —— 没有任何正常英文词包含这四个字母，
+    #      所以「按子串匹配会误伤英文单词」在本仓库不可能发生；
+    #   ② 本仓库是纯 rss，`bvid` 在这里**没有任何正当用途**。
+    # 宁可在极端情况下过度命中，也不给它留漏的口子 —— 泄露一旦 push 即不可逆
+    # （git 历史仍在），而误报的代价只是一次人工加豁免。
+    # `re.I` 顺带覆盖 BVID / Bvid 等大小写变体。
+    # 已知代价：将来若转写稿里出现「BVID」这个词，守门会判红需人工豁免；
+    # 那是可接受的摩擦，与本文件里 `ocr` / `ai-zh` 等同类规则一致。
+    "B 站字段名": re.compile(r"bvid", re.I),
     # ⚠️ 2026-10-06 补：疑似真实平台账号 ID（B 站 mid 是 8–15 位连续数字）。
     # 为什么**不按字段名禁 `uploader_id`**：它是 AC-C2 的 17 字段契约成员
     # （rss 侧填 guid_hash8），按词禁会误报（实测报 3 处假警报）。
@@ -288,6 +305,25 @@ class TestOpenSourceBoundary(unittest.TestCase):
         hits = sum(1 for rx in BANNED.values() if rx.search("这里有小红书和 bilibili 与 xsec_token"))
         self.assertGreaterEqual(hits, 3, "被禁正则疑似失效（连构造串都命中不了几条）")
 
+    def test_bvid_field_rule_catches_underscore_forms(self):
+        """`B 站字段名` 规则必须真能拦住下划线 / 前后缀形态（2026-10-14 回归锁）。
+
+        这条锁的是一次**真实退化**：规则曾是 `\\bbvid\\b`，而 `\\b` 在下划线前不成立，
+        `bvid_or_note_id` 就此一路放行，而那时的注释还写着「实测」。
+        光靠「跑守门是绿的」发现不了 —— 它绿正是因为它没匹配到东西。
+        """
+        rx = BANNED.get("B 站字段名")
+        self.assertIsNotNone(rx, "「B 站字段名」规则不见了")
+        samples = [
+            _P_BVID,                          # 裸字段名
+            _P_BVID + "_or_note_id",          # 下划线后缀（当年漏掉的形态）
+            "note_" + _P_BVID,                # 下划线前缀
+            _P_BVID.upper(),                  # 大写变体
+            '{"' + _P_BVID + '": "x"}',       # 作为 JSON 键
+        ]
+        missed = [s for s in samples if not rx.search(s)]
+        self.assertFalse(missed, f"「B 站字段名」规则拦不住这些形态：{missed}")
+
 
 # ---------------------------------------------------------------------------
 # 正样例的凭证值一律**拼接生成**，不以字面量出现在源码里
@@ -312,6 +348,8 @@ _P_LS = "lark" + "suite"               # 国际版域名
 _P_SHEETS = "/" + "sheets" + "/"
 _P_SHORT = "/" + "s" + "/"
 _P_BASE = "/" + "base" + "/"
+# 字段名片段同样拆开，理由同上（正样例不以完整形态出现在本文件源码里）
+_P_BVID = "b" + "vid"
 
 # 键名同样拆开：否则源码里会出现 `LARK_APP_SECRET=aB3x…` 这样的连续完整形态
 _K_SECRET = "LARK_APP_" + "SECRET"

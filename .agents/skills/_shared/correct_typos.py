@@ -24,7 +24,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 # 输出预算：必须够 max 档的 reasoning 消耗
 # （实测 58K 字符输入 + max 档时，20000 会被 thinking 吃光导致 content 返回空）
-MAX_COMPLETION = int(os.environ.get("MINIMAX_MAX_COMPLETION", "100000"))
+# 通用名优先、专有名兜底（2026-10-14）；嵌套 os.environ.get 而非 `or`
+# ——`or` 分不清「未设置」与「显式设空」。
+MAX_COMPLETION = int(os.environ.get(
+    "LLM_MAX_COMPLETION", os.environ.get("MINIMAX_MAX_COMPLETION", "100000")))
 TIMEOUT = 1800
 
 # max 档返回空 content 时，降级重试的顺序
@@ -546,8 +549,11 @@ def scan_residual_candidates(clean_text: str, judgments: list[dict],
 
 def _call(client, sys_p: str, user_p: str, effort: str = "medium",
           timeout: int = 1800) -> str:
+    # effort == ""（LLM_EFFORT 显式设空）→ 不发 reasoning_effort，
+    # 让服务端走自己的默认值（部分 OpenAI 兼容服务不接受该参数，会直接 400）
+    effort_kwargs = {} if effort == "" else {"reasoning_effort": effort}
     r = client.chat.completions.create(
-        model=_model(), reasoning_effort=effort,
+        model=_model(), **effort_kwargs,
         max_completion_tokens=MAX_COMPLETION, temperature=0.1, timeout=timeout,
         messages=[{"role": "system", "content": sys_p},
                   {"role": "user", "content": user_p}])
@@ -556,12 +562,15 @@ def _call(client, sys_p: str, user_p: str, effort: str = "medium",
 
 def _model() -> str:
     import os
-    return os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash-Preview")
+    # 通用名优先、专有名兜底；不用 `or`（分不清「未设置」与「显式设空」）
+    return os.environ.get(
+        "LLM_MODEL", os.environ.get("MINIMAX_MODEL", "MiniMax-M3.1-Flash-Preview"))
 
 
 def _base_url() -> str:
     import os
-    return os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1")
+    return os.environ.get(
+        "LLM_BASE_URL", os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.cn/v1"))
 
 
 # ④ 剥尾逗号（第 4 层容错，2026-10-05 加）
@@ -923,18 +932,22 @@ if __name__ == "__main__":
         if env_dir is not None:
             load_env(env_dir)
         else:
-            print("ℹ️ 未找到 .env（用 --env-dir 指定）；若缺 MINIMAX_API_KEY 将直接报错退出")
+            print("ℹ️ 未找到 .env（用 --env-dir 指定）；若缺 LLM_API_KEY 将直接报错退出")
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ load_env 失败: {e}", file=sys.stderr)
 
     client = None
     if not a.no_llm:
-        if not os.environ.get("MINIMAX_API_KEY"):
-            print("❌ 未配置 MINIMAX_API_KEY，加 --no-llm 可只用种子表",
-                  file=sys.stderr)
+        # 通用名优先、专有名兜底。⚠️ 此前**只读专有名**，而本仓 env.py 的
+        # load_env 放行的恰恰只有通用名 LLM_API_KEY —— 照 .env.example 配好的用户
+        # 必然撞上「未配置 MINIMAX_API_KEY」并退出。
+        _api_key = os.environ.get("LLM_API_KEY", os.environ.get("MINIMAX_API_KEY", ""))
+        if not _api_key:
+            print("❌ 未配置 LLM_API_KEY（MINIMAX_API_KEY 亦可），"
+                  "加 --no-llm 可只用种子表", file=sys.stderr)
             raise SystemExit(1)
         from openai import OpenAI
-        client = OpenAI(api_key=os.environ["MINIMAX_API_KEY"],
+        client = OpenAI(api_key=_api_key,
                         base_url=_base_url(), timeout=1800)
 
     t0 = time.time()
