@@ -419,7 +419,9 @@ def validate(body: str, source: str, info: dict, llm: dict) -> dict:
     # 标签改由 scripts/retag.py 在产物生成后单独打标，v3 不再产出 tags ——
     # 该检查恒算 n=0 并写下「建议 3-8 个」，检查的是一个不再存在的东西。
     # 替代它的质量检查（G1 漏跑 / G2 数量上限 / G3 超长 / G4 近义重复）
-    # 跟随产出方走，定义见 docs/versions/V1.2/spec.md §8。
+    # 跟随产出方走 —— 四项的具体判据定义在**项目主仓**的 V1.2 spec §8「标签体检规范」，
+    # 本仓不持有该文档（opensource 只保留 rss 相关实现），故此处不写路径：
+    # 写一个本仓不存在的路径，只会让开源用户照着找却「文件不存在」。
 
     # C11 summary
     s = str(llm.get("summary") or "").strip()
