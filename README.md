@@ -1,5 +1,7 @@
 # rss-grab
 
+[![CI](https://github.com/Henry-yuan/rss-grab-skill/actions/workflows/ci.yml/badge.svg)](https://github.com/Henry-yuan/rss-grab-skill/actions/workflows/ci.yml)
+
 订阅 RSS 播客 → 自动拉取增量 → AI 摘要 → 审阅勾选 → 下载 → ASR 转写 → 生成结构化中文笔记。
 
 > **这是什么**：项目主体是一个 **Agent skill 包**（`.agents/skills/rss-grab/`），供 **Codex / Claude Code 等 AI 助手**编排使用——在对话里发一个播客 RSS 链接（或 Apple Podcasts 链接），说"订阅这个播客、拉取新期数、把感兴趣的转写生成笔记"，Agent 会按 skill 指令自动完成整条流水线。各脚本也自带命令行入口，可纯命令行操作（见「快速开始」）。
