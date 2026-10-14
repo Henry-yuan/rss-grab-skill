@@ -171,8 +171,13 @@ python3 scripts/audit_frontmatter.py --source rss
 | AI 摘要（`preview_podcast.py`） | `high` | 读一遍简介写两句话，不需要更深 |
 | 笔记生成（`_shared/build_v3.py`） | `max` | 四步管线 + 校验，质量优先 |
 
-- 解析顺序：**`LLM_EFFORT` → `MINIMAX_EFFORT` → 默认值**；模型名同理（`LLM_MODEL` → `MINIMAX_MODEL` → 内置兜底），所以厂商专有名的变量仍能用，通用名优先
-- ⚠️ **`LLM_EFFORT=` 显式留空 = 完全不发 `reasoning_effort` 这个参数**。给**不支持该参数的服务**用——发了会直接报 400，整个脚本跑不起来
+- **解析顺序两处不同**，请注意：
+  - 笔记生成（`_shared/` 的 build_v3 / chunk_scan / correct_typos）：
+    `LLM_*` → `MINIMAX_*` 兜底 → 内置默认值
+  - **AI 摘要（`preview_podcast.py`）：只读 `LLM_*`，不接 `MINIMAX_*` 兜底。**
+    本仓的 `env.py` 有意「只认通用名、不绑任何厂商」，主项目那份才支持双命名。
+    本仓用 `LLM_MODEL` / `LLM_EFFORT` 等即可。
+- ⚠️ **`LLM_EFFORT=` 显式留空 = 完全不发 `reasoning_effort` 这个参数**（四个环节口径一致）。给**不支持该参数的服务**用——发了会直接报 400，整个脚本跑不起来
 - 调高 effort 会明显多花 reasoning token（实测摘要档从 `high` 提到 `xhigh` 平均多花 2.9 倍），不确定时先留着默认值
 
 ## 两种使用方式

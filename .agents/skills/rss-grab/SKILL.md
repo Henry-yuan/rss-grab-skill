@@ -1,6 +1,6 @@
 ---
 name: rss-grab
-description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目录 /tmp/rss-grab-audio/ → 元数据落到 rss/raw/guid_hash8.info.json（增量去重，二次运行跳过已有）→ ASR 转写（阶段 2，mlx-whisper）→ 生成结构化中文笔记 + INDEX 索引（阶段 3，长短播客统一走 v3 四步管线）。支持订阅模式（阶段 4）：Apple Podcasts 链接自动反推 feed URL → 定时拉增量 → 状态文件勾选 → 抓取做笔记。当用户提供播客 RSS 链接（https://feed.xyzfm.space/xxx 或 https://xxx.com/feed.xml）或 Apple Podcasts 链接并要求"订阅 / 抓下来 / 下载播客 / 拉取期数 / 转写 / 写笔记"时使用。只支持播客音频类 RSS（RSS 2.0 + itunes + audio enclosure），文章/视频/Atom/JSON Feed 识别后提示不处理。依赖：yt-dlp、curl、Python 3.12+、mlx-whisper（Apple Silicon）、LLM_API_KEY。
+description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目录 /tmp/rss-grab-audio/ → 元数据落到 rss/raw/guid_hash8.info.json（增量去重，二次运行跳过已有）→ ASR 转写（阶段 2，mlx-whisper）→ 生成结构化中文笔记 + INDEX 索引（阶段 3，长短播客统一走 v3 四步管线）。支持订阅模式（阶段 4）：Apple Podcasts 链接自动反推 feed URL → 定时拉增量 → 状态文件勾选 → 抓取做笔记。当用户提供播客 RSS 链接（https://feed.xyzfm.space/xxx 或 https://xxx.com/feed.xml）或 Apple Podcasts 链接并要求"订阅 / 抓下来 / 下载播客 / 拉取期数 / 转写 / 写笔记"时使用。只支持播客音频类 RSS（RSS 2.0 + itunes + audio enclosure），文章/视频/Atom/JSON Feed 识别后提示不处理。依赖：yt-dlp、curl、Python 3.12+、mlx-whisper（Apple Silicon）、LLM_API_KEY + LLM_BASE_URL + LLM_MODEL（三项缺一不可）。
 ---
 
 # RSS Grab
@@ -35,13 +35,25 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目
    > 给 100000 是浪费。**改任一个都要看另一条判据，别顺手统一。**
    > 本条曾漏设 `reasoning_effort`，而官方「不设 = Max」，短摘要一直跑在 Max 上；
    > 已加测试 `test_summary_effort.py` 锁住（变异验证过）。
+   > **笔记管线的 LLM 参数是另一套 env**，别把两套记混（取值来源均为 `_shared/`）：
+   > `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`（必填，`_shared/env.py` 缺任一即退出）；
+   > `LLM_MAX_COMPLETION` **100000** —— 纠错（`correct_typos.py`）、分块扫描/合并
+   > （`chunk_scan.py`）、撰写（`build_v3.py`）**三处都读它**；
+   > `LLM_EFFORT` 分档默认：撰写 **max**、扫描 **xhigh**、合并 **medium**
+   > （摘要那条是 high）。不设 `LLM_EFFORT` 就用各档默认，显式留空（`LLM_EFFORT=`）
+   > 则整个调用**不发** `reasoning_effort` 参数。
    - 每期完成增量写状态文件"待确认"区
    - 可配定时任务（launchd/cron）每天自动跑 `--fetch-updates`，命令幂等、重复执行安全；日志 `rss/_logs/`
    - 示例（launchd plist 的 ProgramArguments，每天 22:30）：
      `/bin/bash <project-root>/scripts/run_fetch_updates.sh`
      > ⚠️ **不要**在 plist 里直接写 `python3`（2026-10-06 校正：原写 `/usr/bin/python3`，
      > 那是系统自带 3.9.6、缺依赖，跑必挂）。正确做法是让 plist 调上面那个
-     > `run_fetch_updates.sh`，脚本内部已强制 `PY="/usr/local/bin/python3"`。
+     > `run_fetch_updates.sh`，由它自己解析解释器。按脚本里的实际顺序：
+     > `RSS_FETCH_PYTHON` 环境变量（显式覆盖）→ `/opt/homebrew/bin/python3`（Apple Silicon
+     > 的 Homebrew，**优先命中**）→ `/usr/local/bin/python3`（Intel Homebrew / python.org
+     > 安装版）→ PATH 里的 `python3`（兜底）。
+     > 2026-10-14 校正：本节原写「脚本内部已强制 `PY="/usr/local/bin/python3"`」，与代码
+     > 不符 —— 那只是 Intel 那一档，Apple Silicon 上会先命中 `/opt/homebrew/bin/python3`。
      > **Python 必须是 3.12+**，该约束已写死在脚本里，不需要在 plist 重复配置。
 
 ### 审阅勾选
@@ -107,8 +119,12 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目
 1. **判断长短**：`python3 scripts/decide_mode.py rss/transcripts/<...>.transcript.md`
    - 净字 = 剥 `**[mm:ss]**` 时间戳后去所有空白，口径实现在 `_shared/long_doc.py`，阈值 15,000。阈值来源：2026-10-04 由「原始字符 ≥ 50,000」改为净字口径。
    - **2026-10-05 校正：长短播客统一走 v3 四步管线**（①.5 错字纠错 → ② 分块扫描 → ③ 合并去重 → ④ 撰写）。`decide_mode.py` 两个分支都返回 `("v3", …)`，只用来提示长短，不再分流到别处。此前文档写的「短播客 skill 模式 / 长播客 map-reduce 模式」及「D6 尚未定案」均已作废（D6 已于 2026-10-04 拍板）。
-2. **选模板**（可选，仅 v2 模板路径需要）：`python3 scripts/adapt_template.py <transcript> --templates-dir ~/.agents/skills/rss-grab/templates`
-   - 调 `scripts/adapt_template.py`（不硬编码路径），传 rss 的 templates-dir；播客命中「访谈播客」模板
+2. **选模板**（可选，仅 v2 模板路径需要）：`python3 scripts/adapt_template.py <transcript>`
+   - 2026-10-14 校正：本行原写 `--templates-dir ~/.agents/skills/rss-grab/templates`，
+     硬编码家目录 —— clone 到别处的用户根本没有那个路径，照抄即失败。该参数**本就可省略**：
+     `adapt_template.py --help` 写明「默认自动检测调用者 skill 自己的 templates/」，
+     会自己解析到 `.agents/skills/rss-grab/templates/`，所以直接不传即可
+   - 播客命中「访谈播客」模板
    - v3 管线**不需要** plan.json，该步可跳过
 3. **生成笔记（生产入口）**：
    ```bash
@@ -125,13 +141,29 @@ description: 抓取播客 RSS feed：解析 RSS XML → 下载音频到临时目
 4. **批量抓取**：`python3 scripts/fetch_rss_pending.py [待抓取URL/RSS.md]`
    - 读待抓取文件，批量调 fetch_rss_feed.py 落原料（不生成笔记）
 
+5. **批量做笔记**：`python3 scripts/batch_notes.py`（2026-10-14 补：此前 SKILL.md
+   完全没提这个入口，README:259/:277 有）
+   - 扫 `rss/transcripts/` 下所有 `<title>-<hash8>.transcript.md`，逐个调
+     `generate_note_v3.py` 出笔记；**已有笔记的自动跳过**，中断后重跑续跑
+   - 常用参数：`--max N`（本次最多生成 N 篇）、`--max-workers N`（并发数）、
+     `--force`（强制重生成已有笔记）、`--index`（见下）
+   - 并发口径（`_shared/batch_notes.py`）：默认 **20 并发** + **2s 发射间隔**错开 API 峰值；
+     遇 429 **熔断逐级降并发 20 → 15 → 10**，连续一次无 429 则复位计数
+   - ⚠️ **默认不动生产状态**：子进程一律加 `--no-index`（避免多进程并发写同一个
+     `INDEX.md` 互相覆盖），代价是**跑完索引会缺登记** —— 要一次写生产索引才加 `--index`，
+     否则跑完用 `--backfill-index` 补（见下节）
+   - `Ctrl+C` 可暂停，已完成的笔记保住了
+
 > **2026-10-05 校正（v2 遗留）**：`generate_note_v2.py` / `regenerate_note_v2.py` / `map_reduce_note_v2.py` / `adapt_template.py` 文件仍在、可跑，但已退出主流程。
 > ⚠️ 文档原写的 `scripts/regenerate_note.py`（无 `_v2` 后缀）**该文件不存在**，照着跑必然 `No such file`，新流程不要用。
 
 产物：`rss/notes/<源名>/<sanitized_title>-<guid_hash8>.md` + 全局 `rss/notes/INDEX.md`
 INDEX 列：`| 日期 | 标题 | 作者 | 时长 | 期号 | 源 | 笔记 |`
 
-依赖：LLM_API_KEY（读 scripts/.env，模板见 .env.example）
+依赖：`LLM_API_KEY` + `LLM_BASE_URL` + `LLM_MODEL`（**三项缺一不可**，任缺一项
+`_shared/env.py` 都会 `sys.exit` 直接退出，不做静默降级）。
+读 `scripts/.env`，模板见同目录 `.env.example`（⚠️ 生效的是 **scripts 目录下**那份
+.env，仓库根目录的 `.env` 不会被读取）。
 
 ## 阶段 3 自动化（订阅链路接上笔记生成）
 
@@ -363,11 +395,14 @@ python3 scripts/lark_sync.py push-status
 `--backfill-index` 就是补这一步的：
 
 ```bash
-python3 scripts/generate_note_v3.py --backfill-index 69fca7701b7bd50295ad9ea8,...
+python3 scripts/generate_note_v3.py --backfill-index 69fca770,a1b2c3d4,...
 ```
 
 - 只读已存在的笔记文件，把缺失的登记按 guid_hash8 幂等补进 `rss/notes/INDEX.md`（已登记的跳过）
 - **不需要任何凭证**；退出码恒为 0；末行输出 `✅ 补 N 条（跳过 S 条，失败 F 条）`
+  > ⚠️ 退出码 0 **不代表补成功**：格式不符的期号只计入 `失败 F 条`、退出码仍是 0。
+  > 实测传 24 位 hash 得到 `⚠️ 格式不符，跳过` + `✅ 补 0 条（失败 1 条）`。
+  > 收尾务必看 `失败 F 条` 里的 `F`，别只看退出码。
 - hash8 必须是 8 位小写 hex 且**只接受精确匹配**；交叉校验 `item.guid_hash8`
   与文件名不符时**一行都不写**
 - 「源」列取 `info["feed"]["title"]`，缺失时回退到笔记所在节目目录名

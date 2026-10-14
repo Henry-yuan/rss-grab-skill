@@ -50,6 +50,12 @@ CHECKPOINT_EVERY = 25    # 每 N 期 check点落盘
 # 与 map-reduce 的 100,000 不同是因为期望输出量级不同，不是两套魔数。
 SUMMARY_MAX_COMPLETION = int(os.environ.get("LLM_SUMMARY_MAX_COMPLETION", "16000"))
 
+# 摘要的推理强度档位。**显式留空（`LLM_EFFORT=`）= 不发送 reasoning_effort**，
+# 与笔记管线三处（build_v3 / chunk_scan / correct_typos）同一套语义。
+# 用 os.environ.get 的默认值形式而非 `or`：`or` 会把空串当成假值吃掉，
+# 那样就表达不了「显式设为空」这个意图。
+SUMMARY_EFFORT = os.environ.get("LLM_EFFORT", "high")
+
 PROMPT = """你是播客简介摘要助手。为下面这一期播客生成结构化中文摘要，**直接输出纯文本**（不要 JSON，不要代码块，不要思考过程）：
 
 ## 播客标题
@@ -133,7 +139,12 @@ def summarize_one(client, model, item: dict, label: str,
                 # 取 high 而非 max：摘要只需读一遍简介写两句话；
                 # 16000 预算在 Max 下实测 65/65 通过（2026-10-05），high 更宽松。
                 # 环境变量可覆盖，命名沿用 LLM_ 前缀与本仓其他设置一致。
-                reasoning_effort=os.environ.get("LLM_EFFORT", "high"),
+                # ⚠️ 2026-10-14 补：显式留空（`LLM_EFFORT=`）时**不发**该参数。
+                # 本仓 env.py 只放行通用名，故**不接 MINIMAX_EFFORT 兜底**
+                # （那是主项目的约定，见 env.py 里「不要改成双命名」的注释）。
+                # 笔记管线三处（build_v3 / chunk_scan / correct_typos）用
+                # 同一套 effort_kwargs 写法，四处口径才一致。
+                **({"reasoning_effort": SUMMARY_EFFORT} if SUMMARY_EFFORT else {}),
             )
             content = resp.choices[0].message.content
             summary = strip_thinking_blocks(content)
