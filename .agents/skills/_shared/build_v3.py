@@ -262,6 +262,8 @@ SCAN_CONCURRENCY = 8
 # long_doc 那份 —— 副本从未被验证，且两处各改各的必然漂移。
 # 现在统一从 long_doc 引。口径只有一处定义 = 只可能被测到一次。
 from long_doc import LONG_DOC_THRESHOLD, net_len  # noqa: E402,F401
+# token 计量（2026-11-02）：三个 LLM 调用点之一，见 usage.py 顶部说明。
+import usage  # noqa: E402
 
 # 长文路径喂给 ④ 的是「主题清单 + 原文」：
 #   主题清单 = 覆盖全文的大纲，防遗忘
@@ -580,6 +582,7 @@ def _call_with_template(client, tpl: str, payload: str, info: dict,
                        "content": sys_p or SYSTEM_PROMPT},
                       {"role": "user", "content": user}],
         )
+        usage.record(r)      # token 计量（2026-11-02）
         return r.choices[0].message.content or ""
     finally:
         stop.set()
@@ -683,6 +686,9 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
     else:
         stem = src_path.name
     stats: dict = {'stem': stem, 'route': '', 'attempts': 0}
+    # token 计量会话（2026-11-02）：一篇笔记一本账，
+    # 纠错 / 分块扫描 / 合并 / 撰写四个环节的消耗都汇进来。
+    usage.start_session(stem)
     source, cstat = load_and_clean(src_path)
     stats['source_chars'] = len(source)
     stats['clean'] = cstat
@@ -699,6 +705,8 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
         stats['status'] = 'empty'
         print(f"    ⏭️ 源文仅 {len(source)} 字符（< {MIN_SOURCE_CHARS}）→ 跳过正文生成",
               flush=True)
+        stats['usage'] = usage.end_session(
+            {'route': stats['route'], 'skipped': 'empty_source'})
         return '', {'C0_empty_source': {'chars': len(source)}}, stats
 
     n_chars = net_len(source)
@@ -734,6 +742,8 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
             long_info = run_long_path(src_path, source, client, wr, no_typos=no_typos)
         except Exception as e:
             print(f'    ✗ 长文路径失败: {type(e).__name__}: {str(e)[:160]}', flush=True)
+            usage.end_session({'route': stats['route'], 'net_chars': n_chars,
+                               'failed': 'long_path'})
             raise RuntimeError(f'长文路径失败: {type(e).__name__}: {e}') from e
         stats['n_points'] = long_info['n_points']
         stats['n_chunks'] = long_info['n_chunks']
@@ -783,8 +793,13 @@ def generate_note_body(src_path: Path, info: dict, client, work_dir: Path, typos
             # 等于把归一化结果直接丢弃——H3 编号 `### 1.` 会原样落盘。
             # 2026-10-04 实测：ok=True 的生产路径上 validate 归一化了 2 个 H3，
             # 文件里仍留着编号。归一化器是死代码，从未生效过。
+            stats['usage'] = usage.end_session(
+                {'route': stats['route'], 'net_chars': n_chars,
+                 'attempts': stats.get('attempts', 0)})
             return (v['body'], v['report'], stats)
         except Exception as e:
             last_err = f'{type(e).__name__}: {e}'
             print(f'    ✗ 第 {attempt} 次生成异常: {last_err}', flush=True)
+    # 连续失败：账要收掉（否则会串到下一篇的会话里）
+    usage.end_session({'route': stats['route'], 'net_chars': n_chars, 'failed': True})
     raise RuntimeError(f'撰写连续 {MAX_RETRY + 1} 次失败，最后一次: {last_err}')

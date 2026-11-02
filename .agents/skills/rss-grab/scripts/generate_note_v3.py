@@ -145,6 +145,24 @@ def find_note_by_hash8(notes_dir: pathlib.Path, hash8: str) -> pathlib.Path | No
     return hits[0] if hits else None
 
 
+def source_dir_for(info: dict) -> str:
+    """笔记源目录名（`rss/notes/<本函数返回值>/`）。
+
+    **必须是 sanitize 后的节目名**，与订阅状态文件名（`rss/订阅/<节目名>.md`）
+    同规则 —— 两侧都由 `sanitize_title` / `_sanitize_filename` 派生，
+    而这两个函数都声明「规则一致」。
+
+    2026-11-02 统一的原因：此前这里用的是 `feed.title` 原值，于是
+    「订阅状态文件名（sanitize）」与「笔记源目录名（原值）」长成两套规则 ——
+    实测 `AI-Odyssey.md` 对应 `AI Odyssey/`（带空格），按节目名找目录对不上，
+    看着像两个不同的源。统一到 sanitize 后两边恒等，且消除了路径带空格的隐患。
+
+    ⚠️ `info.json` 里**没有** `_source_dir` 之类字段，别自造。
+    """
+    from fetch_rss_feed import sanitize_title
+    return sanitize_title((info.get("feed") or {}).get("title") or "Unknown")
+
+
 def find_info_by_hash8(raw_dir: pathlib.Path, hash8: str) -> dict | None:
     """按 hash8 找 info.json，并核对内容里的期号与文件名一致。"""
     for p in sorted(raw_dir.glob(f"*-{hash8}.info.json")):
@@ -345,11 +363,10 @@ def main() -> int:
             a.output = existing
         else:
             info = json.loads(pathlib.Path(i).read_text(encoding="utf-8"))
-            # 源目录名 = feed.title（与既有 `rss/notes/<节目名>/` 布局一致，
-            # 实测 十字路口Crossing / 独树不成林 都是这么来的）。
-            # ⚠️ 不要自造 `_source_dir` 之类字段 —— info.json 里根本没有它。
+            # 源目录名规则见 `source_dir_for()` 的 docstring（2026-11-02 统一到
+            # sanitize，与订阅状态文件名同规则）。
             from fetch_rss_feed import sanitize_title
-            source_dir = (info.get("feed") or {}).get("title") or "Unknown"
+            source_dir = source_dir_for(info)
             a.output = (_SHARED.parent.parent.parent / "rss" / "notes" / source_dir /
                         f"{sanitize_title((info.get('item') or {}).get('title') or hash8)}"
                         f"-{hash8}.md")

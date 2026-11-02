@@ -19,6 +19,7 @@ from collections import Counter
 from datetime import datetime
 import pathlib
 from pathlib import Path
+import usage  # token 计量（2026-11-02）
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -557,6 +558,7 @@ def _call(client, sys_p: str, user_p: str, effort: str = "medium",
         max_completion_tokens=MAX_COMPLETION, temperature=0.1, timeout=timeout,
         messages=[{"role": "system", "content": sys_p},
                   {"role": "user", "content": user_p}])
+    usage.record(r)      # token 计量（2026-11-02）
     return r.choices[0].message.content or ""
 
 

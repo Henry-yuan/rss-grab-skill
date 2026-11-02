@@ -39,3 +39,6 @@ HANDOFF.md
 # 长文路径的中间产物（.clean.md / points/ / topics/）——每次重跑都重写，
 # 单次即 MB 级，且可由源文 + 管线完全重建
 **/scripts/scan_work/
+
+# LLM token 用量台账（运行数据，不进版本库）
+.usage/

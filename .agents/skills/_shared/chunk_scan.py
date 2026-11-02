@@ -33,6 +33,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 sys.path.insert(0, str(SCRIPT_DIR.parent.parent / "_shared"))
+import usage  # token 计量（2026-11-02）  # noqa: E402
 
 TS_LINE = re.compile(r"^\*\*\[\d{1,2}:\d{2}\]\*\*")
 SENT_END = re.compile(r"[。！？!?…；;]([\"』」）)]*)\s*$")
@@ -299,6 +300,7 @@ def _call(client, sys_p, user_p, effort: str) -> str:
             timeout=TIMEOUT,
             messages=[{"role": "system", "content": sys_p},
                       {"role": "user", "content": user_p}])
+        usage.record(r)      # token 计量（2026-11-02）
         return r.choices[0].message.content or ""
     finally:
         stop.set()
